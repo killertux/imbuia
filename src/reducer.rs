@@ -315,6 +315,10 @@ fn handle_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
                 }
                 return;
             }
+            (Leader::Space, Mode::Normal) => {
+                handle_space_leader(state, k, cmds);
+                return;
+            }
             _ => {} // stale leader for current mode — fall through
         }
     }
@@ -325,6 +329,36 @@ fn handle_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
         Mode::Command => handle_command_key(state, k, cmds),
     }
 }
+
+/// Dispatch the second keystroke of a `<space>` leader sequence. Kept as a
+/// flat keymap for now — small surface, easy to grok. Esc / Space cancel.
+fn handle_space_leader(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
+    match k.code {
+        KeyCode::Char('o') => crate::commands::cmd_open(state, &[], cmds),
+        KeyCode::Char('w') => crate::commands::cmd_worktree(state, &[], cmds),
+        KeyCode::Char('W') => crate::commands::cmd_worktree_remove(state, &[], cmds),
+        KeyCode::Char('l') => crate::commands::cmd_launch(state, &[], cmds),
+        KeyCode::Char('e') => crate::commands::cmd_edit(state, &[], cmds),
+        KeyCode::Char('u') => crate::commands::cmd_usage(state, &[], cmds),
+        KeyCode::Char('q') => state.running = false,
+        KeyCode::Char('?') | KeyCode::Char('h') => state.help_open = true,
+        // Esc / Space / anything else: silently cancel the leader.
+        _ => {}
+    }
+}
+
+/// Static which-key-style table shown while `<Space>` is pending. Edit in
+/// lockstep with `handle_space_leader`.
+pub const SPACE_LEADER_HINTS: &[(&str, &str)] = &[
+    ("o", "open project"),
+    ("w", "new worktree"),
+    ("W", "remove worktree"),
+    ("l", "launch …"),
+    ("e", "edit project"),
+    ("u", "usage"),
+    ("?", "help"),
+    ("q", "quit"),
+];
 
 fn handle_normal_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
     // Ctrl-W leader.
@@ -350,10 +384,8 @@ fn handle_normal_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
             activate_sidebar_selection(state, cmds);
         }
         KeyCode::Char('g') => state.pending_leader = Some(Leader::G),
+        KeyCode::Char(' ') => state.pending_leader = Some(Leader::Space),
         KeyCode::Char('o') => open_new_tab_in_active(state, cmds),
-        KeyCode::Char('O') => crate::commands::cmd_open(state, &[], cmds),
-        KeyCode::Char('W') => crate::commands::cmd_worktree(state, &[], cmds),
-        KeyCode::Char('L') => crate::commands::cmd_launch(state, &[], cmds),
         KeyCode::Char('x') => close_current_tab(state, cmds),
         KeyCode::Char('i') => state.mode = Mode::Terminal,
         KeyCode::Char(':') => {
@@ -2349,13 +2381,43 @@ mod tests {
     }
 
     #[test]
-    fn shift_o_keybind_opens_open_project_popup() {
+    fn space_leader_o_opens_open_project_popup() {
         let mut s = AppState::new();
+        let _ = reduce(&mut s, Action::Key(plain(' ')));
+        assert_eq!(s.pending_leader, Some(Leader::Space));
+        let _ = reduce(&mut s, Action::Key(plain('o')));
+        assert!(s.pending_leader.is_none());
+        assert!(s.open_project_popup.is_some());
+    }
+
+    #[test]
+    fn space_leader_l_opens_launch_popup() {
+        let mut s = mk_state_with_mock_projects();
+        s.active_worktree = Some((0, 0));
+        let _ = reduce(&mut s, Action::Key(plain(' ')));
+        let _ = reduce(&mut s, Action::Key(plain('l')));
+        assert!(s.launch_popup.is_some());
+    }
+
+    #[test]
+    fn space_leader_q_quits() {
+        let mut s = AppState::new();
+        let _ = reduce(&mut s, Action::Key(plain(' ')));
+        let _ = reduce(&mut s, Action::Key(plain('q')));
+        assert!(!s.running);
+    }
+
+    #[test]
+    fn space_leader_esc_cancels() {
+        let mut s = AppState::new();
+        let _ = reduce(&mut s, Action::Key(plain(' ')));
         let _ = reduce(
             &mut s,
-            Action::Key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT)),
+            Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         );
-        assert!(s.open_project_popup.is_some());
+        assert!(s.pending_leader.is_none());
+        assert!(s.open_project_popup.is_none());
+        assert!(s.running);
     }
 
     #[test]

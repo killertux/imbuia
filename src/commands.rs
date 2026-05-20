@@ -113,7 +113,7 @@ pub(crate) fn execute_command(state: &mut AppState, s: &str, cmds: &mut Commands
     }
 }
 
-fn cmd_usage(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
+pub(crate) fn cmd_usage(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
     state.usage_popup = Some(UsagePopup::new());
     cmds.push(Command::SubscribeUsage);
 }
@@ -239,7 +239,7 @@ fn selected_project_idx(state: &AppState) -> Option<usize> {
     state.active_worktree.map(|(p, _)| p)
 }
 
-fn cmd_worktree_remove(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
+pub(crate) fn cmd_worktree_remove(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
     let Some((pi, Some(wi))) = state.sidebar_selection else {
         state.command_status = Some("select a worktree in the sidebar first".into());
         return;
@@ -264,7 +264,7 @@ fn cmd_worktree_remove(state: &mut AppState, _args: &[&str], cmds: &mut Commands
     });
 }
 
-fn cmd_edit(state: &mut AppState, _args: &[&str], _cmds: &mut Commands) {
+pub(crate) fn cmd_edit(state: &mut AppState, _args: &[&str], _cmds: &mut Commands) {
     let Some(project_idx) = selected_project_idx(state) else {
         state.command_status = Some("select a project in the sidebar first".into());
         return;

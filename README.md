@@ -74,16 +74,31 @@ cargo build --release
 | `o`                       | New terminal tab in the active worktree.                        |
 | `x`                       | Close the focused tab.                                          |
 | `gt` / `gT`               | Next / previous tab.                                            |
-| `Shift-O`                 | Open project popup (path + setup-script).                       |
-| `Shift-W`                 | New worktree popup.                                             |
-| `Shift-L`                 | Launcher picker (pick + spawn a named command).                 |
+| `<Space>`                 | Open the leader menu (which-key style overlay; see below).      |
 | `Ctrl-W >` / `<` / `=`    | Grow / shrink / reset sidebar width.                            |
 | `i`                       | Enter Terminal mode (keys forwarded to the PTY).                |
 | `Ctrl-\ Ctrl-N`           | Leave Terminal mode (Neovim-style).                             |
 | `:`                       | Enter Command mode.                                             |
-| `:help`                   | Scrollable help popup with full keybinding + command reference. |
 | `Ctrl-Q` / `:q`           | Quit.                                                           |
 | **Shift+wheel**           | Always scrolls terminal scrollback (bypasses TUI app).          |
+
+### `<Space>` leader
+
+Pressing `<Space>` in Normal mode opens a small hint overlay listing the
+available follow-up keys. The current bindings:
+
+| Chord          | What it does                                  |
+|----------------|-----------------------------------------------|
+| `<Space> o`    | Open project popup (path + setup script).     |
+| `<Space> w`    | New worktree popup.                           |
+| `<Space> W`    | Remove the selected worktree.                 |
+| `<Space> l`    | Launcher picker.                              |
+| `<Space> e`    | Edit the selected project's setup script.    |
+| `<Space> u`    | Live resource-usage popup.                    |
+| `<Space> ?`    | Open this help popup.                         |
+| `<Space> q`    | Quit.                                         |
+
+`Esc` (or any key not bound under the leader) cancels.
 
 ### Commands
 

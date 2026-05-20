@@ -17,6 +17,9 @@ pub enum Leader {
     CtrlBackslash,
     /// `g` — Normal-mode prefix (e.g. `gt`/`gT` for next/prev tab).
     G,
+    /// `<Space>` — primary command leader (vim-distro convention).
+    /// Triggers the which-key-style hint overlay until the next key arrives.
+    Space,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
