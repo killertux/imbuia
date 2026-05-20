@@ -68,6 +68,11 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // Hourly auto-update check. Tokio's `interval` fires immediately on
+    // first poll, which is what we want — kicks off the startup check.
+    let mut update_tick = tokio::time::interval(Duration::from_secs(3600));
+    update_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     let mut redraw_at: Option<Instant> = Some(Instant::now());
 
     while state.running {
@@ -87,6 +92,10 @@ pub async fn run() -> Result<()> {
                 redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
             }
             _ = notify.notified() => {
+                redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
+            }
+            _ = update_tick.tick() => {
+                handle_action(&mut state, Action::PeriodicUpdateCheck, &action_tx, &notify, &supervisor);
                 redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
             }
             _ = async {
@@ -273,8 +282,38 @@ fn execute(
                 }
             }
         }
+        Command::CheckForUpdate => spawn_update_check(action_tx),
+        Command::InstallUpdate { tag } => spawn_update_install(tag, action_tx),
         Command::Shutdown => {}
     }
+}
+
+fn spawn_update_check(action_tx: &mpsc::Sender<Action>) {
+    let tx = action_tx.clone();
+    std::thread::spawn(move || {
+        let result = crate::updater::check_for_update().map_err(|e| format!("{e:#}"));
+        let _ = tx.blocking_send(Action::UpdateChecked(result));
+    });
+}
+
+fn spawn_update_install(tag: String, action_tx: &mpsc::Sender<Action>) {
+    let tx = action_tx.clone();
+    std::thread::spawn(move || {
+        // Re-derive UpdateInfo from the tag; semver is cheap to parse and we
+        // don't want to thread the full struct through the command queue.
+        let version_str = tag.strip_prefix('v').unwrap_or(&tag).to_string();
+        let info_result = semver::Version::parse(&version_str)
+            .map_err(|e| format!("bad tag {tag:?}: {e}"))
+            .map(|version| crate::updater::UpdateInfo {
+                latest_tag: tag.clone(),
+                latest_version: version,
+            });
+        let result = match info_result {
+            Ok(info) => crate::updater::install_update(&info).map_err(|e| format!("{e:#}")),
+            Err(e) => Err(e),
+        };
+        let _ = tx.blocking_send(Action::UpdateInstalled(result));
+    });
 }
 
 fn state_slugs(state: &AppState) -> Vec<String> {

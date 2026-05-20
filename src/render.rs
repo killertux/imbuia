@@ -1044,7 +1044,28 @@ fn normal_or_terminal_line<'a>(
             Style::default().fg(theme.status_error),
         ));
     }
+    // Auto-update banner: only when no busy-op and no error message are
+    // already shouting in the same row.
+    if state.pending_op.is_none()
+        && state.command_status.is_none()
+        && let Some(banner) = update_banner_text(state)
+    {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(banner, Style::default().fg(theme.fg_dim)));
+    }
     Line::from(spans)
+}
+
+fn update_banner_text(state: &AppState) -> Option<String> {
+    use crate::app::UpdateStatus;
+    match state.update_status {
+        UpdateStatus::Installing => Some("updating…".into()),
+        UpdateStatus::Checking => None,
+        _ => state
+            .available_update
+            .as_ref()
+            .map(|info| format!("{} available · :update to install", info.latest_tag)),
+    }
 }
 
 fn render_command_completion(

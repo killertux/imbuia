@@ -137,6 +137,18 @@ pub enum LaunchSource {
     Global,
 }
 
+/// Phase of the auto-update flow. Drives the banner in the action bar and
+/// gates re-entry from `:update`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum UpdateStatus {
+    #[default]
+    Idle,
+    Checking,
+    Installing,
+    /// Install finished; user needs to restart to switch over.
+    InstalledPendingRestart,
+}
+
 /// Modal "resource usage" dashboard. Driven by 1 Hz `Usage` frames from the
 /// supervisor while open.
 #[derive(Debug, Clone)]
@@ -225,6 +237,10 @@ pub struct AppState {
     /// selected project's launchers at `:launch` time; project entries with
     /// the same name take precedence.
     pub global_launchers: Vec<Launcher>,
+    /// `Some` once a background check discovers a newer release on GitHub.
+    /// Drives the right-aligned banner in the action bar.
+    pub available_update: Option<crate::updater::UpdateInfo>,
+    pub update_status: UpdateStatus,
 }
 
 impl AppState {
@@ -256,6 +272,8 @@ impl AppState {
             pending_op: None,
             theme: Theme::default(),
             global_launchers: Vec::new(),
+            available_update: None,
+            update_status: UpdateStatus::Idle,
         }
     }
 
@@ -392,6 +410,14 @@ pub enum Action {
     SupervisorLost(String),
     /// Supervisor → reducer: a fresh resource-usage snapshot arrived.
     UsageReceived(UsageReport),
+    /// Background updater finished a check. `Ok(None)` means "up to date".
+    UpdateChecked(Result<Option<crate::updater::UpdateInfo>, String>),
+    /// Updater thread finished an install attempt.
+    UpdateInstalled(Result<crate::updater::InstallOutcome, String>),
+    /// Hourly tick from the runtime telling the reducer to fire a check.
+    /// Goes through the reducer (rather than being emitted as a Command
+    /// directly) so the reducer remains the single dispatch authority.
+    PeriodicUpdateCheck,
     Quit,
 }
 
@@ -428,6 +454,9 @@ impl std::fmt::Debug for Action {
             Action::OperationFailed(s) => f.debug_tuple("OperationFailed").field(s).finish(),
             Action::SupervisorLost(s) => f.debug_tuple("SupervisorLost").field(s).finish(),
             Action::UsageReceived(_) => write!(f, "UsageReceived(..)"),
+            Action::UpdateChecked(r) => f.debug_tuple("UpdateChecked").field(r).finish(),
+            Action::UpdateInstalled(r) => f.debug_tuple("UpdateInstalled").field(r).finish(),
+            Action::PeriodicUpdateCheck => write!(f, "PeriodicUpdateCheck"),
             Action::Quit => write!(f, "Quit"),
         }
     }
@@ -492,6 +521,14 @@ pub enum Command {
     SaveGlobalConfig,
     /// Persist a project's config.
     SaveProjectConfig(usize),
+    /// Ask the updater to hit GitHub and report back via
+    /// [`Action::UpdateChecked`]. Spawned as a thread by the runtime.
+    CheckForUpdate,
+    /// Install the given release tag in a background thread; result comes
+    /// back as [`Action::UpdateInstalled`].
+    InstallUpdate {
+        tag: String,
+    },
     Shutdown,
 }
 
