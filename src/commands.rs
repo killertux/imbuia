@@ -1,0 +1,379 @@
+//! Ex-style command registry (`:q`, `:open`, `:set key=value`, …).
+//!
+//! Each command is a `CmdSpec` entry in the `COMMANDS` table. Adding a new
+//! one is just appending to the table and writing a `fn(...)` handler.
+
+use crate::app::{AppState, Command, Commands, EditPopup, InputPopup, PopupAction, UsagePopup};
+use crate::reducer::{
+    close_current_tab, launch_in_active_worktree, open_new_tab_in_active, set_sidebar_width,
+};
+use crate::theme::{Theme, ThemeKind};
+use std::path::PathBuf;
+
+/// Handler for an ex-style command. Mutates state and may emit side-effecting
+/// commands; reports errors by setting `state.command_status`.
+type CmdHandler = fn(&mut AppState, args: &[&str], cmds: &mut Commands);
+
+/// Specification for an ex-style command. Adding a new command is just adding
+/// an entry to `COMMANDS` below.
+pub struct CmdSpec {
+    pub names: &'static [&'static str],
+    pub usage: &'static str,
+    pub description: &'static str,
+    pub handler: CmdHandler,
+}
+
+pub const COMMANDS: &[CmdSpec] = &[
+    CmdSpec {
+        names: &["q", "quit"],
+        usage: ":q[uit]",
+        description: "Quit imbuia.",
+        handler: cmd_quit,
+    },
+    CmdSpec {
+        names: &["tabnew"],
+        usage: ":tabnew",
+        description: "Open a new terminal in the active worktree.",
+        handler: cmd_tabnew,
+    },
+    CmdSpec {
+        names: &["tabclose"],
+        usage: ":tabclose",
+        description: "Close the current terminal.",
+        handler: cmd_tabclose,
+    },
+    CmdSpec {
+        names: &["set"],
+        usage: ":set key=value",
+        description: "Set an option (e.g. :set sidebar.width=24).",
+        handler: cmd_set,
+    },
+    CmdSpec {
+        names: &["help", "h"],
+        usage: ":help",
+        description: "Show this list of commands. Press Esc to close.",
+        handler: cmd_help,
+    },
+    CmdSpec {
+        names: &["open"],
+        usage: ":open [path]",
+        description: "Open a project at <path>. With no arg, opens an input popup.",
+        handler: cmd_open,
+    },
+    CmdSpec {
+        names: &["worktree", "wt"],
+        usage: ":worktree [branch]",
+        description: "Create a worktree for <branch> in the selected project.",
+        handler: cmd_worktree,
+    },
+    CmdSpec {
+        names: &["edit", "e"],
+        usage: ":edit",
+        description: "Open the selected project's TOML in $EDITOR.",
+        handler: cmd_edit,
+    },
+    CmdSpec {
+        names: &["worktree-remove", "wr"],
+        usage: ":worktree-remove",
+        description: "Delete the selected worktree (files + local branch).",
+        handler: cmd_worktree_remove,
+    },
+    CmdSpec {
+        names: &["restart-supervisor", "rs"],
+        usage: ":restart-supervisor",
+        description: "Kill the PTY supervisor and all its sessions; respawn on next launch.",
+        handler: cmd_restart_supervisor,
+    },
+    CmdSpec {
+        names: &["usage", "u"],
+        usage: ":usage",
+        description: "Show live memory/CPU usage per session + its descendants.",
+        handler: cmd_usage,
+    },
+    CmdSpec {
+        names: &["launch", "l"],
+        usage: ":launch [name]",
+        description: "Launch a named command in a new tab (or pick from a popup).",
+        handler: cmd_launch,
+    },
+];
+
+pub(crate) fn execute_command(state: &mut AppState, s: &str, cmds: &mut Commands) {
+    if s.is_empty() {
+        return;
+    }
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    let Some((name, args)) = parts.split_first() else {
+        return;
+    };
+    if let Some(spec) = COMMANDS.iter().find(|s| s.names.contains(name)) {
+        (spec.handler)(state, args, cmds);
+    } else {
+        state.command_status = Some(format!("not a command: :{s}"));
+    }
+}
+
+fn cmd_usage(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
+    state.usage_popup = Some(UsagePopup::new());
+    cmds.push(Command::SubscribeUsage);
+}
+
+fn cmd_restart_supervisor(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
+    state.command_status = Some("restarting supervisor — all sessions killed".into());
+    // Drop every local session reference; the supervisor side terminates
+    // the children when it processes Shutdown.
+    state.sessions.clear();
+    for p in &mut state.projects {
+        for w in &mut p.worktrees {
+            w.sessions.clear();
+            w.active_tab = None;
+        }
+    }
+    cmds.push(Command::RestartSupervisor);
+    // Exit; on next launch the client will see no socket and spawn a fresh
+    // supervisor. (Restarting in-place would require teaching the client
+    // reader thread to reconnect — a future iteration.)
+    state.running = false;
+}
+
+fn cmd_quit(state: &mut AppState, _args: &[&str], _cmds: &mut Commands) {
+    state.running = false;
+}
+
+fn cmd_tabnew(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
+    open_new_tab_in_active(state, cmds);
+}
+
+fn cmd_tabclose(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
+    close_current_tab(state, cmds);
+}
+
+fn cmd_set(state: &mut AppState, args: &[&str], cmds: &mut Commands) {
+    handle_set(state, args, cmds);
+}
+
+fn cmd_help(state: &mut AppState, _args: &[&str], _cmds: &mut Commands) {
+    state.help_open = true;
+}
+
+pub(crate) fn cmd_open(state: &mut AppState, args: &[&str], cmds: &mut Commands) {
+    if let Some(path) = args.first() {
+        let home = current_home();
+        let expanded = expand_user_path(path, home.as_deref());
+        state.pending_op = Some(format!("Opening {}…", expanded.display()));
+        cmds.push(Command::OpenProject {
+            path: expanded,
+            setup_script: None,
+        });
+    } else {
+        use crate::app::{OpenProjectFocus, OpenProjectPopup};
+        let mut script = ratatui_textarea::TextArea::default();
+        script.set_placeholder_text(
+            "optional: bash run in each new worktree on creation (Tab to focus, Ctrl-S to save)",
+        );
+        state.open_project_popup = Some(OpenProjectPopup {
+            path: String::new(),
+            script,
+            focus: OpenProjectFocus::default(),
+        });
+    }
+}
+
+pub(crate) fn cmd_worktree(state: &mut AppState, args: &[&str], cmds: &mut Commands) {
+    let Some(project_idx) = selected_project_idx(state) else {
+        state.command_status = Some("select a project in the sidebar first".into());
+        return;
+    };
+    let p = &state.projects[project_idx];
+    let project_name = p.name.clone();
+    let repo_path = p.repo_path.clone();
+    if let Some(branch) = args.first() {
+        state.pending_op = Some(format!("Creating worktree '{branch}'…"));
+        cmds.push(Command::AddWorktree {
+            project_idx,
+            repo_path,
+            branch: (*branch).to_string(),
+        });
+    } else {
+        state.popup = Some(InputPopup {
+            title: format!("New worktree (project: {project_name})"),
+            prompt: "branch".into(),
+            buffer: String::new(),
+            action: PopupAction::NewWorktree { project_idx },
+        });
+    }
+}
+
+/// Expand a leading `~` or `~/` against `home`. Relative paths (`.`, `..`,
+/// bare names) are returned as-is — the runtime canonicalises them against
+/// the process CWD before validation.
+///
+/// Taking `home` as an argument keeps the function pure and side-effect-free
+/// so tests don't need to mutate the process environment.
+pub fn expand_user_path(input: &str, home: Option<&std::path::Path>) -> PathBuf {
+    let trimmed = input.trim();
+    if let Some(home) = home {
+        if trimmed == "~" {
+            return home.to_path_buf();
+        }
+        if let Some(rest) = trimmed.strip_prefix("~/") {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
+}
+
+/// Resolve `$HOME` once per call; cheap, predictable, no globals.
+pub(crate) fn current_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Resolve the project the sidebar is "on". Prefers an explicit selection;
+/// falls back to the active worktree's project.
+fn selected_project_idx(state: &AppState) -> Option<usize> {
+    if let Some((p, _)) = state.sidebar_selection
+        && state.projects.get(p).is_some()
+    {
+        return Some(p);
+    }
+    state.active_worktree.map(|(p, _)| p)
+}
+
+fn cmd_worktree_remove(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
+    let Some((pi, Some(wi))) = state.sidebar_selection else {
+        state.command_status = Some("select a worktree in the sidebar first".into());
+        return;
+    };
+    let Some(project) = state.projects.get(pi) else {
+        return;
+    };
+    let Some(wt) = project.worktrees.get(wi) else {
+        return;
+    };
+    if wt.path == project.repo_path {
+        state.command_status = Some("can't remove the main worktree".into());
+        return;
+    }
+    state.pending_op = Some(format!("Removing worktree '{}'…", wt.name));
+    cmds.push(Command::RemoveWorktree {
+        project_idx: pi,
+        worktree_idx: wi,
+        repo_path: project.repo_path.clone(),
+        dest_path: wt.path.clone(),
+        branch: wt.branch.clone(),
+    });
+}
+
+fn cmd_edit(state: &mut AppState, _args: &[&str], _cmds: &mut Commands) {
+    let Some(project_idx) = selected_project_idx(state) else {
+        state.command_status = Some("select a project in the sidebar first".into());
+        return;
+    };
+    let project = &state.projects[project_idx];
+    let initial = project.setup_script.clone().unwrap_or_default();
+    let lines: Vec<String> = if initial.is_empty() {
+        vec![String::new()]
+    } else {
+        initial.split('\n').map(str::to_string).collect()
+    };
+    let mut textarea = ratatui_textarea::TextArea::new(lines);
+    textarea.set_cursor_line_style(ratatui::style::Style::default());
+    let title = format!("Setup script — {} (Ctrl-S save · Esc cancel)", project.name);
+    state.edit_popup = Some(EditPopup {
+        project_idx,
+        title,
+        textarea,
+    });
+}
+
+fn handle_set(state: &mut AppState, args: &[&str], cmds: &mut Commands) {
+    // Accept `:set key=value` or `:set key value`.
+    let (key, value): (String, String) = match args {
+        [single] => match single.split_once('=') {
+            Some((k, v)) => (k.trim().into(), v.trim().into()),
+            None => {
+                state.command_status = Some("usage: :set key=value".into());
+                return;
+            }
+        },
+        [k, v] => ((*k).into(), (*v).into()),
+        _ => {
+            state.command_status = Some("usage: :set key=value".into());
+            return;
+        }
+    };
+
+    match key.as_str() {
+        "sidebar.width" => match value.parse::<u16>() {
+            Ok(w) => set_sidebar_width(state, w, cmds),
+            Err(_) => state.command_status = Some(format!("invalid width: {value}")),
+        },
+        "theme" => match ThemeKind::parse(&value) {
+            Some(kind) => {
+                state.theme = Theme::for_kind(kind);
+                cmds.push(Command::SaveGlobalConfig);
+            }
+            None => {
+                state.command_status = Some(format!("invalid theme: {value} (expected dark|light)"))
+            }
+        },
+        _ => state.command_status = Some(format!("unknown setting: {key}")),
+    }
+}
+
+pub(crate) fn cmd_launch(state: &mut AppState, args: &[&str], cmds: &mut Commands) {
+    use crate::app::{LaunchEntry, LaunchPopup};
+
+    let Some((pi, wi)) = state.active_worktree else {
+        state.command_status = Some("no active worktree — pick one first".into());
+        return;
+    };
+
+    if let Some(name) = args.first() {
+        // Direct launch by name. "terminal"/"t" is the always-available plain
+        // shell; everything else looks up the project's configured launchers.
+        let cmd_text = if name.eq_ignore_ascii_case("terminal") || *name == "t" {
+            None
+        } else {
+            let Some(project) = state.projects.get(pi) else {
+                return;
+            };
+            match project
+                .launchers
+                .iter()
+                .find(|l| l.name.eq_ignore_ascii_case(name))
+            {
+                Some(l) => Some(l.command.clone()),
+                None => {
+                    state.command_status = Some(format!(
+                        "no launcher named '{name}' in project '{}'",
+                        project.name
+                    ));
+                    return;
+                }
+            }
+        };
+        launch_in_active_worktree(state, cmd_text, cmds);
+        return;
+    }
+
+    // No arg → open the picker. Always include the plain Terminal entry first.
+    let mut entries = vec![LaunchEntry {
+        label: "Terminal".into(),
+        command: None,
+    }];
+    if let Some(project) = state.projects.get(pi) {
+        for l in &project.launchers {
+            entries.push(LaunchEntry {
+                label: l.name.clone(),
+                command: Some(l.command.clone()),
+            });
+        }
+    }
+    state.launch_popup = Some(LaunchPopup {
+        project_idx: pi,
+        worktree_idx: wi,
+        entries,
+        cursor: 0,
+    });
+}
