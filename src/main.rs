@@ -24,7 +24,16 @@ mod session;
 mod supervisor;
 mod theme;
 
+mod updater;
+
 fn main() -> Result<()> {
+    // Tiny side flag used by `updater::install_update` to check the
+    // freshly-installed binary's IPC protocol version. Must short-circuit
+    // before any TUI / tokio setup.
+    if std::env::args().any(|a| a == "--print-protocol-version") {
+        println!("{}", ipc::PROTOCOL_VERSION);
+        return Ok(());
+    }
     if std::env::args().any(|a| a == "--supervisor") {
         // Supervisor: no TUI, no raw mode, no tokio runtime — just a sync
         // accept loop on the Unix socket.

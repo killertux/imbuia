@@ -1,6 +1,6 @@
 [package]
 name = "imbuia"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["Clemente <clemente@brick.so>"]
 description = "Elm-architecture TUI that supervises persistent terminal sessions across project worktrees."
@@ -21,7 +21,9 @@ nix = { version = "0.31.3", features = ["process", "fs", "signal", "term"] }
 portable-pty = "0.9.0"
 ratatui = "0.30"
 ratatui-textarea = "0.9"
+semver = "1.0.28"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 smallvec = "1.15.1"
 sysinfo = { version = "0.39.2", default-features = false, features = ["system"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "io-util", "signal", "time", "net", "fs"] }
@@ -30,6 +32,7 @@ toml = "1.1.2"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 unicode-width = "0.2.2"
+ureq = { version = "3.3.0", default-features = false, features = ["rustls", "json", "gzip"] }
 vt100 = "0.16.2"
 
 [profile.release]

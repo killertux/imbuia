@@ -96,6 +96,12 @@ pub const COMMANDS: &[CmdSpec] = &[
         description: "Launch a named command in a new tab (or pick from a popup).",
         handler: cmd_launch,
     },
+    CmdSpec {
+        names: &["update"],
+        usage: ":update [check]",
+        description: "Install the latest release; `check` only re-runs the version check.",
+        handler: cmd_update,
+    },
 ];
 
 pub(crate) fn execute_command(state: &mut AppState, s: &str, cmds: &mut Commands) {
@@ -399,4 +405,31 @@ pub(crate) fn cmd_launch(state: &mut AppState, args: &[&str], cmds: &mut Command
         entries,
         cursor: 0,
     });
+}
+
+pub(crate) fn cmd_update(state: &mut AppState, args: &[&str], cmds: &mut Commands) {
+    use crate::app::UpdateStatus;
+    if state.update_status == UpdateStatus::Installing {
+        state.command_status = Some("update already in progress".into());
+        return;
+    }
+    // `:update check` only re-runs the version check.
+    if matches!(args.first(), Some(arg) if arg.eq_ignore_ascii_case("check")) {
+        state.update_status = UpdateStatus::Checking;
+        state.command_status = Some("checking for updates…".into());
+        cmds.push(Command::CheckForUpdate);
+        return;
+    }
+    // `:update` no-arg: install if we already know of one, else kick a check.
+    if let Some(info) = state.available_update.clone() {
+        state.update_status = UpdateStatus::Installing;
+        state.command_status = Some(format!("installing {}…", info.latest_tag));
+        cmds.push(Command::InstallUpdate {
+            tag: info.latest_tag,
+        });
+        return;
+    }
+    state.update_status = UpdateStatus::Checking;
+    state.command_status = Some("no cached update; checking…".into());
+    cmds.push(Command::CheckForUpdate);
 }

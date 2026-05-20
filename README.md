@@ -36,10 +36,17 @@ opens a terminal in it, and runs your saved setup script automatically. Add
 named launchers (e.g. `claude`, `dev`, `repl`) and a single keystroke spawns
 a new tab running that command in the current worktree.
 
-## Install
+## Install & updates
 
-One-liner that fetches the latest release for your platform and drops the
-binary in `$HOME/.local/bin`:
+Imbuia auto-checks GitHub for new releases on startup and once an hour;
+when one's available, a `vX.Y.Z available · :update to install` hint
+appears in the action bar. Running `:update` installs in place
+(in-process pipes the install script into `sh`). If the IPC protocol
+hasn't changed, your existing supervisor and sessions survive the
+relaunch — otherwise `:rs` is needed.
+
+For the first install, one-liner that fetches the latest release for
+your platform and drops the binary in `$HOME/.local/bin`:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/killertux/imbuia/main/install.sh | sh
@@ -114,6 +121,7 @@ available follow-up keys. The current bindings:
 | `:restart-supervisor` / `:rs` | Kill PTY supervisor (and every session) and exit.             |
 | `:set theme=dark\|light`      | Switch palette (persisted).                                   |
 | `:set sidebar.width=N`        | Resize sidebar.                                               |
+| `:update`                     | Install the latest release. With `check`, just re-runs the version check. |
 
 ## Setup scripts
 

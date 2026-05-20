@@ -179,6 +179,41 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
                 popup.cursor = popup.cursor.min(max_row);
             }
         }
+        Action::UpdateChecked(Ok(Some(info))) => {
+            tracing::info!(latest = %info.latest_tag, "update available");
+            state.available_update = Some(info);
+            state.update_status = crate::app::UpdateStatus::Idle;
+        }
+        Action::UpdateChecked(Ok(None)) => {
+            state.available_update = None;
+            state.update_status = crate::app::UpdateStatus::Idle;
+        }
+        Action::UpdateChecked(Err(e)) => {
+            tracing::warn!("update check failed: {e}");
+            state.update_status = crate::app::UpdateStatus::Idle;
+        }
+        Action::UpdateInstalled(Ok(outcome)) => {
+            state.update_status = crate::app::UpdateStatus::InstalledPendingRestart;
+            state.available_update = None;
+            let tag = &outcome.installed_tag;
+            state.command_status = Some(if outcome.supervisor_restart_required {
+                format!(
+                    "installed {tag} — supervisor protocol changed; run :rs (kills sessions) then relaunch"
+                )
+            } else {
+                format!("installed {tag} — relaunch the client to switch over (sessions preserved)")
+            });
+        }
+        Action::UpdateInstalled(Err(e)) => {
+            state.update_status = crate::app::UpdateStatus::Idle;
+            state.command_status = Some(format!("update failed: {e}"));
+        }
+        Action::PeriodicUpdateCheck => {
+            if state.update_status == crate::app::UpdateStatus::Idle {
+                state.update_status = crate::app::UpdateStatus::Checking;
+                cmds.push(Command::CheckForUpdate);
+            }
+        }
         Action::Quit => {
             state.running = false;
             cmds.push(Command::Shutdown);
@@ -2418,6 +2453,111 @@ mod tests {
         assert!(s.pending_leader.is_none());
         assert!(s.open_project_popup.is_none());
         assert!(s.running);
+    }
+
+    #[test]
+    fn update_checked_some_sets_available_update() {
+        let mut s = AppState::new();
+        s.update_status = crate::app::UpdateStatus::Checking;
+        let info = crate::updater::UpdateInfo {
+            latest_tag: "v9.9.9".into(),
+            latest_version: semver::Version::parse("9.9.9").unwrap(),
+        };
+        let _ = reduce(&mut s, Action::UpdateChecked(Ok(Some(info))));
+        assert_eq!(
+            s.available_update.as_ref().map(|i| i.latest_tag.as_str()),
+            Some("v9.9.9")
+        );
+        assert_eq!(s.update_status, crate::app::UpdateStatus::Idle);
+    }
+
+    #[test]
+    fn update_checked_none_clears_available_update() {
+        let mut s = AppState::new();
+        s.available_update = Some(crate::updater::UpdateInfo {
+            latest_tag: "v9.9.9".into(),
+            latest_version: semver::Version::parse("9.9.9").unwrap(),
+        });
+        let _ = reduce(&mut s, Action::UpdateChecked(Ok(None)));
+        assert!(s.available_update.is_none());
+    }
+
+    #[test]
+    fn update_installed_no_restart_shows_friendly_status() {
+        let mut s = AppState::new();
+        let outcome = crate::updater::InstallOutcome {
+            installed_to: std::path::PathBuf::from("/tmp"),
+            supervisor_restart_required: false,
+            installed_tag: "v0.4.0".into(),
+        };
+        let _ = reduce(&mut s, Action::UpdateInstalled(Ok(outcome)));
+        let status = s.command_status.as_deref().unwrap();
+        assert!(status.contains("v0.4.0"));
+        assert!(status.contains("relaunch"));
+        assert!(!status.contains(":rs"));
+        assert_eq!(
+            s.update_status,
+            crate::app::UpdateStatus::InstalledPendingRestart
+        );
+    }
+
+    #[test]
+    fn update_installed_with_protocol_bump_asks_for_rs() {
+        let mut s = AppState::new();
+        let outcome = crate::updater::InstallOutcome {
+            installed_to: std::path::PathBuf::from("/tmp"),
+            supervisor_restart_required: true,
+            installed_tag: "v0.4.0".into(),
+        };
+        let _ = reduce(&mut s, Action::UpdateInstalled(Ok(outcome)));
+        let status = s.command_status.as_deref().unwrap();
+        assert!(status.contains(":rs"));
+    }
+
+    #[test]
+    fn periodic_update_check_emits_command_when_idle() {
+        let mut s = AppState::new();
+        let cmds = reduce(&mut s, Action::PeriodicUpdateCheck);
+        assert!(matches!(cmds.as_slice(), [Command::CheckForUpdate]));
+        assert_eq!(s.update_status, crate::app::UpdateStatus::Checking);
+    }
+
+    #[test]
+    fn periodic_update_check_is_inert_while_installing() {
+        let mut s = AppState::new();
+        s.update_status = crate::app::UpdateStatus::Installing;
+        let cmds = reduce(&mut s, Action::PeriodicUpdateCheck);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn cmd_update_check_pushes_check_command() {
+        let mut s = AppState::new();
+        let cmds = submit_command(&mut s, "update check");
+        assert!(matches!(cmds.as_slice(), [Command::CheckForUpdate]));
+        assert_eq!(s.update_status, crate::app::UpdateStatus::Checking);
+    }
+
+    #[test]
+    fn cmd_update_with_cached_info_installs_directly() {
+        let mut s = AppState::new();
+        s.available_update = Some(crate::updater::UpdateInfo {
+            latest_tag: "v9.9.9".into(),
+            latest_version: semver::Version::parse("9.9.9").unwrap(),
+        });
+        let cmds = submit_command(&mut s, "update");
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::InstallUpdate { tag }] if tag == "v9.9.9"
+        ));
+        assert_eq!(s.update_status, crate::app::UpdateStatus::Installing);
+    }
+
+    #[test]
+    fn cmd_update_without_cache_kicks_a_check() {
+        let mut s = AppState::new();
+        let cmds = submit_command(&mut s, "update");
+        assert!(matches!(cmds.as_slice(), [Command::CheckForUpdate]));
     }
 
     #[test]
