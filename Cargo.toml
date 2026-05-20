@@ -6,8 +6,8 @@ authors = ["Clemente <clemente@brick.so>"]
 description = "Elm-architecture TUI that supervises persistent terminal sessions across project worktrees."
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/clemento/imbuia"
-homepage = "https://github.com/clemento/imbuia"
+repository = "https://github.com/killertux/imbuia"
+homepage = "https://github.com/killertux/imbuia"
 keywords = ["tui", "terminal", "ratatui", "worktree", "pty"]
 categories = ["command-line-utilities", "development-tools"]
 
