@@ -241,6 +241,10 @@ pub struct AppState {
     /// Drives the right-aligned banner in the action bar.
     pub available_update: Option<crate::updater::UpdateInfo>,
     pub update_status: UpdateStatus,
+    /// `true` when the user typed `:update` (no args) and we had to kick a
+    /// check first. The next `Action::UpdateChecked(Ok(Some(_)))` auto-installs
+    /// instead of just setting the banner.
+    pub auto_install_after_check: bool,
 }
 
 impl AppState {
@@ -274,6 +278,7 @@ impl AppState {
             global_launchers: Vec::new(),
             available_update: None,
             update_status: UpdateStatus::Idle,
+            auto_install_after_check: false,
         }
     }
 
