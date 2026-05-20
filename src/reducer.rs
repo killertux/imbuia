@@ -1613,6 +1613,68 @@ mod tests {
     }
 
     #[test]
+    fn launch_named_falls_back_to_global() {
+        let mut s = mk_state_with_mock_projects();
+        s.active_worktree = Some((0, 0));
+        s.global_launchers = vec![crate::app::Launcher {
+            name: "claude".into(),
+            command: "claude --global".into(),
+        }];
+        let cmds = submit_command(&mut s, "launch claude");
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::SpawnInWorktree { initial_command: Some(c), .. }]
+                if c == "claude --global"
+        ));
+    }
+
+    #[test]
+    fn launch_project_shadows_global_with_same_name() {
+        let mut s = mk_state_with_mock_projects();
+        s.active_worktree = Some((0, 0));
+        s.projects[0].launchers = vec![crate::app::Launcher {
+            name: "claude".into(),
+            command: "claude --project".into(),
+        }];
+        s.global_launchers = vec![crate::app::Launcher {
+            name: "claude".into(),
+            command: "claude --global".into(),
+        }];
+        let cmds = submit_command(&mut s, "launch claude");
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::SpawnInWorktree { initial_command: Some(c), .. }]
+                if c == "claude --project"
+        ));
+    }
+
+    #[test]
+    fn launch_popup_includes_globals_with_dedup() {
+        let mut s = mk_state_with_mock_projects();
+        s.active_worktree = Some((0, 0));
+        s.projects[0].launchers = vec![crate::app::Launcher {
+            name: "dev".into(),
+            command: "pnpm dev".into(),
+        }];
+        s.global_launchers = vec![
+            crate::app::Launcher {
+                name: "dev".into(),
+                command: "ignored".into(),
+            },
+            crate::app::Launcher {
+                name: "repl".into(),
+                command: "node".into(),
+            },
+        ];
+        let _ = submit_command(&mut s, "launch");
+        let popup = s.launch_popup.as_ref().unwrap();
+        let labels: Vec<_> = popup.entries.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(labels, vec!["Terminal", "dev", "repl"]);
+        assert_eq!(popup.entries[1].source, crate::app::LaunchSource::Project);
+        assert_eq!(popup.entries[2].source, crate::app::LaunchSource::Global);
+    }
+
+    #[test]
     fn launch_unknown_name_sets_status() {
         let mut s = mk_state_with_mock_projects();
         s.active_worktree = Some((0, 0));

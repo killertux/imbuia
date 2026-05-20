@@ -13,6 +13,11 @@ pub struct GlobalConfig {
     pub theme: ThemeKind,
     #[serde(default)]
     pub projects: Vec<String>,
+    /// Launchers available across every project. Merged with the per-project
+    /// [`ProjectConfig::launchers`] at runtime; a project-level entry with
+    /// the same name overrides the global one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launchers: Vec<LauncherConfig>,
 }
 
 impl Default for GlobalConfig {
@@ -21,6 +26,7 @@ impl Default for GlobalConfig {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             theme: ThemeKind::default(),
             projects: Vec::new(),
+            launchers: Vec::new(),
         }
     }
 }
@@ -227,6 +233,7 @@ mod tests {
             sidebar_width: 30,
             theme: ThemeKind::default(),
             projects: vec!["../etc".into(), "ok".into()],
+            launchers: Vec::new(),
         };
         save_global(&dir, &global).unwrap();
         let proj = ProjectConfig {
@@ -255,6 +262,7 @@ mod tests {
             sidebar_width: 30,
             theme: ThemeKind::Light,
             projects: vec!["foo".into()],
+            launchers: Vec::new(),
         };
         save_global(&dir, &global).unwrap();
         let loaded = load_global(&dir).unwrap();

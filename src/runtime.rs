@@ -43,6 +43,14 @@ pub async fn run() -> Result<()> {
     state.config_dir = config_dir.clone();
     state.sidebar_width = global.sidebar_width;
     state.theme = Theme::for_kind(global.theme);
+    state.global_launchers = global
+        .launchers
+        .into_iter()
+        .map(|l| crate::app::Launcher {
+            name: l.name,
+            command: l.command,
+        })
+        .collect();
     state.projects = project_cfgs.into_iter().map(Project::from_config).collect();
     if !state.projects.is_empty() {
         state.sidebar_selection = Some((0, None));
@@ -244,6 +252,14 @@ fn execute(
                 sidebar_width: state.sidebar_width,
                 theme: state.theme.kind,
                 projects: state_slugs(state),
+                launchers: state
+                    .global_launchers
+                    .iter()
+                    .map(|l| config::LauncherConfig {
+                        name: l.name.clone(),
+                        command: l.command.clone(),
+                    })
+                    .collect(),
             };
             if let Err(e) = config::save_global(&state.config_dir, &global) {
                 tracing::warn!("save_global failed: {e}");

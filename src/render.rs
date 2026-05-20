@@ -96,12 +96,18 @@ fn render_launch_popup(
             Style::default().fg(theme.fg)
         };
         let detail = match &entry.command {
-            Some(c) => format!("  {}", truncate(c, 48)),
+            Some(c) => format!("  {}", truncate(c, 44)),
             None => "  (plain shell)".to_string(),
+        };
+        let tag = match entry.source {
+            crate::app::LaunchSource::Builtin => "",
+            crate::app::LaunchSource::Project => "  [project]",
+            crate::app::LaunchSource::Global => "  [global]",
         };
         lines.push(Line::from(vec![
             Span::styled(format!("{prefix}{}", entry.label), style),
             Span::styled(detail, Style::default().fg(theme.fg_dim)),
+            Span::styled(tag.to_string(), Style::default().fg(theme.fg_dim)),
         ]));
     }
     lines.push(Line::from(""));
