@@ -45,6 +45,62 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     } else if let Some(launch) = &state.launch_popup {
         render_launch_popup(frame, area, launch, theme);
     }
+
+    // Always last so it floats over whatever is below.
+    if matches!(state.pending_leader, Some(crate::app::Leader::Space)) {
+        render_space_leader_hint(frame, area, theme);
+    }
+}
+
+fn render_space_leader_hint(frame: &mut Frame, area: Rect, theme: &Theme) {
+    let hints = crate::reducer::SPACE_LEADER_HINTS;
+    let inner_w = hints
+        .iter()
+        .map(|(k, d)| k.chars().count() + 3 + d.chars().count())
+        .max()
+        .unwrap_or(16) as u16
+        + 4;
+    let width = inner_w.min(area.width.saturating_sub(2));
+    let height = (hints.len() as u16 + 3).min(area.height.saturating_sub(2));
+
+    // Anchor to bottom-right so it doesn't cover the terminal viewport.
+    let x = area.x + area.width.saturating_sub(width).saturating_sub(1);
+    let y = area.y + area.height.saturating_sub(height).saturating_sub(2);
+    let r = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, r);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border_focus))
+        .style(Style::default().bg(theme.bg).fg(theme.fg))
+        .title(
+            Line::from(" <Space> ")
+                .style(
+                    Style::default()
+                        .fg(theme.header_fg)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .alignment(Alignment::Left),
+        );
+    let inner = block.inner(r);
+    frame.render_widget(block, r);
+
+    let mut lines = Vec::with_capacity(hints.len() + 1);
+    for (key, desc) in hints {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:<2}", key),
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ".to_string(), Style::default()),
+            Span::styled((*desc).to_string(), Style::default().fg(theme.fg_dim)),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        " Esc cancel".to_string(),
+        Style::default().fg(theme.fg_dim),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_launch_popup(
@@ -592,10 +648,15 @@ fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines.push(row("Ctrl-W =", "reset sidebar to default width"));
     lines.push(Line::from(""));
 
-    lines.push(header("PROJECTS & WORKTREES".into()));
-    lines.push(row("Shift-O", "open project popup (path + setup script)"));
-    lines.push(row("Shift-W", "new worktree popup"));
-    lines.push(row("Shift-L", "launcher picker (`:launch [name]`)"));
+    lines.push(header("LEADER (<Space>)".into()));
+    lines.push(row("<Space> o", "open project popup"));
+    lines.push(row("<Space> w", "new worktree"));
+    lines.push(row("<Space> W", "remove selected worktree"));
+    lines.push(row("<Space> l", "launcher picker"));
+    lines.push(row("<Space> e", "edit project setup script"));
+    lines.push(row("<Space> u", "usage popup"));
+    lines.push(row("<Space> ?", "this help"));
+    lines.push(row("<Space> q", "quit"));
     lines.push(Line::from(""));
 
     lines.push(header("POPUPS".into()));
