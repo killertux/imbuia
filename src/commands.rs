@@ -413,14 +413,16 @@ pub(crate) fn cmd_update(state: &mut AppState, args: &[&str], cmds: &mut Command
         state.command_status = Some("update already in progress".into());
         return;
     }
-    // `:update check` only re-runs the version check.
+    // `:update check` only re-runs the version check — never auto-installs.
     if matches!(args.first(), Some(arg) if arg.eq_ignore_ascii_case("check")) {
+        state.auto_install_after_check = false;
         state.update_status = UpdateStatus::Checking;
         state.command_status = Some("checking for updates…".into());
         cmds.push(Command::CheckForUpdate);
         return;
     }
-    // `:update` no-arg: install if we already know of one, else kick a check.
+    // `:update` no-arg: install if we already know of one, else kick a check
+    // and let `Action::UpdateChecked(Ok(Some(_)))` auto-install when it lands.
     if let Some(info) = state.available_update.clone() {
         state.update_status = UpdateStatus::Installing;
         state.command_status = Some(format!("installing {}…", info.latest_tag));
@@ -429,7 +431,8 @@ pub(crate) fn cmd_update(state: &mut AppState, args: &[&str], cmds: &mut Command
         });
         return;
     }
+    state.auto_install_after_check = true;
     state.update_status = UpdateStatus::Checking;
-    state.command_status = Some("no cached update; checking…".into());
+    state.command_status = Some("checking for updates…".into());
     cmds.push(Command::CheckForUpdate);
 }

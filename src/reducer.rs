@@ -181,16 +181,37 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
         }
         Action::UpdateChecked(Ok(Some(info))) => {
             tracing::info!(latest = %info.latest_tag, "update available");
+            let tag = info.latest_tag.clone();
             state.available_update = Some(info);
-            state.update_status = crate::app::UpdateStatus::Idle;
+            if state.auto_install_after_check {
+                state.auto_install_after_check = false;
+                state.update_status = crate::app::UpdateStatus::Installing;
+                state.command_status = Some(format!("installing {tag}…"));
+                cmds.push(Command::InstallUpdate { tag });
+            } else {
+                state.update_status = crate::app::UpdateStatus::Idle;
+                state.command_status = Some(format!("{tag} available — :update to install"));
+            }
         }
         Action::UpdateChecked(Ok(None)) => {
             state.available_update = None;
             state.update_status = crate::app::UpdateStatus::Idle;
+            let was_user_initiated = state.auto_install_after_check;
+            state.auto_install_after_check = false;
+            // Only chirp on user-initiated checks. The hourly background tick
+            // shouldn't pester the status row when nothing's new.
+            if was_user_initiated {
+                state.command_status = Some("already on the latest release".into());
+            }
         }
         Action::UpdateChecked(Err(e)) => {
             tracing::warn!("update check failed: {e}");
             state.update_status = crate::app::UpdateStatus::Idle;
+            let was_user_initiated = state.auto_install_after_check;
+            state.auto_install_after_check = false;
+            if was_user_initiated {
+                state.command_status = Some(format!("update check failed: {e}"));
+            }
         }
         Action::UpdateInstalled(Ok(outcome)) => {
             state.update_status = crate::app::UpdateStatus::InstalledPendingRestart;
@@ -2558,6 +2579,60 @@ mod tests {
         let mut s = AppState::new();
         let cmds = submit_command(&mut s, "update");
         assert!(matches!(cmds.as_slice(), [Command::CheckForUpdate]));
+        assert!(s.auto_install_after_check);
+    }
+
+    #[test]
+    fn cmd_update_check_does_not_arm_auto_install() {
+        let mut s = AppState::new();
+        let _ = submit_command(&mut s, "update check");
+        assert!(!s.auto_install_after_check);
+    }
+
+    #[test]
+    fn update_check_then_some_auto_installs_when_armed() {
+        // Simulates: user types :update with no cached info, the check fires,
+        // and a newer release is found — we should auto-install instead of
+        // leaving the user staring at "checking for updates…".
+        let mut s = AppState::new();
+        let _ = submit_command(&mut s, "update");
+        assert!(s.auto_install_after_check);
+        let info = crate::updater::UpdateInfo {
+            latest_tag: "v9.9.9".into(),
+            latest_version: semver::Version::parse("9.9.9").unwrap(),
+        };
+        let cmds = reduce(&mut s, Action::UpdateChecked(Ok(Some(info))));
+        assert!(!s.auto_install_after_check);
+        assert_eq!(s.update_status, crate::app::UpdateStatus::Installing);
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::InstallUpdate { tag }] if tag == "v9.9.9"
+        ));
+    }
+
+    #[test]
+    fn update_check_then_none_when_armed_says_up_to_date() {
+        let mut s = AppState::new();
+        let _ = submit_command(&mut s, "update");
+        let _ = reduce(&mut s, Action::UpdateChecked(Ok(None)));
+        assert!(!s.auto_install_after_check);
+        assert!(
+            s.command_status
+                .as_deref()
+                .unwrap()
+                .contains("already on the latest")
+        );
+    }
+
+    #[test]
+    fn background_check_does_not_set_command_status() {
+        // Hourly tick → PeriodicUpdateCheck → CheckForUpdate. When the check
+        // returns None, the status row should NOT chirp at the user.
+        let mut s = AppState::new();
+        let _ = reduce(&mut s, Action::PeriodicUpdateCheck);
+        assert!(!s.auto_install_after_check);
+        let _ = reduce(&mut s, Action::UpdateChecked(Ok(None)));
+        assert!(s.command_status.is_none());
     }
 
     #[test]
