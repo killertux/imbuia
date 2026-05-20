@@ -322,7 +322,7 @@ fn handle_set(state: &mut AppState, args: &[&str], cmds: &mut Commands) {
 }
 
 pub(crate) fn cmd_launch(state: &mut AppState, args: &[&str], cmds: &mut Commands) {
-    use crate::app::{LaunchEntry, LaunchPopup};
+    use crate::app::{LaunchEntry, LaunchPopup, LaunchSource};
 
     let Some((pi, wi)) = state.active_worktree else {
         state.command_status = Some("no active worktree — pick one first".into());
@@ -331,24 +331,31 @@ pub(crate) fn cmd_launch(state: &mut AppState, args: &[&str], cmds: &mut Command
 
     if let Some(name) = args.first() {
         // Direct launch by name. "terminal"/"t" is the always-available plain
-        // shell; everything else looks up the project's configured launchers.
+        // shell; everything else looks up project launchers first, then the
+        // global fallback list.
         let cmd_text = if name.eq_ignore_ascii_case("terminal") || *name == "t" {
             None
         } else {
-            let Some(project) = state.projects.get(pi) else {
-                return;
-            };
-            match project
-                .launchers
-                .iter()
-                .find(|l| l.name.eq_ignore_ascii_case(name))
-            {
-                Some(l) => Some(l.command.clone()),
+            let project_match = state
+                .projects
+                .get(pi)
+                .and_then(|p| {
+                    p.launchers
+                        .iter()
+                        .find(|l| l.name.eq_ignore_ascii_case(name))
+                })
+                .map(|l| l.command.clone());
+            let resolved = project_match.or_else(|| {
+                state
+                    .global_launchers
+                    .iter()
+                    .find(|l| l.name.eq_ignore_ascii_case(name))
+                    .map(|l| l.command.clone())
+            });
+            match resolved {
+                Some(c) => Some(c),
                 None => {
-                    state.command_status = Some(format!(
-                        "no launcher named '{name}' in project '{}'",
-                        project.name
-                    ));
+                    state.command_status = Some(format!("no launcher named '{name}'"));
                     return;
                 }
             }
@@ -357,18 +364,34 @@ pub(crate) fn cmd_launch(state: &mut AppState, args: &[&str], cmds: &mut Command
         return;
     }
 
-    // No arg → open the picker. Always include the plain Terminal entry first.
+    // No arg → open the picker. Order: Terminal first, then project launchers,
+    // then global launchers (deduped by case-insensitive name; the project
+    // entry wins when a name collides — closer scope beats wider scope).
     let mut entries = vec![LaunchEntry {
         label: "Terminal".into(),
         command: None,
+        source: LaunchSource::Builtin,
     }];
+    let mut seen: Vec<String> = Vec::new();
     if let Some(project) = state.projects.get(pi) {
         for l in &project.launchers {
             entries.push(LaunchEntry {
                 label: l.name.clone(),
                 command: Some(l.command.clone()),
+                source: LaunchSource::Project,
             });
+            seen.push(l.name.to_ascii_lowercase());
         }
+    }
+    for l in &state.global_launchers {
+        if seen.contains(&l.name.to_ascii_lowercase()) {
+            continue;
+        }
+        entries.push(LaunchEntry {
+            label: l.name.clone(),
+            command: Some(l.command.clone()),
+            source: LaunchSource::Global,
+        });
     }
     state.launch_popup = Some(LaunchPopup {
         project_idx: pi,

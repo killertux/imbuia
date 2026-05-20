@@ -120,7 +120,7 @@ new tab in the active worktree and runs `claude` as its first input.
 `Shift-L` (or `:launch` with no arg) opens a picker showing the project's
 launchers plus a always-present `Terminal` entry for a plain shell.
 
-Configure them per-project in
+Launchers can live in two places. Per-project in
 `~/.config/imbuia/projects/<slug>.toml`:
 
 ```toml
@@ -133,8 +133,22 @@ name = "dev"
 command = "pnpm dev"
 ```
 
-(No in-app editor yet — edit the TOML by hand or via `:edit` + a future
-extension.)
+Or globally in `~/.config/imbuia/config.toml`, where they're available
+across every project:
+
+```toml
+[[launchers]]
+name = "claude"
+command = "claude"
+
+[[launchers]]
+name = "repl"
+command = "node"
+```
+
+The picker shows both lists with a `[project]` / `[global]` tag. When the
+same name appears in both, the project entry wins (closer scope beats wider
+scope). No in-app editor yet — edit the TOML by hand.
 
 ## Config
 

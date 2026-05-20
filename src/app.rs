@@ -121,6 +121,17 @@ pub struct LaunchEntry {
     pub label: String,
     /// `None` is the always-present "Terminal" entry (plain shell).
     pub command: Option<String>,
+    pub source: LaunchSource,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LaunchSource {
+    /// Built-in entry (the `Terminal` row).
+    Builtin,
+    /// Defined on the active project.
+    Project,
+    /// Defined in the global config; falls back when no project entry shadows it.
+    Global,
 }
 
 /// Modal "resource usage" dashboard. Driven by 1 Hz `Usage` frames from the
@@ -207,6 +218,10 @@ pub struct AppState {
     pub pending_op: Option<String>,
     /// Active color palette. Persisted in the global config.
     pub theme: Theme,
+    /// Cross-project launchers loaded from `config.toml`. Merged with the
+    /// selected project's launchers at `:launch` time; project entries with
+    /// the same name take precedence.
+    pub global_launchers: Vec<Launcher>,
 }
 
 impl AppState {
@@ -237,6 +252,7 @@ impl AppState {
             config_dir: PathBuf::new(),
             pending_op: None,
             theme: Theme::default(),
+            global_launchers: Vec::new(),
         }
     }
 
