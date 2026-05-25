@@ -84,6 +84,20 @@ pub enum PopupAction {
     NewWorktree { project_idx: usize },
 }
 
+/// Inline confirmation shown in the action bar (no modal popup). Answered with
+/// `y`/`n` in Normal mode; `Esc` cancels.
+#[derive(Clone, Debug)]
+pub enum PendingConfirm {
+    RemoveWorktree {
+        project_idx: usize,
+        worktree_idx: usize,
+        name: String,
+        repo_path: PathBuf,
+        dest_path: PathBuf,
+        branch: Option<String>,
+    },
+}
+
 /// Multi-line edit popup driven by `ratatui-textarea`. Currently used by
 /// `:edit` to edit the selected project's `setup_script`.
 pub struct EditPopup {
@@ -231,6 +245,10 @@ pub struct AppState {
     /// Description of the currently running async operation (open project,
     /// add worktree). Cleared when the result action arrives.
     pub pending_op: Option<String>,
+    /// In-flight action bar confirmation (e.g. worktree delete). Mutually
+    /// exclusive with normal Normal-mode key handling: while `Some`, keys are
+    /// routed to the y/n/Esc prompt.
+    pub pending_confirm: Option<PendingConfirm>,
     /// Active color palette. Persisted in the global config.
     pub theme: Theme,
     /// Cross-project launchers loaded from `config.toml`. Merged with the
@@ -274,6 +292,7 @@ impl AppState {
             usage_popup: None,
             config_dir: PathBuf::new(),
             pending_op: None,
+            pending_confirm: None,
             theme: Theme::default(),
             global_launchers: Vec::new(),
             available_update: None,

@@ -4,8 +4,8 @@
 //! else in this module is a private helper used to keep `reduce` small.
 
 use crate::app::{
-    Action, AppState, Command, Commands, InputPopup, Leader, Mode, PopupAction, SidebarRow,
-    UiFocus, Worktree,
+    Action, AppState, Command, Commands, InputPopup, Leader, Mode, PendingConfirm, PopupAction,
+    SidebarRow, UiFocus, Worktree,
 };
 use crate::layout::{ChromeRects, DEFAULT_SIDEBAR_WIDTH, chrome, clamp_sidebar_width};
 use crate::session::SessionId;
@@ -337,6 +337,14 @@ fn handle_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
     // Input popup is modal: keys edit the popup buffer.
     if state.popup.is_some() {
         handle_popup_key(state, k, cmds);
+        return;
+    }
+
+    // Inline action-bar confirmation (e.g. worktree delete). Only intercepts
+    // in Normal mode so the user can still escape into Command/Terminal by
+    // dismissing first with Esc.
+    if state.pending_confirm.is_some() && matches!(state.mode, Mode::Normal) {
+        handle_pending_confirm_key(state, k, cmds);
         return;
     }
 
@@ -893,6 +901,40 @@ fn cycle_command_completion(state: &mut AppState, delta: i32) {
         Some(i) => (i as i32 + delta).rem_euclid(len),
     };
     comp.selected = Some(next as usize);
+}
+
+fn handle_pending_confirm_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
+    match k.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            let Some(confirm) = state.pending_confirm.take() else {
+                return;
+            };
+            match confirm {
+                PendingConfirm::RemoveWorktree {
+                    project_idx,
+                    worktree_idx,
+                    name,
+                    repo_path,
+                    dest_path,
+                    branch,
+                } => {
+                    state.pending_op = Some(format!("Removing worktree '{name}'…"));
+                    cmds.push(Command::RemoveWorktree {
+                        project_idx,
+                        worktree_idx,
+                        repo_path,
+                        dest_path,
+                        branch,
+                    });
+                }
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            state.pending_confirm = None;
+            state.command_status = Some("cancelled".into());
+        }
+        _ => {}
+    }
 }
 
 fn handle_popup_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
@@ -2865,6 +2907,20 @@ mod tests {
         s.projects[0].worktrees[1].path = PathBuf::from("/tmp/feat-x");
         s.sidebar_selection = Some((0, Some(1)));
         let cmds = submit_command(&mut s, "worktree-remove");
+        // First step: a confirmation is staged, nothing is dispatched yet.
+        assert!(cmds.is_empty());
+        assert!(matches!(
+            s.pending_confirm,
+            Some(PendingConfirm::RemoveWorktree {
+                project_idx: 0,
+                worktree_idx: 1,
+                ..
+            })
+        ));
+        // Confirming with `y` emits the RemoveWorktree command and clears the
+        // confirmation in favor of a pending_op for the action bar.
+        let cmds = reduce(&mut s, Action::Key(plain('y')));
+        assert!(s.pending_confirm.is_none());
         assert!(s.pending_op.is_some());
         assert!(matches!(
             cmds.as_slice(),
@@ -2874,6 +2930,20 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn worktree_remove_confirmation_cancelled_by_n() {
+        let mut s = AppState::new();
+        s.projects = mock_projects();
+        s.projects[0].worktrees[1].path = PathBuf::from("/tmp/feat-x");
+        s.sidebar_selection = Some((0, Some(1)));
+        let _ = submit_command(&mut s, "worktree-remove");
+        assert!(s.pending_confirm.is_some());
+        let cmds = reduce(&mut s, Action::Key(plain('n')));
+        assert!(s.pending_confirm.is_none());
+        assert!(s.pending_op.is_none());
+        assert!(cmds.is_empty());
     }
 
     #[test]
