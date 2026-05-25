@@ -288,7 +288,10 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
                 state.command_status = Some(if matched == 0 {
                     "PR status refreshed (no open PRs)".into()
                 } else {
-                    format!("PR status refreshed ({matched} PR{})", if matched == 1 { "" } else { "s" })
+                    format!(
+                        "PR status refreshed ({matched} PR{})",
+                        if matched == 1 { "" } else { "s" }
+                    )
                 });
             }
         }

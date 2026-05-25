@@ -747,7 +747,14 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
                 let dot = if active { "●" } else { "○" };
                 let selected = state.sidebar_selection == Some((pi, Some(wi)));
                 lines.push(worktree_line(
-                    pi, wi, wt.name.as_str(), dot, selected, focused, max_w, state,
+                    pi,
+                    wi,
+                    wt.name.as_str(),
+                    dot,
+                    selected,
+                    focused,
+                    max_w,
+                    state,
                 ));
             }
         }
@@ -820,7 +827,9 @@ fn worktree_line(
     }
     // The bar keeps its color regardless of selection; only the bg follows
     // the row so the selection highlight stays continuous.
-    let bar_style = Style::default().fg(bar_color).bg(row_style.bg.unwrap_or(theme.bg));
+    let bar_style = Style::default()
+        .fg(bar_color)
+        .bg(row_style.bg.unwrap_or(theme.bg));
 
     Line::from(vec![
         Span::styled(bar_text.to_string(), bar_style),

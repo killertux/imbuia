@@ -88,13 +88,15 @@ pub fn fetch_pr_by_branch(repo_path: &Path, branch: &str) -> Result<Option<PrSta
             "headRefName,state,reviewDecision,mergeable,statusCheckRollup",
         ])
         .stdin(std::process::Stdio::null());
-    let out = cmd.output().map_err(|e| anyhow!("failed to spawn gh: {e}"))?;
+    let out = cmd
+        .output()
+        .map_err(|e| anyhow!("failed to spawn gh: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(anyhow!("gh pr list failed ({}): {}", out.status, stderr));
     }
-    let prs: Vec<PrInfo> = serde_json::from_slice(&out.stdout)
-        .map_err(|e| anyhow!("parsing gh json: {e}"))?;
+    let prs: Vec<PrInfo> =
+        serde_json::from_slice(&out.stdout).map_err(|e| anyhow!("parsing gh json: {e}"))?;
     Ok(prs.first().and_then(classify))
 }
 
@@ -176,7 +178,6 @@ pub fn _classify_test(
     };
     classify(&pr)
 }
-
 
 #[cfg(test)]
 mod tests {
