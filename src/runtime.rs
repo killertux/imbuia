@@ -38,6 +38,13 @@ pub async fn run() -> Result<()> {
 
     spawn_input_thread(action_tx.clone());
 
+    // Long-lived worker that serialises every `gh` invocation so a 2-min
+    // background poll never races with a foreground `:gh-refresh` (or another
+    // tick that arrived while gh was still chewing). Drops requests that
+    // arrive while one is already in flight for the *same project* — the
+    // newer request would observe the same upstream state anyway.
+    let gh_tx = spawn_gh_worker(action_tx.clone());
+
     let mut state = AppState::new();
     state.term_size = term_size;
     state.config_dir = config_dir.clone();
@@ -51,6 +58,7 @@ pub async fn run() -> Result<()> {
             command: l.command,
         })
         .collect();
+    state.gh_poll_interval_secs = global.gh_poll_interval_secs;
     state.projects = project_cfgs.into_iter().map(Project::from_config).collect();
     if !state.projects.is_empty() {
         state.sidebar_selection = Some((0, None));
@@ -64,7 +72,7 @@ pub async fn run() -> Result<()> {
     if !state.sessions.is_empty() {
         let cmds = reduce(&mut state, Action::Resize(term_size));
         for cmd in cmds {
-            execute(cmd, &state, &action_tx, &notify, &supervisor);
+            execute(cmd, &state, &action_tx, &notify, &supervisor, &gh_tx);
         }
     }
 
@@ -72,6 +80,17 @@ pub async fn run() -> Result<()> {
     // first poll, which is what we want — kicks off the startup check.
     let mut update_tick = tokio::time::interval(Duration::from_secs(3600));
     update_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // PR status poll. Ticks every 30s; the reducer fans this out into one
+    // `FetchPrStatuses` per gh-enabled project, and the runtime gates per
+    // (project, last-fetched-at) so each project only refreshes at its own
+    // cadence — see `pr_poll_last` below.
+    let mut pr_tick = tokio::time::interval(Duration::from_secs(30));
+    pr_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Per-project last-poll instant, keyed by slug so it survives index
+    // shuffles. Built lazily; missing entry => "never polled, fetch now".
+    let mut pr_poll_last: std::collections::HashMap<String, Instant> =
+        std::collections::HashMap::new();
 
     let mut redraw_at: Option<Instant> = Some(Instant::now());
 
@@ -85,9 +104,9 @@ pub async fn run() -> Result<()> {
             biased;
             maybe_action = action_rx.recv() => {
                 let Some(action) = maybe_action else { break };
-                handle_action(&mut state, action, &action_tx, &notify, &supervisor);
+                handle_action(&mut state, action, &action_tx, &notify, &supervisor, &gh_tx);
                 while let Ok(action) = action_rx.try_recv() {
-                    handle_action(&mut state, action, &action_tx, &notify, &supervisor);
+                    handle_action(&mut state, action, &action_tx, &notify, &supervisor, &gh_tx);
                 }
                 redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
             }
@@ -95,8 +114,14 @@ pub async fn run() -> Result<()> {
                 redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
             }
             _ = update_tick.tick() => {
-                handle_action(&mut state, Action::PeriodicUpdateCheck, &action_tx, &notify, &supervisor);
+                handle_action(&mut state, Action::PeriodicUpdateCheck, &action_tx, &notify, &supervisor, &gh_tx);
                 redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
+            }
+            _ = pr_tick.tick() => {
+                if maybe_emit_pr_poll(&mut state, &mut pr_poll_last) {
+                    handle_action(&mut state, Action::PeriodicPrCheck, &action_tx, &notify, &supervisor, &gh_tx);
+                    redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
+                }
             }
             _ = async {
                 match redraw_at {
@@ -151,10 +176,11 @@ fn handle_action(
     action_tx: &mpsc::Sender<Action>,
     notify: &Arc<Notify>,
     supervisor: &Arc<SupervisorClient>,
+    gh_tx: &std::sync::mpsc::Sender<GhRequest>,
 ) {
     let cmds = reduce(state, action);
     for cmd in cmds {
-        execute(cmd, state, action_tx, notify, supervisor);
+        execute(cmd, state, action_tx, notify, supervisor, gh_tx);
     }
 }
 
@@ -164,6 +190,7 @@ fn execute(
     action_tx: &mpsc::Sender<Action>,
     _notify: &Arc<Notify>,
     supervisor: &Arc<SupervisorClient>,
+    gh_tx: &std::sync::mpsc::Sender<GhRequest>,
 ) {
     match cmd {
         Command::WriteKey(id, key) => {
@@ -269,6 +296,7 @@ fn execute(
                         command: l.command.clone(),
                     })
                     .collect(),
+                gh_poll_interval_secs: state.gh_poll_interval_secs,
             };
             if let Err(e) = config::save_global(&state.config_dir, &global) {
                 tracing::warn!("save_global failed: {e}");
@@ -282,10 +310,167 @@ fn execute(
                 }
             }
         }
+        Command::FetchPrStatuses {
+            project_idx,
+            repo_path,
+            worktrees,
+        } => {
+            // Fire-and-forget: the worker thread serialises and forwards
+            // results via the same action_tx channel.
+            if let Err(e) = gh_tx.send(GhRequest {
+                project_idx,
+                repo_path,
+                worktrees,
+            }) {
+                tracing::warn!("gh worker channel closed: {e}");
+            }
+        }
         Command::CheckForUpdate => spawn_update_check(action_tx),
         Command::InstallUpdate { tag } => spawn_update_install(tag, action_tx),
         Command::Shutdown => {}
     }
+}
+
+/// Returns `true` if at least one project is due for a refresh, after also
+/// updating `last` with `now` for every project that just got queued. The
+/// reducer still walks `state.projects` to emit the actual commands; this
+/// helper just decides whether the tick should fire at all.
+fn maybe_emit_pr_poll(
+    state: &mut AppState,
+    last: &mut std::collections::HashMap<String, Instant>,
+) -> bool {
+    if !crate::github::gh_available() {
+        return false;
+    }
+    let now = Instant::now();
+    let global_default = Duration::from_secs(state.gh_poll_interval_secs.unwrap_or(120));
+    let mut any = false;
+    // Garbage-collect entries for projects that no longer exist.
+    let live_slugs: std::collections::HashSet<String> =
+        state.projects.iter().map(|p| p.slug.clone()).collect();
+    last.retain(|s, _| live_slugs.contains(s));
+    for p in &state.projects {
+        if !p.github_enabled {
+            continue;
+        }
+        let interval = p
+            .gh_poll_interval_secs
+            .map(Duration::from_secs)
+            .unwrap_or(global_default);
+        let due = match last.get(&p.slug) {
+            Some(t) => now.duration_since(*t) >= interval,
+            None => true,
+        };
+        if due {
+            last.insert(p.slug.clone(), now);
+            any = true;
+        }
+    }
+    any
+}
+
+/// Message handed to the gh worker. One request = one project's worth of
+/// branch lookups.
+struct GhRequest {
+    project_idx: usize,
+    repo_path: PathBuf,
+    worktrees: Vec<(usize, PathBuf)>,
+}
+
+/// Spawn the singleton worker. Returns its inbox sender.
+///
+/// The thread drains its queue serially: while it's processing project A,
+/// other requests pile up in the channel and run after. Coalescing: before
+/// starting a request, we drain any *additional* pending requests for the
+/// same project and keep only the newest — they'd just observe the same
+/// upstream state anyway.
+fn spawn_gh_worker(action_tx: mpsc::Sender<Action>) -> std::sync::mpsc::Sender<GhRequest> {
+    let (tx, rx) = std::sync::mpsc::channel::<GhRequest>();
+    std::thread::spawn(move || {
+        while let Ok(mut req) = rx.recv() {
+            // Drain anything else already queued; collapse same-project
+            // requests down to the newest one.
+            while let Ok(next) = rx.try_recv() {
+                if next.project_idx == req.project_idx {
+                    req = next;
+                } else {
+                    // Different project — process the current one first, then
+                    // re-queue `next` at the front by handling it after this
+                    // iteration. Simplest: handle req now, then handle next.
+                    do_fetch(req, &action_tx);
+                    req = next;
+                }
+            }
+            do_fetch(req, &action_tx);
+        }
+        tracing::info!("gh worker exiting (channel closed)");
+    });
+    tx
+}
+
+fn do_fetch(req: GhRequest, action_tx: &mpsc::Sender<Action>) {
+    let GhRequest {
+        project_idx,
+        repo_path,
+        worktrees,
+    } = req;
+    let tx = action_tx.clone();
+    // Inline body — the function used to spawn its own thread; now we run
+    // synchronously on the worker so requests are serialised.
+    let work = move || {
+        tracing::info!(
+            project_idx,
+            n = worktrees.len(),
+            repo = %repo_path.display(),
+            "gh: fetching per-worktree PR status"
+        );
+        let mut statuses: Vec<(usize, Option<crate::app::PrStatus>)> =
+            Vec::with_capacity(worktrees.len());
+        let mut last_err: Option<String> = None;
+        let mut any_ok = false;
+        for (wi, wt_path) in worktrees {
+            // Live HEAD resolution — picks up `git switch` inside the worktree.
+            let branch = match crate::git::head_branch(&wt_path) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    tracing::info!(project_idx, wi, path = %wt_path.display(), "gh: detached HEAD, skipping");
+                    statuses.push((wi, None));
+                    any_ok = true;
+                    continue;
+                }
+                Err(e) => {
+                    let msg = format!("git symbolic-ref failed: {e}");
+                    tracing::warn!(project_idx, wi, path = %wt_path.display(), "{msg}");
+                    last_err = Some(msg);
+                    continue;
+                }
+            };
+            match crate::github::fetch_pr_by_branch(&repo_path, &branch) {
+                Ok(s) => {
+                    any_ok = true;
+                    tracing::info!(project_idx, wi, %branch, status = ?s, "gh: branch status");
+                    statuses.push((wi, s));
+                }
+                Err(e) => {
+                    let msg = format!("{e}");
+                    tracing::warn!(project_idx, wi, %branch, "gh: branch fetch failed: {msg}");
+                    last_err = Some(msg);
+                }
+            }
+        }
+        if !any_ok && let Some(msg) = last_err {
+            let _ = tx.blocking_send(Action::PrFetchFailed {
+                project_idx,
+                message: msg,
+            });
+            return;
+        }
+        let _ = tx.blocking_send(Action::PrStatusesFetched {
+            project_idx,
+            statuses,
+        });
+    };
+    work();
 }
 
 fn spawn_update_check(action_tx: &mpsc::Sender<Action>) {
@@ -368,6 +553,8 @@ fn do_open_project(
         setup_script,
         worktrees: vec![main],
         launchers: Vec::new(),
+        github_enabled: false,
+        gh_poll_interval_secs: None,
     };
     config::save_project(config_dir, &cfg)?;
     Ok(cfg)

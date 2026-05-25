@@ -63,6 +63,36 @@ pub struct Project {
     /// Named launchers: label + command to feed the PTY at spawn. Edited via
     /// the TOML for now; surfaced through `:launch` and the launch popup.
     pub launchers: Vec<Launcher>,
+    /// Opt-in GitHub PR-status integration (`:gh-enable`). When `true`, the
+    /// runtime periodically shells out to `gh pr list` and populates
+    /// [`AppState::pr_statuses`] for this project's worktrees.
+    pub github_enabled: bool,
+    /// Per-project override for the polling cadence (seconds). Falls back to
+    /// the global setting, then a hardcoded default.
+    pub gh_poll_interval_secs: Option<u64>,
+}
+
+/// Lifecycle phase of the GitHub PR associated with a worktree's branch.
+/// Precedence (highest first): Merged > Failed > ChangesRequested > Running
+/// > Open. "No PR" is the absence of an entry in [`AppState::pr_statuses`].
+///
+/// `ChangesRequested` and `Failed` (which also covers merge conflicts) both
+/// render in the same "needs attention" color; the enum still distinguishes
+/// them so future code can react to one specifically.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PrStatus {
+    /// PR is open, CI is green (or no checks defined), no review block, no
+    /// merge conflict.
+    Open,
+    /// PR open; CI has pending or in-progress checks.
+    Running,
+    /// PR open; at least one CI check failed, OR the branch has merge
+    /// conflicts against base.
+    Failed,
+    /// PR open; reviewer marked CHANGES_REQUESTED.
+    ChangesRequested,
+    /// PR has been merged.
+    Merged,
 }
 
 #[derive(Clone, Debug)]
@@ -263,6 +293,16 @@ pub struct AppState {
     /// check first. The next `Action::UpdateChecked(Ok(Some(_)))` auto-installs
     /// instead of just setting the banner.
     pub auto_install_after_check: bool,
+    /// PR status per worktree, keyed positionally as `(project_idx, worktree_idx)`.
+    /// Absence means "no PR" or "integration disabled". Updated in the
+    /// background by `Command::FetchPrStatuses`; never persisted.
+    pub pr_statuses: HashMap<(usize, usize), PrStatus>,
+    /// Global default poll interval (seconds) for GitHub PR status. `None`
+    /// means use the hardcoded fallback (120s).
+    pub gh_poll_interval_secs: Option<u64>,
+    /// `true` while a foreground `:gh-refresh` is in flight. Background polls
+    /// don't set this — they should never touch `command_status`.
+    pub pr_refresh_in_flight: bool,
 }
 
 impl AppState {
@@ -298,6 +338,9 @@ impl AppState {
             available_update: None,
             update_status: UpdateStatus::Idle,
             auto_install_after_check: false,
+            pr_statuses: HashMap::new(),
+            gh_poll_interval_secs: None,
+            pr_refresh_in_flight: false,
         }
     }
 
@@ -332,6 +375,8 @@ pub fn mock_projects() -> Vec<Project> {
             expanded,
             setup_script: None,
             launchers: Vec::new(),
+            github_enabled: false,
+            gh_poll_interval_secs: None,
         }
     }
     vec![
@@ -369,6 +414,8 @@ impl Project {
                     command: l.command,
                 })
                 .collect(),
+            github_enabled: cfg.github_enabled,
+            gh_poll_interval_secs: cfg.gh_poll_interval_secs,
         }
     }
 
@@ -396,6 +443,8 @@ impl Project {
                     command: l.command.clone(),
                 })
                 .collect(),
+            github_enabled: self.github_enabled,
+            gh_poll_interval_secs: self.gh_poll_interval_secs,
         }
     }
 }
@@ -442,6 +491,23 @@ pub enum Action {
     /// Goes through the reducer (rather than being emitted as a Command
     /// directly) so the reducer remains the single dispatch authority.
     PeriodicUpdateCheck,
+    /// Periodic tick from the runtime that asks the reducer to emit one
+    /// `FetchPrStatuses` command per gh-enabled project whose poll interval
+    /// has elapsed.
+    PeriodicPrCheck,
+    /// Background fetcher result for a single project: one entry per
+    /// worktree-index in the order they were polled. `None` clears the
+    /// existing entry (no PR / per-worktree failure).
+    PrStatusesFetched {
+        project_idx: usize,
+        statuses: Vec<(usize, Option<PrStatus>)>,
+    },
+    /// Background fetcher failure. Surfaced to `command_status` only when a
+    /// foreground `:gh-refresh` was in flight; silent otherwise.
+    PrFetchFailed {
+        project_idx: usize,
+        message: String,
+    },
     Quit,
 }
 
@@ -481,6 +547,23 @@ impl std::fmt::Debug for Action {
             Action::UpdateChecked(r) => f.debug_tuple("UpdateChecked").field(r).finish(),
             Action::UpdateInstalled(r) => f.debug_tuple("UpdateInstalled").field(r).finish(),
             Action::PeriodicUpdateCheck => write!(f, "PeriodicUpdateCheck"),
+            Action::PeriodicPrCheck => write!(f, "PeriodicPrCheck"),
+            Action::PrStatusesFetched {
+                project_idx,
+                statuses,
+            } => f
+                .debug_struct("PrStatusesFetched")
+                .field("project_idx", project_idx)
+                .field("count", &statuses.len())
+                .finish(),
+            Action::PrFetchFailed {
+                project_idx,
+                message,
+            } => f
+                .debug_struct("PrFetchFailed")
+                .field("project_idx", project_idx)
+                .field("message", message)
+                .finish(),
             Action::Quit => write!(f, "Quit"),
         }
     }
@@ -552,6 +635,19 @@ pub enum Command {
     /// back as [`Action::UpdateInstalled`].
     InstallUpdate {
         tag: String,
+    },
+    /// For each worktree, resolve its current HEAD live via `git symbolic-ref`
+    /// then query `gh pr list --head <branch>` from the project's main repo.
+    /// Posts back an [`Action::PrStatusesFetched`]. Spawned on a background
+    /// thread.
+    FetchPrStatuses {
+        project_idx: usize,
+        /// CWD for the `gh` invocations (project's main repo dir).
+        repo_path: PathBuf,
+        /// `(worktree_idx, worktree_cwd)` — branch resolved live in the
+        /// background thread, so a `git switch` inside a worktree picks up
+        /// on the next refresh without needing to re-open the project.
+        worktrees: Vec<(usize, PathBuf)>,
     },
     Shutdown,
 }

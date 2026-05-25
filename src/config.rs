@@ -18,6 +18,10 @@ pub struct GlobalConfig {
     /// the same name overrides the global one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub launchers: Vec<LauncherConfig>,
+    /// Default cadence (seconds) for the GitHub PR-status background poll.
+    /// `None` means the runtime falls back to its built-in default (120s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gh_poll_interval_secs: Option<u64>,
 }
 
 impl Default for GlobalConfig {
@@ -27,6 +31,7 @@ impl Default for GlobalConfig {
             theme: ThemeKind::default(),
             projects: Vec::new(),
             launchers: Vec::new(),
+            gh_poll_interval_secs: None,
         }
     }
 }
@@ -56,6 +61,17 @@ pub struct ProjectConfig {
     /// `:launch` or the launch popup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub launchers: Vec<LauncherConfig>,
+    /// Opt-in GitHub PR-status integration. Toggled by `:gh-enable`/`:gh-disable`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub github_enabled: bool,
+    /// Per-project poll cadence override (seconds). Overrides the global
+    /// `gh_poll_interval_secs`; `None` defers to the global setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gh_poll_interval_secs: Option<u64>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,6 +250,7 @@ mod tests {
             theme: ThemeKind::default(),
             projects: vec!["../etc".into(), "ok".into()],
             launchers: Vec::new(),
+            gh_poll_interval_secs: None,
         };
         save_global(&dir, &global).unwrap();
         let proj = ProjectConfig {
@@ -244,6 +261,8 @@ mod tests {
             setup_script: None,
             worktrees: vec![],
             launchers: Vec::new(),
+            github_enabled: false,
+            gh_poll_interval_secs: None,
         };
         save_project(&dir, &proj).unwrap();
         let (_, ps) = load_or_default(&dir);
@@ -263,6 +282,7 @@ mod tests {
             theme: ThemeKind::Light,
             projects: vec!["foo".into()],
             launchers: Vec::new(),
+            gh_poll_interval_secs: None,
         };
         save_global(&dir, &global).unwrap();
         let loaded = load_global(&dir).unwrap();
@@ -285,6 +305,8 @@ mod tests {
                 name: "claude".into(),
                 command: "claude".into(),
             }],
+            github_enabled: false,
+            gh_poll_interval_secs: None,
         };
         save_project(&dir, &proj).unwrap();
         let loaded = load_project(&dir, "foo").unwrap();
