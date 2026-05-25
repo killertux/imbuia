@@ -73,17 +73,16 @@ pub struct Project {
 }
 
 /// Lifecycle phase of the GitHub PR associated with a worktree's branch.
-/// Precedence (highest first): Merged > Failed > ChangesRequested > Running
-/// > Open. "No PR" is the absence of an entry in [`AppState::pr_statuses`].
 ///
-/// `ChangesRequested` and `Failed` (which also covers merge conflicts) both
-/// render in the same "needs attention" color; the enum still distinguishes
-/// them so future code can react to one specifically.
+/// Precedence (highest first): `Merged`, `Failed`, `ChangesRequested`,
+/// `Running`, `Approved`, `Open`. "No PR" is the absence of an entry in
+/// `AppState::pr_statuses`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PrStatus {
-    /// PR is open, CI is green (or no checks defined), no review block, no
-    /// merge conflict.
+    /// PR is open, CI green (or none), still awaiting review.
     Open,
+    /// PR open and already approved; CI green. "Ready to merge".
+    Approved,
     /// PR open; CI has pending or in-progress checks.
     Running,
     /// PR open; at least one CI check failed, OR the branch has merge

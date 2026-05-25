@@ -49,6 +49,8 @@ pub struct Theme {
     /// Used for "review requested changes" — distinct from `status_error`
     /// (CI failure) so the two PR states are visually separable.
     pub status_changes: Color,
+    /// Used for "PR approved, ready to merge" (sidebar bar). Blue.
+    pub status_approved: Color,
     pub header_fg: Color,
 }
 
@@ -85,6 +87,7 @@ const DARK: Theme = Theme {
     status_ok: rgb(0xA6, 0xE3, 0xA1),
     status_error: rgb(0xF3, 0x8B, 0xA8),
     status_changes: rgb(0xCB, 0xA6, 0xF7),
+    status_approved: rgb(0x89, 0xB4, 0xFA),
     header_fg: rgb(0xF5, 0xC2, 0xE7),
 };
 
@@ -102,6 +105,7 @@ const LIGHT: Theme = Theme {
     status_ok: rgb(0x2D, 0x80, 0x1F),
     status_error: rgb(0xC4, 0x0E, 0x33),
     status_changes: rgb(0x88, 0x39, 0xEF),
+    status_approved: rgb(0x1E, 0x66, 0xF5),
     header_fg: rgb(0xC8, 0x44, 0xA9),
 };
 

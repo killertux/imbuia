@@ -97,59 +97,112 @@ pub fn fetch_pr_by_branch(repo_path: &Path, branch: &str) -> Result<Option<PrSta
     }
     let prs: Vec<PrInfo> =
         serde_json::from_slice(&out.stdout).map_err(|e| anyhow!("parsing gh json: {e}"))?;
-    Ok(prs.first().and_then(classify))
+    let Some(pr) = prs.first() else {
+        tracing::info!(%branch, "gh: no PR for branch");
+        return Ok(None);
+    };
+    let sig = signals(pr);
+    let status = classify_signals(&sig);
+    // One-line, all signals. Greppable in `imbuia.log` so the user can
+    // correlate a sidebar bar with what gh actually reported.
+    tracing::info!(
+        %branch,
+        state = %pr.state,
+        review = ?pr.review_decision,
+        mergeable = ?pr.mergeable,
+        checks = pr.status_check_rollup.len(),
+        failed = sig.failed_checks,
+        pending = sig.pending_checks,
+        conflict = sig.conflict,
+        approved = sig.approved,
+        changes_requested = sig.changes_requested,
+        classified = ?status,
+        "gh: classify",
+    );
+    Ok(status)
 }
 
-/// Classify a single PR. Returns `None` only for closed-not-merged — every
-/// other state maps onto a [`PrStatus`] variant so the sidebar always shows
-/// *something* for any worktree that has a PR.
-///
-/// Precedence: Merged > Failed (CI failure or merge conflict) >
-/// ChangesRequested > Running > Open.
-pub fn classify(pr: &PrInfo) -> Option<PrStatus> {
-    if pr.state.eq_ignore_ascii_case("MERGED") {
-        return Some(PrStatus::Merged);
-    }
-    if !pr.state.eq_ignore_ascii_case("OPEN") {
-        return None;
-    }
-    let mut any_failed = false;
-    let mut any_pending = false;
+/// Diagnostic snapshot of the signals classify uses to derive [`PrStatus`].
+/// Logged on every fetch so the user can correlate the sidebar bar with the
+/// raw PR data without re-running `gh` by hand.
+#[derive(Debug, Default)]
+pub struct Signals {
+    pub merged: bool,
+    pub closed: bool,
+    pub conflict: bool,
+    pub failed_checks: usize,
+    pub pending_checks: usize,
+    pub approved: bool,
+    pub changes_requested: bool,
+}
+
+pub fn signals(pr: &PrInfo) -> Signals {
+    let mut s = Signals::default();
+    s.merged = pr.state.eq_ignore_ascii_case("MERGED");
+    s.closed = !s.merged && !pr.state.eq_ignore_ascii_case("OPEN");
+    s.conflict = matches!(
+        pr.mergeable.as_deref(),
+        Some(m) if m.eq_ignore_ascii_case("CONFLICTING")
+    );
     for c in &pr.status_check_rollup {
         let status = c.status.as_deref().unwrap_or("").to_ascii_uppercase();
         let conclusion = c.conclusion.as_deref().unwrap_or("").to_ascii_uppercase();
         let state = c.state.as_deref().unwrap_or("").to_ascii_uppercase();
         if state == "FAILURE" || state == "ERROR" {
-            any_failed = true;
+            s.failed_checks += 1;
         } else if state == "PENDING" || state == "EXPECTED" {
-            any_pending = true;
+            s.pending_checks += 1;
         }
         match (status.as_str(), conclusion.as_str()) {
             ("COMPLETED", "FAILURE")
             | ("COMPLETED", "TIMED_OUT")
             | ("COMPLETED", "CANCELLED")
-            | ("COMPLETED", "ACTION_REQUIRED") => any_failed = true,
+            | ("COMPLETED", "ACTION_REQUIRED") => s.failed_checks += 1,
             ("IN_PROGRESS", _) | ("QUEUED", _) | ("PENDING", _) | ("WAITING", _) => {
-                any_pending = true
+                s.pending_checks += 1
             }
             _ => {}
         }
     }
-    let conflict = matches!(
-        pr.mergeable.as_deref(),
-        Some(m) if m.eq_ignore_ascii_case("CONFLICTING")
+    s.approved = matches!(
+        pr.review_decision.as_deref(),
+        Some(d) if d.eq_ignore_ascii_case("APPROVED")
     );
-    if any_failed || conflict {
-        return Some(PrStatus::Failed);
-    }
-    if matches!(
+    s.changes_requested = matches!(
         pr.review_decision.as_deref(),
         Some(d) if d.eq_ignore_ascii_case("CHANGES_REQUESTED")
-    ) {
+    );
+    s
+}
+
+/// Classify a single PR. Returns `None` only for closed-not-merged. The
+/// sidebar shows *something* for every open PR so users can tell at a glance.
+///
+/// Precedence: Merged > Failed (CI failure or merge conflict) >
+/// ChangesRequested > Running > Approved > Open.
+#[cfg(test)]
+pub fn classify(pr: &PrInfo) -> Option<PrStatus> {
+    classify_signals(&signals(pr))
+}
+
+pub fn classify_signals(s: &Signals) -> Option<PrStatus> {
+    if s.merged {
+        return Some(PrStatus::Merged);
+    }
+    if s.closed {
+        return None;
+    }
+    if s.failed_checks > 0 || s.conflict {
+        return Some(PrStatus::Failed);
+    }
+    if s.changes_requested {
         return Some(PrStatus::ChangesRequested);
     }
-    if any_pending {
+    if s.pending_checks > 0 {
         return Some(PrStatus::Running);
+    }
+    if s.approved {
+        return Some(PrStatus::Approved);
     }
     Some(PrStatus::Open)
 }
@@ -239,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_open_pr_returns_open() {
+    fn approved_open_returns_approved() {
         assert_eq!(
             _classify_test(
                 "OPEN",
@@ -247,7 +300,33 @@ mod tests {
                 Some("MERGEABLE"),
                 &[("COMPLETED", "SUCCESS")]
             ),
+            Some(PrStatus::Approved)
+        );
+    }
+
+    #[test]
+    fn review_required_open_returns_open() {
+        assert_eq!(
+            _classify_test(
+                "OPEN",
+                Some("REVIEW_REQUIRED"),
+                Some("MERGEABLE"),
+                &[("COMPLETED", "SUCCESS")]
+            ),
             Some(PrStatus::Open)
+        );
+    }
+
+    #[test]
+    fn running_beats_approved() {
+        assert_eq!(
+            _classify_test(
+                "OPEN",
+                Some("APPROVED"),
+                Some("MERGEABLE"),
+                &[("IN_PROGRESS", "")]
+            ),
+            Some(PrStatus::Running)
         );
     }
 

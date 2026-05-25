@@ -805,6 +805,7 @@ fn worktree_line(
         Some(PrStatus::Merged) => theme.status_changes,
         Some(PrStatus::ChangesRequested) | Some(PrStatus::Failed) => theme.status_error,
         Some(PrStatus::Running) => theme.status_running,
+        Some(PrStatus::Approved) => theme.status_approved,
         Some(PrStatus::Open) => theme.status_ok,
         None => theme.fg_dim,
     };
