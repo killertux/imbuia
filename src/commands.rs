@@ -245,7 +245,7 @@ fn selected_project_idx(state: &AppState) -> Option<usize> {
     state.active_worktree.map(|(p, _)| p)
 }
 
-pub(crate) fn cmd_worktree_remove(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
+pub(crate) fn cmd_worktree_remove(state: &mut AppState, _args: &[&str], _cmds: &mut Commands) {
     let Some((pi, Some(wi))) = state.sidebar_selection else {
         state.command_status = Some("select a worktree in the sidebar first".into());
         return;
@@ -260,10 +260,10 @@ pub(crate) fn cmd_worktree_remove(state: &mut AppState, _args: &[&str], cmds: &m
         state.command_status = Some("can't remove the main worktree".into());
         return;
     }
-    state.pending_op = Some(format!("Removing worktree '{}'…", wt.name));
-    cmds.push(Command::RemoveWorktree {
+    state.pending_confirm = Some(crate::app::PendingConfirm::RemoveWorktree {
         project_idx: pi,
         worktree_idx: wi,
+        name: wt.name.clone(),
         repo_path: project.repo_path.clone(),
         dest_path: wt.path.clone(),
         branch: wt.branch.clone(),

@@ -1029,7 +1029,15 @@ fn normal_or_terminal_line<'a>(
         Span::raw("  "),
         Span::styled(middle, Style::default().fg(theme.fg_dim)),
     ];
-    if let Some(busy) = &state.pending_op {
+    if let Some(prompt) = confirm_prompt_text(state) {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            prompt,
+            Style::default()
+                .fg(theme.status_error)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if let Some(busy) = &state.pending_op {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             busy.as_str(),
@@ -1048,12 +1056,22 @@ fn normal_or_terminal_line<'a>(
     // already shouting in the same row.
     if state.pending_op.is_none()
         && state.command_status.is_none()
+        && state.pending_confirm.is_none()
         && let Some(banner) = update_banner_text(state)
     {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(banner, Style::default().fg(theme.fg_dim)));
     }
     Line::from(spans)
+}
+
+fn confirm_prompt_text(state: &AppState) -> Option<String> {
+    use crate::app::PendingConfirm;
+    match state.pending_confirm.as_ref()? {
+        PendingConfirm::RemoveWorktree { name, .. } => {
+            Some(format!("delete worktree '{name}'? [y/N]"))
+        }
+    }
 }
 
 fn update_banner_text(state: &AppState) -> Option<String> {
