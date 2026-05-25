@@ -14,6 +14,7 @@ mod client;
 mod commands;
 mod config;
 mod git;
+mod github;
 mod input;
 mod ipc;
 mod layout;

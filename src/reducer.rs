@@ -148,6 +148,20 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
                     Some((pi, Some(wi - 1)))
                 };
             }
+            // Drop the removed worktree's PR status and shift later indices
+            // for the same project down by one, mirroring the active_worktree
+            // re-key above. pr_statuses keys are positional like (pi, wi).
+            state.pr_statuses.remove(&(project_idx, worktree_idx));
+            let to_shift: Vec<usize> = state
+                .pr_statuses
+                .keys()
+                .filter_map(|(pi, wi)| (*pi == project_idx && *wi > worktree_idx).then_some(*wi))
+                .collect();
+            for wi in to_shift {
+                if let Some(status) = state.pr_statuses.remove(&(project_idx, wi)) {
+                    state.pr_statuses.insert((project_idx, wi - 1), status);
+                }
+            }
             cmds.push(Command::SaveProjectConfig(project_idx));
             if let Some(name) = removed_name {
                 state.command_status = Some(format!("removed worktree '{name}'"));
@@ -235,12 +249,77 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
                 cmds.push(Command::CheckForUpdate);
             }
         }
+        Action::PeriodicPrCheck => {
+            for (pi, p) in state.projects.iter().enumerate() {
+                if p.github_enabled {
+                    cmds.push(Command::FetchPrStatuses {
+                        project_idx: pi,
+                        repo_path: p.repo_path.clone(),
+                        worktrees: worktree_paths(p),
+                    });
+                }
+            }
+        }
+        Action::PrStatusesFetched {
+            project_idx,
+            statuses,
+        } => {
+            let Some(project) = state.projects.get(project_idx) else {
+                return cmds;
+            };
+            let wt_count = project.worktrees.len();
+            let mut matched = 0usize;
+            for (wi, status) in &statuses {
+                if *wi >= wt_count {
+                    continue;
+                }
+                match status {
+                    Some(s) => {
+                        matched += 1;
+                        state.pr_statuses.insert((project_idx, *wi), *s);
+                    }
+                    None => {
+                        state.pr_statuses.remove(&(project_idx, *wi));
+                    }
+                }
+            }
+            if state.pr_refresh_in_flight {
+                state.pr_refresh_in_flight = false;
+                state.command_status = Some(if matched == 0 {
+                    "PR status refreshed (no open PRs)".into()
+                } else {
+                    format!(
+                        "PR status refreshed ({matched} PR{})",
+                        if matched == 1 { "" } else { "s" }
+                    )
+                });
+            }
+        }
+        Action::PrFetchFailed {
+            project_idx: _,
+            message,
+        } => {
+            if state.pr_refresh_in_flight {
+                state.pr_refresh_in_flight = false;
+                state.command_status = Some(format!("PR refresh failed: {message}"));
+            }
+            // Background failures are silent — log-only is enough.
+        }
         Action::Quit => {
             state.running = false;
             cmds.push(Command::Shutdown);
         }
     }
     cmds
+}
+
+fn worktree_paths(project: &crate::app::Project) -> Vec<(usize, std::path::PathBuf)> {
+    project
+        .worktrees
+        .iter()
+        .enumerate()
+        .map(|(wi, w)| (wi, w.path.clone()))
+        .collect()
 }
 
 fn handle_paste(state: &mut AppState, text: String, cmds: &mut Commands) {
@@ -1543,6 +1622,8 @@ mod tests {
             expanded: true,
             setup_script: None,
             launchers: Vec::new(),
+            github_enabled: false,
+            gh_poll_interval_secs: None,
         }];
         s.active_worktree = Some((0, 0));
 
@@ -1646,6 +1727,8 @@ mod tests {
             expanded: true,
             setup_script: None,
             launchers: Vec::new(),
+            github_enabled: false,
+            gh_poll_interval_secs: None,
         }];
         s.active_worktree = Some((0, 0));
         let cmds = reduce(&mut s, Action::Key(plain('a')));
@@ -1679,6 +1762,8 @@ mod tests {
             expanded: true,
             setup_script: None,
             launchers: Vec::new(),
+            github_enabled: false,
+            gh_poll_interval_secs: None,
         }];
         s.active_worktree = Some((0, 0));
         let cmds = reduce(&mut s, Action::Key(plain('a')));
@@ -2768,6 +2853,8 @@ mod tests {
             expanded: true,
             setup_script: None,
             launchers: Vec::new(),
+            github_enabled: false,
+            gh_poll_interval_secs: None,
         };
         let _ = reduce(&mut s, Action::ProjectOpened(project));
         assert!(s.pending_op.is_none());
@@ -2824,6 +2911,8 @@ mod tests {
             expanded: true,
             setup_script: None,
             launchers: Vec::new(),
+            github_enabled: false,
+            gh_poll_interval_secs: None,
         };
         let cmds = reduce(&mut s, Action::ProjectOpened(project));
         assert_eq!(s.projects.len(), 1);
@@ -3099,5 +3188,104 @@ mod tests {
             Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         );
         assert!(s.usage_popup.as_ref().unwrap().expanded.contains(&42));
+    }
+
+    #[test]
+    fn pr_statuses_fetched_inserts_by_worktree_idx() {
+        use crate::app::PrStatus;
+        let mut s = AppState::new();
+        s.projects = mock_projects();
+        // imbuia has 2 worktrees. Report Running for #1, nothing for #0.
+        let cmds = reduce(
+            &mut s,
+            Action::PrStatusesFetched {
+                project_idx: 0,
+                statuses: vec![(0, None), (1, Some(PrStatus::Running))],
+            },
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(s.pr_statuses.get(&(0, 1)), Some(&PrStatus::Running));
+        assert!(!s.pr_statuses.contains_key(&(0, 0)));
+    }
+
+    #[test]
+    fn pr_statuses_fetched_clears_when_none() {
+        use crate::app::PrStatus;
+        let mut s = AppState::new();
+        s.projects = mock_projects();
+        s.pr_statuses.insert((0, 1), PrStatus::Failed);
+        let _ = reduce(
+            &mut s,
+            Action::PrStatusesFetched {
+                project_idx: 0,
+                statuses: vec![(1, None)],
+            },
+        );
+        assert!(!s.pr_statuses.contains_key(&(0, 1)));
+    }
+
+    #[test]
+    fn periodic_pr_check_emits_one_fetch_per_enabled_project() {
+        let mut s = AppState::new();
+        s.projects = mock_projects();
+        s.projects[0].github_enabled = true;
+        s.projects[2].github_enabled = true;
+        let cmds = reduce(&mut s, Action::PeriodicPrCheck);
+        assert_eq!(cmds.len(), 2);
+        let mut idxs: Vec<usize> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Command::FetchPrStatuses { project_idx, .. } => Some(*project_idx),
+                _ => None,
+            })
+            .collect();
+        idxs.sort();
+        assert_eq!(idxs, vec![0, 2]);
+    }
+
+    #[test]
+    fn worktree_removed_re_keys_pr_statuses() {
+        use crate::app::PrStatus;
+        let mut s = AppState::new();
+        s.projects = mock_projects();
+        // imbuia has [main, feat-x]; add a third so we can verify shift-down.
+        s.projects[0].worktrees.push(Worktree {
+            name: "extra".into(),
+            path: PathBuf::from("/tmp/extra"),
+            branch: Some("extra".into()),
+            sessions: vec![],
+            active_tab: None,
+        });
+        s.pr_statuses.insert((0, 0), PrStatus::Running);
+        s.pr_statuses.insert((0, 1), PrStatus::Failed);
+        s.pr_statuses.insert((0, 2), PrStatus::Merged);
+        // Remove the middle worktree.
+        let _ = reduce(
+            &mut s,
+            Action::WorktreeRemoved {
+                project_idx: 0,
+                worktree_idx: 1,
+            },
+        );
+        assert_eq!(s.pr_statuses.get(&(0, 0)), Some(&PrStatus::Running));
+        // (0,1) used to be "extra" / Merged after the shift.
+        assert_eq!(s.pr_statuses.get(&(0, 1)), Some(&PrStatus::Merged));
+        assert!(!s.pr_statuses.contains_key(&(0, 2)));
+    }
+
+    #[test]
+    fn gh_disable_clears_pr_statuses_for_project() {
+        use crate::app::PrStatus;
+        let mut s = AppState::new();
+        s.projects = mock_projects();
+        s.projects[0].github_enabled = true;
+        s.pr_statuses.insert((0, 0), PrStatus::Failed);
+        s.pr_statuses.insert((1, 0), PrStatus::Merged);
+        s.sidebar_selection = Some((0, None));
+        let _ = submit_command(&mut s, "gh-disable");
+        assert!(!s.projects[0].github_enabled);
+        assert!(!s.pr_statuses.contains_key(&(0, 0)));
+        // Other project's entry untouched.
+        assert_eq!(s.pr_statuses.get(&(1, 0)), Some(&PrStatus::Merged));
     }
 }

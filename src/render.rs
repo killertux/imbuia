@@ -746,12 +746,15 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
                 let active = state.active_worktree == Some((pi, wi));
                 let dot = if active { "●" } else { "○" };
                 let selected = state.sidebar_selection == Some((pi, Some(wi)));
-                lines.push(styled_line(
-                    truncate_to_width(&format!("  {dot} {}", wt.name), max_w),
+                lines.push(worktree_line(
+                    pi,
+                    wi,
+                    wt.name.as_str(),
+                    dot,
                     selected,
                     focused,
-                    false,
-                    theme,
+                    max_w,
+                    state,
                 ));
             }
         }
@@ -779,6 +782,59 @@ fn truncate_to_width(s: &str, max_chars: usize) -> String {
     let mut out: String = s.chars().take(max_chars - 1).collect();
     out.push('…');
     out
+}
+
+/// Sidebar row for a single worktree. Renders a leading colored `▌` reflecting
+/// the GitHub PR status (dim when no PR / integration disabled), then the
+/// usual `● name` / `○ name` content. Two spans so the bar can have its own
+/// color independent of selection styling.
+#[allow(clippy::too_many_arguments)]
+fn worktree_line(
+    pi: usize,
+    wi: usize,
+    name: &str,
+    dot: &str,
+    selected: bool,
+    focused: bool,
+    max_w: usize,
+    state: &AppState,
+) -> Line<'static> {
+    use crate::app::PrStatus;
+    let theme = &state.theme;
+    let bar_color = match state.pr_statuses.get(&(pi, wi)) {
+        Some(PrStatus::Merged) => theme.status_changes,
+        Some(PrStatus::ChangesRequested) | Some(PrStatus::Failed) => theme.status_error,
+        Some(PrStatus::Running) => theme.status_running,
+        Some(PrStatus::Open) => theme.status_ok,
+        None => theme.fg_dim,
+    };
+    // The bar consumes 2 visible columns ("▌ "); the rest of the row uses
+    // the existing format, capped to whatever's left of `max_w`.
+    let bar_text = "▌ ";
+    let rest_budget = max_w.saturating_sub(2);
+    let rest_text = truncate_to_width(&format!("{dot} {name}"), rest_budget);
+
+    let mut row_style = Style::default().fg(theme.fg).bg(theme.bg);
+    if selected {
+        if focused {
+            row_style = row_style
+                .bg(theme.selection_bg)
+                .fg(theme.selection_fg)
+                .add_modifier(Modifier::BOLD);
+        } else {
+            row_style = row_style.bg(theme.selection_bg).fg(theme.fg_dim);
+        }
+    }
+    // The bar keeps its color regardless of selection; only the bg follows
+    // the row so the selection highlight stays continuous.
+    let bar_style = Style::default()
+        .fg(bar_color)
+        .bg(row_style.bg.unwrap_or(theme.bg));
+
+    Line::from(vec![
+        Span::styled(bar_text.to_string(), bar_style),
+        Span::styled(rest_text, row_style),
+    ])
 }
 
 fn styled_line(

@@ -102,6 +102,30 @@ pub const COMMANDS: &[CmdSpec] = &[
         description: "Install the latest release; `check` only re-runs the version check.",
         handler: cmd_update,
     },
+    CmdSpec {
+        names: &["gh-enable"],
+        usage: ":gh-enable",
+        description: "Enable GitHub PR status indicators for the selected project.",
+        handler: cmd_gh_enable,
+    },
+    CmdSpec {
+        names: &["gh-disable"],
+        usage: ":gh-disable",
+        description: "Disable GitHub PR status indicators for the selected project.",
+        handler: cmd_gh_disable,
+    },
+    CmdSpec {
+        names: &["gh-refresh"],
+        usage: ":gh-refresh",
+        description: "Force a PR status refresh for the selected project now.",
+        handler: cmd_gh_refresh,
+    },
+    CmdSpec {
+        names: &["log-path"],
+        usage: ":log-path",
+        description: "Show the path to the client log file (tail -f to debug).",
+        handler: cmd_log_path,
+    },
 ];
 
 pub(crate) fn execute_command(state: &mut AppState, s: &str, cmds: &mut Commands) {
@@ -404,6 +428,81 @@ pub(crate) fn cmd_launch(state: &mut AppState, args: &[&str], cmds: &mut Command
         worktree_idx: wi,
         entries,
         cursor: 0,
+    });
+}
+
+fn cmd_gh_enable(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
+    if !crate::github::gh_available() {
+        state.command_status = Some("`gh` not found in PATH — install GitHub CLI first".into());
+        return;
+    }
+    let Some(pi) = selected_project_idx(state) else {
+        state.command_status = Some("select a project in the sidebar first".into());
+        return;
+    };
+    state.projects[pi].github_enabled = true;
+    state.command_status = Some("GitHub PR status enabled".into());
+    let repo_path = state.projects[pi].repo_path.clone();
+    let worktrees = state.projects[pi]
+        .worktrees
+        .iter()
+        .enumerate()
+        .map(|(wi, w)| (wi, w.path.clone()))
+        .collect();
+    cmds.push(Command::SaveProjectConfig(pi));
+    cmds.push(Command::FetchPrStatuses {
+        project_idx: pi,
+        repo_path,
+        worktrees,
+    });
+}
+
+fn cmd_gh_disable(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
+    let Some(pi) = selected_project_idx(state) else {
+        state.command_status = Some("select a project in the sidebar first".into());
+        return;
+    };
+    state.projects[pi].github_enabled = false;
+    state.pr_statuses.retain(|(p, _), _| *p != pi);
+    state.command_status = Some("GitHub PR status disabled".into());
+    cmds.push(Command::SaveProjectConfig(pi));
+}
+
+fn cmd_log_path(state: &mut AppState, _args: &[&str], _cmds: &mut Commands) {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let path = cache.join("imbuia").join("imbuia.log");
+    state.command_status = Some(format!("log: {}", path.display()));
+}
+
+fn cmd_gh_refresh(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
+    let Some(pi) = selected_project_idx(state) else {
+        state.command_status = Some("select a project in the sidebar first".into());
+        return;
+    };
+    if !state.projects[pi].github_enabled {
+        state.command_status = Some("GitHub integration disabled — run :gh-enable first".into());
+        return;
+    }
+    if !crate::github::gh_available() {
+        state.command_status = Some("`gh` not found in PATH".into());
+        return;
+    }
+    let repo_path = state.projects[pi].repo_path.clone();
+    let worktrees: Vec<_> = state.projects[pi]
+        .worktrees
+        .iter()
+        .enumerate()
+        .map(|(wi, w)| (wi, w.path.clone()))
+        .collect();
+    state.command_status = Some("refreshing PR status…".into());
+    state.pr_refresh_in_flight = true;
+    cmds.push(Command::FetchPrStatuses {
+        project_idx: pi,
+        repo_path,
+        worktrees,
     });
 }
 
