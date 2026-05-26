@@ -17,6 +17,7 @@ mod git;
 mod github;
 mod input;
 mod ipc;
+mod keybinds;
 mod layout;
 mod reducer;
 mod render;

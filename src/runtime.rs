@@ -59,6 +59,8 @@ pub async fn run() -> Result<()> {
         })
         .collect();
     state.gh_poll_interval_secs = global.gh_poll_interval_secs;
+    state.keybinds_config = global.keybinds.clone();
+    state.keymap = std::sync::Arc::new(crate::keybinds::load_overlay(&global.keybinds));
     state.projects = project_cfgs.into_iter().map(Project::from_config).collect();
     if !state.projects.is_empty() {
         state.sidebar_selection = Some((0, None));
@@ -297,6 +299,7 @@ fn execute(
                     })
                     .collect(),
                 gh_poll_interval_secs: state.gh_poll_interval_secs,
+                keybinds: state.keybinds_config.clone(),
             };
             if let Err(e) = config::save_global(&state.config_dir, &global) {
                 tracing::warn!("save_global failed: {e}");

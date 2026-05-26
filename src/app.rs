@@ -1,26 +1,13 @@
 use crate::ipc::UsageReport;
+use crate::keybinds::{Chord, KeyMap};
 use crate::layout::{DEFAULT_SIDEBAR_WIDTH, TermSize};
 use crate::session::{Session, SessionId};
 use crate::theme::Theme;
 use crossterm::event::{KeyEvent, MouseEvent};
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-
-/// Pending multi-key leader (vim-style chords).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Leader {
-    /// `Ctrl-W` — window operations in Normal mode (sidebar resize today).
-    CtrlW,
-    /// `Ctrl-\` — Terminal-mode escape sequence (must be followed by `Ctrl-N`).
-    CtrlBackslash,
-    /// `g` — Normal-mode prefix (e.g. `gt`/`gT` for next/prev tab).
-    G,
-    /// `<Space>` — primary command leader (vim-distro convention).
-    /// Triggers the which-key-style hint overlay until the next key arrives.
-    Space,
-}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -236,7 +223,22 @@ pub struct AppState {
     pub sidebar_width: u16,
     /// First visible row of the sidebar tree (scroll offset).
     pub sidebar_scroll: u16,
-    pub pending_leader: Option<Leader>,
+    /// Chord accumulator for the keymap matcher. Empty when no multi-key
+    /// chord is in progress. Replaces the old `Leader` enum — each leader
+    /// is just the first chord of a binding now.
+    pub pending_chord: SmallVec<[Chord; 4]>,
+    /// When matching a chord in `Mode::Terminal`, the raw KeyEvents that
+    /// would otherwise go straight to the PTY are buffered here. If the
+    /// chord matches an allow-listed action they're discarded; if it
+    /// fails, they're replayed to the PTY in order.
+    pub pending_terminal_keys: SmallVec<[KeyEvent; 4]>,
+    /// Resolved keymap (defaults overlaid with user bindings). Loaded once
+    /// at startup and not mutated after.
+    pub keymap: Arc<KeyMap>,
+    /// Raw user keybind table from the config toml. Preserved verbatim so
+    /// `Command::SaveGlobalConfig` round-trips without rewriting the user's
+    /// formatting.
+    pub keybinds_config: BTreeMap<String, String>,
     pub term_size: TermSize,
     pub mode: Mode,
     /// Command-mode input buffer (the part after `:`).
@@ -314,7 +316,10 @@ impl AppState {
             active_worktree: None,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_scroll: 0,
-            pending_leader: None,
+            pending_chord: SmallVec::new(),
+            pending_terminal_keys: SmallVec::new(),
+            keymap: Arc::new(crate::keybinds::defaults()),
+            keybinds_config: BTreeMap::new(),
             term_size: TermSize::default(),
             mode: Mode::default(),
             command: String::new(),

@@ -32,7 +32,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     }
 
     if state.help_open {
-        let max_scroll = render_help_popup(frame, area, theme, state.help_scroll);
+        let max_scroll = render_help_popup(frame, area, theme, state.help_scroll, state);
         state.help_max_scroll.set(max_scroll);
     } else if let Some(popup) = &state.popup {
         render_input_popup(frame, area, popup, theme);
@@ -47,13 +47,41 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     }
 
     // Always last so it floats over whatever is below.
-    if matches!(state.pending_leader, Some(crate::app::Leader::Space)) {
-        render_space_leader_hint(frame, area, theme);
+    if pending_chord_is_space(state) {
+        render_space_leader_hint(frame, area, theme, state);
     }
 }
 
-fn render_space_leader_hint(frame: &mut Frame, area: Rect, theme: &Theme) {
-    let hints = crate::reducer::SPACE_LEADER_HINTS;
+/// True when exactly one chord — `<Space>` — is pending. Used to gate the
+/// which-key popup so it only appears for the Space leader (not for `g` or
+/// `<C-w>`).
+fn pending_chord_is_space(state: &AppState) -> bool {
+    state.pending_chord.len() == 1
+        && state.pending_chord[0].code == ratatui::crossterm::event::KeyCode::Char(' ')
+}
+
+fn render_space_leader_hint(frame: &mut Frame, area: Rect, theme: &Theme, state: &AppState) {
+    use crate::keybinds::{Binding, Chord, Scope, format_binding};
+    let space = Chord {
+        mods: ratatui::crossterm::event::KeyModifiers::NONE,
+        code: ratatui::crossterm::event::KeyCode::Char(' '),
+    };
+    // Build the hint table from the live keymap: every Normal binding that
+    // starts with `<Space>`. Display just the remainder after `<Space>`.
+    let hints: Vec<(String, &'static str)> = state
+        .keymap
+        .bindings_starting_with(Scope::Normal, &space)
+        .filter_map(|(b, a)| {
+            if b.0.len() < 2 {
+                return None;
+            }
+            let tail = Binding(b.0[1..].to_vec());
+            Some((format_binding(&tail), a.description()))
+        })
+        .collect();
+    if hints.is_empty() {
+        return;
+    }
     let inner_w = hints
         .iter()
         .map(|(k, d)| k.chars().count() + 3 + d.chars().count())
@@ -86,7 +114,7 @@ fn render_space_leader_hint(frame: &mut Frame, area: Rect, theme: &Theme) {
     frame.render_widget(block, r);
 
     let mut lines = Vec::with_capacity(hints.len() + 1);
-    for (key, desc) in hints {
+    for (key, desc) in &hints {
         lines.push(Line::from(vec![
             Span::styled(
                 format!(" {:<2}", key),
@@ -529,7 +557,13 @@ fn render_input_popup(
     }
 }
 
-fn render_help_popup(frame: &mut Frame, area: Rect, theme: &Theme, scroll: u16) -> u16 {
+fn render_help_popup(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    scroll: u16,
+    state: &AppState,
+) -> u16 {
     let content_width = 78u16.min(area.width.saturating_sub(4));
     let content_height = area.height.saturating_sub(4).clamp(12, 36);
 
@@ -552,7 +586,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect, theme: &Theme, scroll: u16) 
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let lines = help_lines(theme);
+    let lines = help_lines(theme, state);
     let viewport_h = inner.height.saturating_sub(1); // reserve 1 row for footer
     let max_scroll = (lines.len() as u16).saturating_sub(viewport_h);
     let clipped = scroll.min(max_scroll);
@@ -589,9 +623,10 @@ fn render_help_popup(frame: &mut Frame, area: Rect, theme: &Theme, scroll: u16) 
     max_scroll
 }
 
-/// Full help content. Built once per frame; cheap (a few dozen lines).
-/// Returning owned `Line<'static>` keeps the renderer free of borrow gymnastics.
-fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
+/// Full help content. Sources key strings from the live keymap so the popup
+/// reflects the user's actual bindings.
+fn help_lines(theme: &Theme, state: &AppState) -> Vec<Line<'static>> {
+    use crate::keybinds::BindableAction as A;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let header = |text: String| -> Line<'static> {
         Line::from(Span::styled(
@@ -616,47 +651,54 @@ fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
             Style::default().fg(theme.fg_dim),
         ))
     };
+    // Resolve a bindable action's key string from the live keymap. Falls
+    // back to "(unbound)" if the user removed the default and didn't add a
+    // replacement — `:help` still shows them what's unbound.
+    let key = |a: A| -> String {
+        state
+            .keymap
+            .binding_for(a)
+            .unwrap_or_else(|| "(unbound)".into())
+    };
+    let kr = |a: A| -> Line<'static> { row(&key(a), a.description()) };
 
     lines.push(header("MODES".into()));
-    lines.push(row(
-        "i",
-        "Normal → Terminal (keys are forwarded to the PTY)",
-    ));
-    lines.push(row("Ctrl-\\ Ctrl-N", "Terminal → Normal"));
-    lines.push(row(":", "Normal → Command (ex-line at the bottom)"));
-    lines.push(row("Esc", "Command → Normal · close popups"));
+    lines.push(kr(A::EnterTerminalMode));
+    lines.push(kr(A::LeaveTerminal));
+    lines.push(kr(A::EnterCommandMode));
+    lines.push(row("<Esc>", "Command → Normal · close popups"));
     lines.push(Line::from(""));
 
     lines.push(header("SIDEBAR & FOCUS (Normal mode)".into()));
-    lines.push(row("h  ←", "focus sidebar"));
-    lines.push(row("l  →", "focus terminal"));
-    lines.push(row("j  ↓", "next sidebar row (when focused)"));
-    lines.push(row("k  ↑", "previous sidebar row (when focused)"));
-    lines.push(row("Enter", "activate selected project/worktree"));
+    lines.push(kr(A::FocusSidebar));
+    lines.push(kr(A::FocusTerminal));
+    lines.push(kr(A::SidebarDown));
+    lines.push(kr(A::SidebarUp));
+    lines.push(kr(A::ActivateSelection));
     lines.push(Line::from(""));
 
     lines.push(header("TABS".into()));
-    lines.push(row("o", "open new tab in the active worktree"));
-    lines.push(row("x", "close the current tab"));
-    lines.push(row("gt", "next tab"));
-    lines.push(row("gT", "previous tab"));
+    lines.push(kr(A::OpenTab));
+    lines.push(kr(A::CloseTab));
+    lines.push(kr(A::NextTab));
+    lines.push(kr(A::PrevTab));
     lines.push(Line::from(""));
 
     lines.push(header("SIDEBAR WIDTH".into()));
-    lines.push(row("Ctrl-W >", "grow sidebar by 2 columns"));
-    lines.push(row("Ctrl-W <", "shrink sidebar by 2 columns"));
-    lines.push(row("Ctrl-W =", "reset sidebar to default width"));
+    lines.push(kr(A::SidebarGrow));
+    lines.push(kr(A::SidebarShrink));
+    lines.push(kr(A::SidebarReset));
     lines.push(Line::from(""));
 
-    lines.push(header("LEADER (<Space>)".into()));
-    lines.push(row("<Space> o", "open project popup"));
-    lines.push(row("<Space> w", "new worktree"));
-    lines.push(row("<Space> W", "remove selected worktree"));
-    lines.push(row("<Space> l", "launcher picker"));
-    lines.push(row("<Space> e", "edit project setup script"));
-    lines.push(row("<Space> u", "usage popup"));
-    lines.push(row("<Space> ?", "this help"));
-    lines.push(row("<Space> q", "quit"));
+    lines.push(header("LEADER".into()));
+    lines.push(kr(A::OpenProjectPopup));
+    lines.push(kr(A::NewWorktree));
+    lines.push(kr(A::RemoveWorktree));
+    lines.push(kr(A::LaunchPicker));
+    lines.push(kr(A::EditProject));
+    lines.push(kr(A::UsagePopup));
+    lines.push(kr(A::HelpPopup));
+    lines.push(kr(A::Quit));
     lines.push(Line::from(""));
 
     lines.push(header("POPUPS".into()));
