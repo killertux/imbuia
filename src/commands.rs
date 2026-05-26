@@ -365,7 +365,9 @@ fn handle_set(state: &mut AppState, args: &[&str], cmds: &mut Commands) {
                 cmds.push(Command::SaveGlobalConfig);
             }
             None => {
-                state.command_status = Some(format!("invalid theme: {value} (expected dark|light)"))
+                state.command_status = Some(format!(
+                    "invalid theme: {value} (expected dark|light|gruber_darker)"
+                ))
             }
         },
         _ => state.command_status = Some(format!("unknown setting: {key}")),

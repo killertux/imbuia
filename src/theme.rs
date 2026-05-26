@@ -1,6 +1,7 @@
-//! Color palette. Two bundled variants — `Dark` and `Light` — copied from the
-//! rowdy project's `themes/dark.toml` and `themes/light.toml`. Persisted in
-//! the global config as a plain string ("dark" / "light").
+//! Color palette. Bundled variants — `Dark` and `Light` (copied from the
+//! rowdy project's `themes/dark.toml` and `themes/light.toml`) and
+//! `GruberDarker` (ported from rexim/gruber-darker-theme). Persisted in the
+//! global config as a plain string ("dark" / "light" / "gruber_darker").
 
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,8 @@ pub enum ThemeKind {
     #[default]
     Dark,
     Light,
+    #[serde(rename = "gruber_darker")]
+    GruberDarker,
 }
 
 impl ThemeKind {
@@ -18,6 +21,7 @@ impl ThemeKind {
         match s.trim().to_ascii_lowercase().as_str() {
             "dark" => Some(Self::Dark),
             "light" => Some(Self::Light),
+            "gruber_darker" => Some(Self::GruberDarker),
             _ => None,
         }
     }
@@ -27,6 +31,7 @@ impl ThemeKind {
         match self {
             Self::Dark => "dark",
             Self::Light => "light",
+            Self::GruberDarker => "gruber_darker",
         }
     }
 }
@@ -59,6 +64,7 @@ impl Theme {
         match kind {
             ThemeKind::Dark => DARK,
             ThemeKind::Light => LIGHT,
+            ThemeKind::GruberDarker => GRUBER_DARKER,
         }
     }
 }
@@ -107,6 +113,24 @@ const LIGHT: Theme = Theme {
     status_changes: rgb(0x88, 0x39, 0xEF),
     status_approved: rgb(0x1E, 0x66, 0xF5),
     header_fg: rgb(0xC8, 0x44, 0xA9),
+};
+
+const GRUBER_DARKER: Theme = Theme {
+    kind: ThemeKind::GruberDarker,
+    bg: rgb(0x18, 0x18, 0x18),
+    fg: rgb(0xE4, 0xE4, 0xEF),
+    fg_dim: rgb(0x95, 0xA9, 0x9F),
+    border: rgb(0x45, 0x3D, 0x41),
+    border_focus: rgb(0xFF, 0xDD, 0x33),
+    selection_bg: rgb(0x48, 0x48, 0x48),
+    selection_fg: rgb(0xF4, 0xF4, 0xFF),
+    status_idle: rgb(0xC4, 0xD8, 0xCC),
+    status_running: rgb(0xFF, 0xE6, 0x00),
+    status_ok: rgb(0x9C, 0xFF, 0x3D),
+    status_error: rgb(0xFF, 0x5C, 0x5C),
+    status_changes: rgb(0xC9, 0xB8, 0xFF),
+    status_approved: rgb(0x7F, 0xB8, 0xFF),
+    header_fg: rgb(0xCC, 0x8C, 0x3C),
 };
 
 #[cfg(test)]
