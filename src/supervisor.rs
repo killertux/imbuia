@@ -489,26 +489,70 @@ fn shutdown_all(registry: &Arc<Mutex<Registry>>) {
 }
 
 /// Replay every PTY byte we've buffered so the client's local vt100 parser
-/// rebuilds visible screen *and* scrollback. Falls back to
-/// `contents_formatted()` if the log is empty (fresh session that hasn't
-/// produced output yet) so the cursor still lands in a sensible spot.
+/// rebuilds visible screen *and* scrollback. Always prefixed with a mode
+/// prelude (alt-screen / mouse / DECCKM / bracketed paste) derived from the
+/// parser's *current* state — `contents_formatted()` doesn't include those
+/// toggles, and even the raw log can start after their original emission
+/// once the buffer rolls over.
+///
+/// Falls back to `contents_formatted()` if the log is empty (fresh session)
+/// or hard-truncated (no newline boundary inside the scan window, so replay
+/// could land mid-CSI).
 fn send_dump(writer: &ClientWriter, id: SessionId, sess: &Supervised) {
-    let bytes: Vec<u8> = {
+    let mut bytes = mode_prelude(&sess.parser.lock().unwrap());
+    {
         let log = sess.output_log.lock().unwrap();
         if log.buf.is_empty() || log.truncated {
-            // Either no output yet, or the buffer evicted its head and the
-            // remaining prefix may start mid-CSI. Fall back to the parser's
-            // formatted view — loses scrollback but never smears colors.
             drop(log);
             let p = sess.parser.lock().unwrap();
-            p.screen().contents_formatted()
+            bytes.extend(p.screen().contents_formatted());
         } else {
-            log.buf.iter().copied().collect()
+            bytes.extend(log.buf.iter().copied());
         }
-    };
+    }
     if let Ok(mut g) = writer.lock() {
         let _ = ipc::write_frame(&mut *g, &SupervisorMsg::OutputDump { id, bytes });
     }
+}
+
+/// Escape-sequence prelude that puts the receiving vt100 parser back into
+/// the same alt-screen / mouse / cursor-key / bracketed-paste mode the
+/// supervisor's parser is in. Without this, after a client restart the
+/// local parser thinks we're on the main screen (and no mouse capture), so
+/// wheel routing in `client::ProxySession::write_mouse` goes to local
+/// scrollback even when the app under the PTY is in alt-screen and wants
+/// the wheel forwarded as arrow keys.
+fn mode_prelude(parser: &vt100::Parser) -> Vec<u8> {
+    let s = parser.screen();
+    let mut out = Vec::with_capacity(64);
+    if s.alternate_screen() {
+        // 1049 also clears + repositions, which is what xterm does on enter.
+        out.extend_from_slice(b"\x1b[?1049h");
+    }
+    if s.application_cursor() {
+        out.extend_from_slice(b"\x1b[?1h");
+    }
+    if s.application_keypad() {
+        out.extend_from_slice(b"\x1b=");
+    }
+    if s.bracketed_paste() {
+        out.extend_from_slice(b"\x1b[?2004h");
+    }
+    use vt100::MouseProtocolMode as M;
+    match s.mouse_protocol_mode() {
+        M::None => {}
+        M::Press => out.extend_from_slice(b"\x1b[?9h"),
+        M::PressRelease => out.extend_from_slice(b"\x1b[?1000h"),
+        M::ButtonMotion => out.extend_from_slice(b"\x1b[?1002h"),
+        M::AnyMotion => out.extend_from_slice(b"\x1b[?1003h"),
+    }
+    use vt100::MouseProtocolEncoding as E;
+    match s.mouse_protocol_encoding() {
+        E::Default => {}
+        E::Utf8 => out.extend_from_slice(b"\x1b[?1005h"),
+        E::Sgr => out.extend_from_slice(b"\x1b[?1006h"),
+    }
+    out
 }
 
 /// Append `chunk` to the per-session replay log, evicting from the front to
@@ -524,8 +568,13 @@ fn push_output_log(log: &mut OutputLog, chunk: &[u8]) {
         let scan = log.buf.len().min(4096);
         if let Some(pos) = log.buf.iter().take(scan).position(|b| *b == b'\n') {
             log.buf.drain(..=pos);
+            // Newline-aligned — replay is safe, keep using the log.
+        } else {
+            // No newline within scan window; the prefix could be in the
+            // middle of an escape sequence. Tell `send_dump` to fall back
+            // to `contents_formatted()` for this session.
+            log.truncated = true;
         }
-        log.truncated = true;
     }
 }
 
@@ -787,19 +836,59 @@ mod tests {
         let chunk = b"line\n".repeat(OUTPUT_LOG_CAP / 5 + 100);
         push_output_log(&mut log, &chunk);
         assert!(log.buf.len() <= OUTPUT_LOG_CAP);
-        assert!(log.truncated, "should be flagged truncated after eviction");
-        // After eviction we should land at (or just past) a newline boundary.
-        // Either the head is right after a `\n` or no newline was found —
-        // both cases are valid; we just need the cap respected.
+        // Newline-aligned eviction keeps the log safe to replay, so the
+        // truncated flag stays false.
+        assert!(
+            !log.truncated,
+            "newline-aligned eviction should not flip truncated"
+        );
+        // Head should now be at the start of a fresh `line` token.
+        assert_eq!(
+            &log.buf.iter().copied().take(4).collect::<Vec<_>>(),
+            b"line"
+        );
     }
 
     #[test]
-    fn push_output_log_marks_truncated_even_without_newline() {
+    fn push_output_log_marks_truncated_without_newline() {
         let mut log = OutputLog::default();
-        // No newlines anywhere — eviction can't align, but truncated must flip.
+        // No newlines anywhere — eviction can't align, so truncated must flip.
         let chunk = vec![b'x'; OUTPUT_LOG_CAP + 1024];
         push_output_log(&mut log, &chunk);
         assert!(log.buf.len() <= OUTPUT_LOG_CAP);
         assert!(log.truncated);
+    }
+
+    #[test]
+    fn mode_prelude_emits_alt_screen_and_sgr_mouse() {
+        // Synthesise a parser that's been told to enter alt-screen with SGR
+        // mouse capture; the prelude should reflect both.
+        let mut p = vt100::Parser::new(24, 80, 100);
+        p.process(b"\x1b[?1049h\x1b[?1006h\x1b[?1000h");
+        let prelude = mode_prelude(&p);
+        assert!(
+            prelude
+                .windows(b"\x1b[?1049h".len())
+                .any(|w| w == b"\x1b[?1049h"),
+            "missing alt-screen toggle: {prelude:?}"
+        );
+        assert!(
+            prelude
+                .windows(b"\x1b[?1006h".len())
+                .any(|w| w == b"\x1b[?1006h"),
+            "missing SGR mouse encoding: {prelude:?}"
+        );
+        assert!(
+            prelude
+                .windows(b"\x1b[?1000h".len())
+                .any(|w| w == b"\x1b[?1000h"),
+            "missing press/release mouse mode: {prelude:?}"
+        );
+    }
+
+    #[test]
+    fn mode_prelude_empty_when_no_modes_active() {
+        let p = vt100::Parser::new(24, 80, 100);
+        assert!(mode_prelude(&p).is_empty());
     }
 }
