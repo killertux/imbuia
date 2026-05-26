@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::app::{Project, Worktree, mock_projects};
 use crate::commands::expand_user_path;
