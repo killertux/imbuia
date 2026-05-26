@@ -81,21 +81,19 @@ pub fn gh_available() -> bool {
 /// worktree doesn't reliably resolve the branch.
 pub fn fetch_pr_by_branch(repo_path: &Path, branch: &str) -> Result<Option<PrStatus>> {
     let mut cmd = Command::new("gh");
-    cmd.current_dir(repo_path)
-        .args([
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--state",
-            "all",
-            "--limit",
-            "1",
-            "--json",
-            "headRefName,state,reviewDecision,mergeable,statusCheckRollup",
-        ]);
-    let out = output_with_timeout(&mut cmd, GH_TIMEOUT)
-        .map_err(|e| anyhow!("gh pr list: {e}"))?;
+    cmd.current_dir(repo_path).args([
+        "pr",
+        "list",
+        "--head",
+        branch,
+        "--state",
+        "all",
+        "--limit",
+        "1",
+        "--json",
+        "headRefName,state,reviewDecision,mergeable,statusCheckRollup",
+    ]);
+    let out = output_with_timeout(&mut cmd, GH_TIMEOUT).map_err(|e| anyhow!("gh pr list: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(anyhow!("gh pr list failed ({}): {}", out.status, stderr));

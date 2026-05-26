@@ -45,8 +45,8 @@ pub fn head_branch(path: &Path) -> Result<Option<String>> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(path);
     cmd.args(["symbolic-ref", "--quiet", "--short", "HEAD"]);
-    let out = output_with_timeout(&mut cmd, GIT_TIMEOUT)
-        .map_err(|e| anyhow!("git symbolic-ref: {e}"))?;
+    let out =
+        output_with_timeout(&mut cmd, GIT_TIMEOUT).map_err(|e| anyhow!("git symbolic-ref: {e}"))?;
     if out.status.success() {
         Ok(Some(
             String::from_utf8_lossy(&out.stdout).trim().to_string(),

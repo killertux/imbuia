@@ -191,7 +191,14 @@ fn serve_client(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
     // Immediately push a dump for every existing session so the client can
     // restore its rendered view.
     for meta in &sessions_snapshot {
-        if let Some(sess) = shared.registry.lock().unwrap().sessions.get(&meta.id).cloned() {
+        if let Some(sess) = shared
+            .registry
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&meta.id)
+            .cloned()
+        {
             send_dump(&writer, meta.id, &sess);
         }
     }
@@ -232,7 +239,8 @@ fn serve_client(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
                             // order as long as no one else writes between.
                             ipc::write_frame(&mut *w, &SupervisorMsg::Spawned { request_id, id })?;
                             drop(w);
-                            if let Some(sess) = shared.registry.lock().unwrap().sessions.get(&id).cloned()
+                            if let Some(sess) =
+                                shared.registry.lock().unwrap().sessions.get(&id).cloned()
                             {
                                 send_dump(&writer, id, &sess);
                             }
