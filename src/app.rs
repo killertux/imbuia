@@ -1,26 +1,13 @@
 use crate::ipc::UsageReport;
+use crate::keybinds::{Chord, KeyMap};
 use crate::layout::{DEFAULT_SIDEBAR_WIDTH, TermSize};
 use crate::session::{Session, SessionId};
 use crate::theme::Theme;
 use crossterm::event::{KeyEvent, MouseEvent};
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-
-/// Pending multi-key leader (vim-style chords).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Leader {
-    /// `Ctrl-W` — window operations in Normal mode (sidebar resize today).
-    CtrlW,
-    /// `Ctrl-\` — Terminal-mode escape sequence (must be followed by `Ctrl-N`).
-    CtrlBackslash,
-    /// `g` — Normal-mode prefix (e.g. `gt`/`gT` for next/prev tab).
-    G,
-    /// `<Space>` — primary command leader (vim-distro convention).
-    /// Triggers the which-key-style hint overlay until the next key arrives.
-    Space,
-}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -143,6 +130,10 @@ pub struct OpenProjectPopup {
     pub path: String,
     pub script: ratatui_textarea::TextArea<'static>,
     pub focus: OpenProjectFocus,
+    /// When `true`, after the project is opened the runtime enumerates the
+    /// repo's existing git worktrees and adds any not already in the
+    /// project. Toggled with Space / Enter while the Import row has focus.
+    pub import_existing: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
@@ -150,6 +141,7 @@ pub enum OpenProjectFocus {
     #[default]
     Path,
     Script,
+    Import,
 }
 
 /// Modal picker for `:launch` — shows the project's configured launchers plus
@@ -236,7 +228,22 @@ pub struct AppState {
     pub sidebar_width: u16,
     /// First visible row of the sidebar tree (scroll offset).
     pub sidebar_scroll: u16,
-    pub pending_leader: Option<Leader>,
+    /// Chord accumulator for the keymap matcher. Empty when no multi-key
+    /// chord is in progress. Replaces the old `Leader` enum — each leader
+    /// is just the first chord of a binding now.
+    pub pending_chord: SmallVec<[Chord; 4]>,
+    /// When matching a chord in `Mode::Terminal`, the raw KeyEvents that
+    /// would otherwise go straight to the PTY are buffered here. If the
+    /// chord matches an allow-listed action they're discarded; if it
+    /// fails, they're replayed to the PTY in order.
+    pub pending_terminal_keys: SmallVec<[KeyEvent; 4]>,
+    /// Resolved keymap (defaults overlaid with user bindings). Loaded once
+    /// at startup and not mutated after.
+    pub keymap: Arc<KeyMap>,
+    /// Raw user keybind table from the config toml. Preserved verbatim so
+    /// `Command::SaveGlobalConfig` round-trips without rewriting the user's
+    /// formatting.
+    pub keybinds_config: BTreeMap<String, String>,
     pub term_size: TermSize,
     pub mode: Mode,
     /// Command-mode input buffer (the part after `:`).
@@ -314,7 +321,10 @@ impl AppState {
             active_worktree: None,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_scroll: 0,
-            pending_leader: None,
+            pending_chord: SmallVec::new(),
+            pending_terminal_keys: SmallVec::new(),
+            keymap: Arc::new(crate::keybinds::defaults()),
+            keybinds_config: BTreeMap::new(),
             term_size: TermSize::default(),
             mode: Mode::default(),
             command: String::new(),
@@ -460,9 +470,13 @@ pub enum Action {
     Resize(TermSize),
     SessionExited(SessionId),
     /// Runtime → reducer: a new project has finished validating & saving.
-    /// The persistence layer's TOML schema is *not* leaked here — the runtime
-    /// constructs the domain `Project` from its `ProjectConfig` first.
-    ProjectOpened(Project),
+    /// `import_existing` is forwarded from the originating `Command::OpenProject`
+    /// — when `true`, the reducer fires an `ImportWorktrees` command once
+    /// the project is in `state.projects`.
+    ProjectOpened {
+        project: Project,
+        import_existing: bool,
+    },
     /// Runtime → reducer: a worktree finished `git worktree add`.
     WorktreeAdded {
         project_idx: usize,
@@ -472,6 +486,12 @@ pub enum Action {
     WorktreeRemoved {
         project_idx: usize,
         worktree_idx: usize,
+    },
+    /// Runtime → reducer: `git worktree list` returned these entries; the
+    /// reducer adds whichever ones aren't already in the project.
+    WorktreesImported {
+        project_idx: usize,
+        entries: Vec<Worktree>,
     },
     /// Runtime → reducer: an async operation failed; show the message.
     OperationFailed(String),
@@ -523,7 +543,14 @@ impl std::fmt::Debug for Action {
             Action::Paste(s) => f.debug_tuple("Paste").field(&s.len()).finish(),
             Action::Resize(sz) => f.debug_tuple("Resize").field(sz).finish(),
             Action::SessionExited(id) => f.debug_tuple("SessionExited").field(id).finish(),
-            Action::ProjectOpened(p) => f.debug_tuple("ProjectOpened").field(&p.slug).finish(),
+            Action::ProjectOpened {
+                project,
+                import_existing,
+            } => f
+                .debug_struct("ProjectOpened")
+                .field("slug", &project.slug)
+                .field("import_existing", import_existing)
+                .finish(),
             Action::WorktreeAdded {
                 project_idx,
                 worktree,
@@ -539,6 +566,14 @@ impl std::fmt::Debug for Action {
                 .debug_struct("WorktreeRemoved")
                 .field("project_idx", project_idx)
                 .field("worktree_idx", worktree_idx)
+                .finish(),
+            Action::WorktreesImported {
+                project_idx,
+                entries,
+            } => f
+                .debug_struct("WorktreesImported")
+                .field("project_idx", project_idx)
+                .field("count", &entries.len())
                 .finish(),
             Action::OperationFailed(s) => f.debug_tuple("OperationFailed").field(s).finish(),
             Action::SupervisorLost(s) => f.debug_tuple("SupervisorLost").field(s).finish(),
@@ -607,6 +642,16 @@ pub enum Command {
     OpenProject {
         path: PathBuf,
         setup_script: Option<String>,
+        /// If `true`, the reducer auto-dispatches `ImportWorktrees` once the
+        /// project lands. Set by the `[x] Import existing worktrees` toggle
+        /// in the open-project popup.
+        import_existing: bool,
+    },
+    /// Run `git worktree list --porcelain` and append every entry not
+    /// already in the project. Asynchronous.
+    ImportWorktrees {
+        project_idx: usize,
+        repo_path: PathBuf,
     },
     /// Run `git worktree add` and persist. Asynchronous.
     AddWorktree {

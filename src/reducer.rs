@@ -4,9 +4,10 @@
 //! else in this module is a private helper used to keep `reduce` small.
 
 use crate::app::{
-    Action, AppState, Command, Commands, InputPopup, Leader, Mode, PendingConfirm, PopupAction,
-    SidebarRow, UiFocus, Worktree,
+    Action, AppState, Command, Commands, InputPopup, Mode, PendingConfirm, PopupAction, SidebarRow,
+    UiFocus, Worktree,
 };
+use crate::keybinds::{BindableAction, Chord, MatchResult, Scope};
 use crate::layout::{ChromeRects, DEFAULT_SIDEBAR_WIDTH, chrome, clamp_sidebar_width};
 use crate::session::SessionId;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -39,8 +40,12 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
             state.sessions.remove(&id);
             remove_session_from_worktrees(state, id);
         }
-        Action::ProjectOpened(project) => {
+        Action::ProjectOpened {
+            project,
+            import_existing,
+        } => {
             state.pending_op = None;
+            let repo_path = project.repo_path.clone();
             state.projects.push(project);
             let new_idx = state.projects.len() - 1;
             if state.sidebar_selection.is_none() {
@@ -48,6 +53,40 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
             }
             cmds.push(Command::SaveGlobalConfig);
             cmds.push(Command::SaveProjectConfig(new_idx));
+            if import_existing {
+                state.pending_op = Some("Importing existing worktrees…".into());
+                cmds.push(Command::ImportWorktrees {
+                    project_idx: new_idx,
+                    repo_path,
+                });
+            }
+        }
+        Action::WorktreesImported {
+            project_idx,
+            entries,
+        } => {
+            state.pending_op = None;
+            let Some(project) = state.projects.get_mut(project_idx) else {
+                return cmds;
+            };
+            let mut added = 0usize;
+            for wt in entries {
+                // Dedup by path — the main worktree is already in the project.
+                if project.worktrees.iter().any(|w| w.path == wt.path) {
+                    continue;
+                }
+                project.worktrees.push(wt);
+                added += 1;
+            }
+            if added > 0 {
+                cmds.push(Command::SaveProjectConfig(project_idx));
+                state.command_status = Some(format!(
+                    "imported {added} worktree{}",
+                    if added == 1 { "" } else { "s" }
+                ));
+            } else {
+                state.command_status = Some("no new worktrees to import".into());
+            }
         }
         Action::WorktreeAdded {
             project_idx,
@@ -454,45 +493,6 @@ fn handle_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
         return;
     }
 
-    // 1. Pending leader chord, dispatched by mode.
-    if let Some(leader) = state.pending_leader {
-        state.pending_leader = None;
-        match (leader, state.mode) {
-            (Leader::CtrlW, Mode::Normal) => {
-                match k.code {
-                    KeyCode::Char('>') => apply_sidebar_resize(state, 2, cmds),
-                    KeyCode::Char('<') => apply_sidebar_resize(state, -2, cmds),
-                    KeyCode::Char('=') => set_sidebar_width(state, DEFAULT_SIDEBAR_WIDTH, cmds),
-                    _ => {}
-                }
-                return;
-            }
-            (Leader::CtrlBackslash, Mode::Terminal) => {
-                if is_ctrl_n(&k) {
-                    state.mode = Mode::Normal;
-                } else if let Some(id) = state.focused_session_id() {
-                    // Neovim semantics: Ctrl-\ then non-Ctrl-N passes both through.
-                    cmds.push(Command::WriteKey(id, ctrl_backslash_event()));
-                    cmds.push(Command::WriteKey(id, k));
-                }
-                return;
-            }
-            (Leader::G, Mode::Normal) => {
-                match k.code {
-                    KeyCode::Char('t') => switch_tab(state, 1),
-                    KeyCode::Char('T') => switch_tab(state, -1),
-                    _ => {}
-                }
-                return;
-            }
-            (Leader::Space, Mode::Normal) => {
-                handle_space_leader(state, k, cmds);
-                return;
-            }
-            _ => {} // stale leader for current mode — fall through
-        }
-    }
-
     match state.mode {
         Mode::Normal => handle_normal_key(state, k, cmds),
         Mode::Terminal => handle_terminal_key(state, k, cmds),
@@ -500,73 +500,31 @@ fn handle_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
     }
 }
 
-/// Dispatch the second keystroke of a `<space>` leader sequence. Kept as a
-/// flat keymap for now — small surface, easy to grok. Esc / Space cancel.
-fn handle_space_leader(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
-    match k.code {
-        KeyCode::Char('o') => crate::commands::cmd_open(state, &[], cmds),
-        KeyCode::Char('w') => crate::commands::cmd_worktree(state, &[], cmds),
-        KeyCode::Char('W') => crate::commands::cmd_worktree_remove(state, &[], cmds),
-        KeyCode::Char('l') => crate::commands::cmd_launch(state, &[], cmds),
-        KeyCode::Char('e') => crate::commands::cmd_edit(state, &[], cmds),
-        KeyCode::Char('u') => crate::commands::cmd_usage(state, &[], cmds),
-        KeyCode::Char('q') => state.running = false,
-        KeyCode::Char('?') | KeyCode::Char('h') => state.help_open = true,
-        // Esc / Space / anything else: silently cancel the leader.
-        _ => {}
-    }
-}
-
-/// Static which-key-style table shown while `<Space>` is pending. Edit in
-/// lockstep with `handle_space_leader`.
-pub const SPACE_LEADER_HINTS: &[(&str, &str)] = &[
-    ("o", "open project"),
-    ("w", "new worktree"),
-    ("W", "remove worktree"),
-    ("l", "launch …"),
-    ("e", "edit project"),
-    ("u", "usage"),
-    ("?", "help"),
-    ("q", "quit"),
-];
-
+/// Normal-mode key handling. Builds up a multi-key chord against the live
+/// keymap; on exact match, fires the action; on prefix match, waits for the
+/// next key; otherwise discards (single-key sequences also propagate to a
+/// few hardcoded affordances like the `Esc` reset).
 fn handle_normal_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
-    // Ctrl-W leader.
-    if k.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(k.code, KeyCode::Char('w') | KeyCode::Char('W'))
-    {
-        state.pending_leader = Some(Leader::CtrlW);
+    // Esc unconditionally cancels any chord in progress.
+    if k.code == KeyCode::Esc {
+        state.pending_chord.clear();
         return;
     }
-    if !k.modifiers.is_empty() && k.modifiers != KeyModifiers::SHIFT {
-        return;
-    }
-    match k.code {
-        KeyCode::Char('h') | KeyCode::Left => state.ui_focus = UiFocus::Sidebar,
-        KeyCode::Char('l') | KeyCode::Right => state.ui_focus = UiFocus::Terminal,
-        KeyCode::Char('j') | KeyCode::Down if state.ui_focus == UiFocus::Sidebar => {
-            move_sidebar_selection(state, 1);
+    let chord = Chord::from_event(&k);
+    state.pending_chord.push(chord);
+    let seq: Vec<Chord> = state.pending_chord.iter().copied().collect();
+    match state.keymap.lookup(Scope::Normal, &seq) {
+        MatchResult::Exact(action) => {
+            state.pending_chord.clear();
+            dispatch_action(state, action, cmds);
         }
-        KeyCode::Char('k') | KeyCode::Up if state.ui_focus == UiFocus::Sidebar => {
-            move_sidebar_selection(state, -1);
+        MatchResult::Prefix(_) => {
+            // Keep `pending_chord`; render layer will optionally show the
+            // which-key hint for `<Space>` etc.
         }
-        KeyCode::Enter if state.ui_focus == UiFocus::Sidebar => {
-            activate_sidebar_selection(state, cmds);
+        MatchResult::None => {
+            state.pending_chord.clear();
         }
-        KeyCode::Char('g') => state.pending_leader = Some(Leader::G),
-        KeyCode::Char(' ') => state.pending_leader = Some(Leader::Space),
-        KeyCode::Char('o') => open_new_tab_in_active(state, cmds),
-        KeyCode::Char('x') => close_current_tab(state, cmds),
-        KeyCode::Char('i') => state.mode = Mode::Terminal,
-        KeyCode::Char(':') => {
-            state.mode = Mode::Command;
-            state.command.clear();
-            state.command_status = None;
-            state.command_completion = None;
-            state.help_open = false;
-            refresh_command_completion(state);
-        }
-        _ => {}
     }
 }
 
@@ -899,14 +857,89 @@ fn activate_worktree(state: &mut AppState, pi: usize, wi: usize, cmds: &mut Comm
 }
 
 fn handle_terminal_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
-    // Ctrl-\ starts the Terminal-mode escape chord. crossterm delivers the
-    // 0x1C control byte as `Ctrl-4` (legacy mapping), so accept either form.
-    if is_ctrl_backslash(&k) {
-        state.pending_leader = Some(Leader::CtrlBackslash);
-        return;
+    // crossterm sometimes delivers 0x1C as Ctrl-4. Normalise so the keymap
+    // matcher sees the canonical Ctrl-\ shape.
+    let k = if is_ctrl_backslash(&k) {
+        ctrl_backslash_event()
+    } else {
+        k
+    };
+    let chord = Chord::from_event(&k);
+    state.pending_chord.push(chord);
+    state.pending_terminal_keys.push(k);
+    let seq: Vec<Chord> = state.pending_chord.iter().copied().collect();
+    match state.keymap.lookup(Scope::Terminal, &seq) {
+        MatchResult::Exact(action) => {
+            state.pending_chord.clear();
+            state.pending_terminal_keys.clear();
+            dispatch_action(state, action, cmds);
+        }
+        MatchResult::Prefix(_) => {
+            // Chord in progress — buffered keys stay queued; nothing reaches
+            // the PTY until we know whether the chord resolves.
+        }
+        MatchResult::None => {
+            // Replay every buffered key to the PTY in order, then clear.
+            // This is what keeps `\\` + arbitrary-key working: the user's
+            // shell sees both characters once the chord is rejected.
+            if let Some(id) = state.focused_session_id() {
+                for buffered in state.pending_terminal_keys.drain(..) {
+                    cmds.push(Command::WriteKey(id, buffered));
+                }
+            } else {
+                state.pending_terminal_keys.clear();
+            }
+            state.pending_chord.clear();
+        }
     }
-    if let Some(id) = state.focused_session_id() {
-        cmds.push(Command::WriteKey(id, k));
+}
+
+/// Translate a `BindableAction` into existing helpers/commands. All the
+/// behaviour lives in those helpers — this is just the name layer.
+fn dispatch_action(state: &mut AppState, action: BindableAction, cmds: &mut Commands) {
+    match action {
+        BindableAction::FocusSidebar => state.ui_focus = UiFocus::Sidebar,
+        BindableAction::FocusTerminal => state.ui_focus = UiFocus::Terminal,
+        BindableAction::SidebarUp => {
+            if state.ui_focus == UiFocus::Sidebar {
+                move_sidebar_selection(state, -1);
+            }
+        }
+        BindableAction::SidebarDown => {
+            if state.ui_focus == UiFocus::Sidebar {
+                move_sidebar_selection(state, 1);
+            }
+        }
+        BindableAction::ActivateSelection => {
+            if state.ui_focus == UiFocus::Sidebar {
+                activate_sidebar_selection(state, cmds);
+            }
+        }
+        BindableAction::OpenTab => open_new_tab_in_active(state, cmds),
+        BindableAction::CloseTab => close_current_tab(state, cmds),
+        BindableAction::EnterTerminalMode => state.mode = Mode::Terminal,
+        BindableAction::EnterCommandMode => {
+            state.mode = Mode::Command;
+            state.command.clear();
+            state.command_status = None;
+            state.command_completion = None;
+            state.help_open = false;
+            refresh_command_completion(state);
+        }
+        BindableAction::NextTab => switch_tab(state, 1),
+        BindableAction::PrevTab => switch_tab(state, -1),
+        BindableAction::SidebarGrow => apply_sidebar_resize(state, 2, cmds),
+        BindableAction::SidebarShrink => apply_sidebar_resize(state, -2, cmds),
+        BindableAction::SidebarReset => set_sidebar_width(state, DEFAULT_SIDEBAR_WIDTH, cmds),
+        BindableAction::OpenProjectPopup => crate::commands::cmd_open(state, &[], cmds),
+        BindableAction::NewWorktree => crate::commands::cmd_worktree(state, &[], cmds),
+        BindableAction::RemoveWorktree => crate::commands::cmd_worktree_remove(state, &[], cmds),
+        BindableAction::EditProject => crate::commands::cmd_edit(state, &[], cmds),
+        BindableAction::LaunchPicker => crate::commands::cmd_launch(state, &[], cmds),
+        BindableAction::UsagePopup => crate::commands::cmd_usage(state, &[], cmds),
+        BindableAction::HelpPopup => state.help_open = true,
+        BindableAction::Quit => state.running = false,
+        BindableAction::LeaveTerminal => state.mode = Mode::Normal,
     }
 }
 
@@ -1096,11 +1129,6 @@ fn is_ctrl_backslash(k: &KeyEvent) -> bool {
     // protocols) or Ctrl-4 (legacy raw-byte mapping). Treat both as Ctrl-\.
     k.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(k.code, KeyCode::Char('\\') | KeyCode::Char('4'))
-}
-
-fn is_ctrl_n(k: &KeyEvent) -> bool {
-    k.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(k.code, KeyCode::Char('n') | KeyCode::Char('N'))
 }
 
 /// Clamp the help popup's scroll offset against the last `max_scroll` the
@@ -1319,16 +1347,22 @@ fn handle_open_project_popup_key(state: &mut AppState, k: KeyEvent, cmds: &mut C
     // Ctrl-S submits from any focus.
     let ctrl_s = k.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(k.code, KeyCode::Char('s') | KeyCode::Char('S'));
-    let enter_on_path = matches!(k.code, KeyCode::Enter)
-        && state
-            .open_project_popup
-            .as_ref()
-            .is_some_and(|p| p.focus == OpenProjectFocus::Path);
-    if ctrl_s || enter_on_path {
+    // Enter submits when on Path; on Import it toggles the flag (so the
+    // user can both navigate to + check it with one Enter). On Script it
+    // still inserts a newline via the textarea path below.
+    let on_path = state
+        .open_project_popup
+        .as_ref()
+        .is_some_and(|p| p.focus == OpenProjectFocus::Path);
+    let on_import = state
+        .open_project_popup
+        .as_ref()
+        .is_some_and(|p| p.focus == OpenProjectFocus::Import);
+    let enter_submit = matches!(k.code, KeyCode::Enter) && on_path;
+    if ctrl_s || enter_submit {
         if let Some(popup) = state.open_project_popup.take() {
             let path = popup.path.trim().to_string();
             if path.is_empty() {
-                // Re-open with the script preserved so the user doesn't lose it.
                 state.open_project_popup = Some(popup);
                 state.command_status = Some("path required".into());
                 return;
@@ -1346,17 +1380,26 @@ fn handle_open_project_popup_key(state: &mut AppState, k: KeyEvent, cmds: &mut C
             cmds.push(Command::OpenProject {
                 path: expanded,
                 setup_script,
+                import_existing: popup.import_existing,
             });
         }
         return;
     }
-    // Tab toggles focus.
+    // Tab cycles Path → Script → Import → Path.
     if matches!(k.code, KeyCode::Tab) {
         if let Some(popup) = state.open_project_popup.as_mut() {
             popup.focus = match popup.focus {
                 OpenProjectFocus::Path => OpenProjectFocus::Script,
-                OpenProjectFocus::Script => OpenProjectFocus::Path,
+                OpenProjectFocus::Script => OpenProjectFocus::Import,
+                OpenProjectFocus::Import => OpenProjectFocus::Path,
             };
+        }
+        return;
+    }
+    // Space (or Enter) on the Import row toggles the flag.
+    if on_import && matches!(k.code, KeyCode::Char(' ') | KeyCode::Enter) {
+        if let Some(popup) = state.open_project_popup.as_mut() {
+            popup.import_existing = !popup.import_existing;
         }
         return;
     }
@@ -1374,6 +1417,10 @@ fn handle_open_project_popup_key(state: &mut AppState, k: KeyEvent, cmds: &mut C
             },
             OpenProjectFocus::Script => {
                 popup.script.input(crossterm_key_to_input(k));
+            }
+            OpenProjectFocus::Import => {
+                // No other keys do anything when the Import row is focused;
+                // ignore so a stray keystroke doesn't fall through.
             }
         }
     }
@@ -1497,10 +1544,10 @@ mod tests {
         let mut s = AppState::new();
         s.term_size = TermSize::new(40, 200);
         let _ = reduce(&mut s, Action::Key(ctrl('w')));
-        assert_eq!(s.pending_leader, Some(Leader::CtrlW));
+        assert_eq!(s.pending_chord.len(), 1);
         let _ = reduce(&mut s, Action::Key(plain('>')));
         assert_eq!(s.sidebar_width, DEFAULT_SIDEBAR_WIDTH + 2);
-        assert_eq!(s.pending_leader, None);
+        assert!(s.pending_chord.is_empty());
     }
 
     #[test]
@@ -1571,7 +1618,7 @@ mod tests {
         let _ = reduce(&mut s, Action::Key(ctrl('w')));
         let cmds = reduce(&mut s, Action::Key(plain('x')));
         assert!(cmds.is_empty());
-        assert_eq!(s.pending_leader, None);
+        assert!(s.pending_chord.is_empty());
         assert_eq!(s.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
     }
 
@@ -1610,7 +1657,7 @@ mod tests {
         let mut s = AppState::new();
         s.mode = Mode::Terminal;
         let _ = reduce(&mut s, Action::Key(ctrl('4')));
-        assert_eq!(s.pending_leader, Some(Leader::CtrlBackslash));
+        assert_eq!(s.pending_chord.len(), 1);
         let _ = reduce(&mut s, Action::Key(ctrl('n')));
         assert_eq!(s.mode, Mode::Normal);
     }
@@ -1620,10 +1667,10 @@ mod tests {
         let mut s = AppState::new();
         s.mode = Mode::Terminal;
         let _ = reduce(&mut s, Action::Key(ctrl('\\')));
-        assert_eq!(s.pending_leader, Some(Leader::CtrlBackslash));
+        assert_eq!(s.pending_chord.len(), 1);
         let _ = reduce(&mut s, Action::Key(ctrl('n')));
         assert_eq!(s.mode, Mode::Normal);
-        assert_eq!(s.pending_leader, None);
+        assert!(s.pending_chord.is_empty());
     }
 
     #[test]
@@ -1725,7 +1772,7 @@ mod tests {
         s.mode = Mode::Terminal;
         // No session → key just goes nowhere; the point is the chord must NOT trigger.
         let _ = reduce(&mut s, Action::Key(ctrl('w')));
-        assert_eq!(s.pending_leader, None);
+        assert!(s.pending_chord.is_empty());
         let cmds = reduce(&mut s, Action::Key(plain('>')));
         assert_eq!(s.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
         // No writes (no active session in this test).
@@ -2099,10 +2146,10 @@ mod tests {
         let mut s = mk_state_with_two_tabs();
         assert_eq!(s.projects[0].worktrees[0].active_tab, Some(1));
         let _ = reduce(&mut s, Action::Key(plain('g')));
-        assert_eq!(s.pending_leader, Some(Leader::G));
+        assert_eq!(s.pending_chord.len(), 1);
         let _ = reduce(&mut s, Action::Key(plain('t')));
         assert_eq!(s.projects[0].worktrees[0].active_tab, Some(0));
-        assert_eq!(s.pending_leader, None);
+        assert!(s.pending_chord.is_empty());
     }
 
     #[test]
@@ -2122,7 +2169,7 @@ mod tests {
         let mut s = mk_state_with_two_tabs();
         let _ = reduce(&mut s, Action::Key(plain('g')));
         let _ = reduce(&mut s, Action::Key(plain('z')));
-        assert_eq!(s.pending_leader, None);
+        assert!(s.pending_chord.is_empty());
         // active_tab unchanged
         assert_eq!(s.projects[0].worktrees[0].active_tab, Some(1));
     }
@@ -2180,7 +2227,7 @@ mod tests {
         s.mode = Mode::Terminal;
         // 'g' should be forwarded to the PTY (it's just a letter in Terminal mode).
         let cmds = reduce(&mut s, Action::Key(plain('g')));
-        assert_eq!(s.pending_leader, None);
+        assert!(s.pending_chord.is_empty());
         assert!(matches!(cmds.as_slice(), [Command::WriteKey(_, _)]));
     }
 
@@ -2588,7 +2635,7 @@ mod tests {
         let cmds = submit_command(&mut s, "open /tmp/some-repo");
         assert!(matches!(
             cmds.as_slice(),
-            [Command::OpenProject { path, setup_script: None }]
+            [Command::OpenProject { path, setup_script: None, .. }]
                 if path.as_os_str() == "/tmp/some-repo"
         ));
         assert!(s.open_project_popup.is_none());
@@ -2606,9 +2653,9 @@ mod tests {
     fn space_leader_o_opens_open_project_popup() {
         let mut s = AppState::new();
         let _ = reduce(&mut s, Action::Key(plain(' ')));
-        assert_eq!(s.pending_leader, Some(Leader::Space));
+        assert_eq!(s.pending_chord.len(), 1);
         let _ = reduce(&mut s, Action::Key(plain('o')));
-        assert!(s.pending_leader.is_none());
+        assert!(s.pending_chord.is_empty());
         assert!(s.open_project_popup.is_some());
     }
 
@@ -2637,7 +2684,7 @@ mod tests {
             &mut s,
             Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         );
-        assert!(s.pending_leader.is_none());
+        assert!(s.pending_chord.is_empty());
         assert!(s.open_project_popup.is_none());
         assert!(s.running);
     }
@@ -2817,7 +2864,7 @@ mod tests {
         assert!(s.open_project_popup.is_none());
         assert!(matches!(
             cmds.as_slice(),
-            [Command::OpenProject { path, setup_script: None }]
+            [Command::OpenProject { path, setup_script: None, .. }]
                 if path.as_os_str() == "/tmp"
         ));
     }
@@ -2844,7 +2891,7 @@ mod tests {
         assert!(s.open_project_popup.is_none());
         assert!(matches!(
             cmds.as_slice(),
-            [Command::OpenProject { path, setup_script: Some(script) }]
+            [Command::OpenProject { path, setup_script: Some(script), .. }]
                 if path.as_os_str() == "/x" && script == "echo"
         ));
     }
@@ -2895,7 +2942,13 @@ mod tests {
             github_enabled: false,
             gh_poll_interval_secs: None,
         };
-        let _ = reduce(&mut s, Action::ProjectOpened(project));
+        let _ = reduce(
+            &mut s,
+            Action::ProjectOpened {
+                project,
+                import_existing: false,
+            },
+        );
         assert!(s.pending_op.is_none());
     }
 
@@ -2953,7 +3006,13 @@ mod tests {
             github_enabled: false,
             gh_poll_interval_secs: None,
         };
-        let cmds = reduce(&mut s, Action::ProjectOpened(project));
+        let cmds = reduce(
+            &mut s,
+            Action::ProjectOpened {
+                project,
+                import_existing: false,
+            },
+        );
         assert_eq!(s.projects.len(), 1);
         assert_eq!(s.projects[0].slug, "test");
         assert!(matches!(
@@ -3326,5 +3385,149 @@ mod tests {
         assert!(!s.pr_statuses.contains_key(&(0, 0)));
         // Other project's entry untouched.
         assert_eq!(s.pr_statuses.get(&(1, 0)), Some(&PrStatus::Merged));
+    }
+
+    #[test]
+    fn g_alone_leaves_chord_pending_gt_clears_it() {
+        let mut s = AppState::new();
+        let _ = reduce(&mut s, Action::Key(plain('g')));
+        assert_eq!(s.pending_chord.len(), 1);
+        let _ = reduce(&mut s, Action::Key(plain('t')));
+        assert!(s.pending_chord.is_empty());
+    }
+
+    #[test]
+    fn custom_binding_via_overlay_remaps_open_tab() {
+        use crate::keybinds::{BindableAction, load_overlay};
+        let mut overlay = std::collections::BTreeMap::new();
+        overlay.insert("open_tab".into(), "<Space>t".into());
+        let mut s = AppState::new();
+        s.keymap = std::sync::Arc::new(load_overlay(&overlay));
+        // Old default `o` should now do nothing.
+        let _ = reduce(&mut s, Action::Key(plain('o')));
+        assert!(s.pending_chord.is_empty());
+        // New chord <Space>t fires OpenTab.
+        let _ = reduce(&mut s, Action::Key(plain(' ')));
+        assert_eq!(s.pending_chord.len(), 1);
+        let _ = reduce(&mut s, Action::Key(plain('t')));
+        assert!(s.pending_chord.is_empty());
+        assert_eq!(
+            s.keymap.binding_for(BindableAction::OpenTab).as_deref(),
+            Some("<Space>t")
+        );
+    }
+
+    #[test]
+    fn worktrees_imported_appends_new_and_skips_dupes() {
+        let mut s = AppState::new();
+        s.projects = mock_projects();
+        let main_path = s.projects[0].worktrees[0].path.clone();
+        let feat_path = s.projects[0].worktrees[1].path.clone();
+        let entries = vec![
+            Worktree {
+                name: "main".into(),
+                path: main_path,
+                branch: Some("main".into()),
+                sessions: Vec::new(),
+                active_tab: None,
+            },
+            Worktree {
+                name: "feat-x".into(),
+                path: feat_path,
+                branch: Some("feat-x".into()),
+                sessions: Vec::new(),
+                active_tab: None,
+            },
+            Worktree {
+                name: "fresh-1".into(),
+                path: PathBuf::from("/tmp/fresh-1"),
+                branch: Some("fresh-1".into()),
+                sessions: Vec::new(),
+                active_tab: None,
+            },
+            Worktree {
+                name: "fresh-2".into(),
+                path: PathBuf::from("/tmp/fresh-2"),
+                branch: Some("fresh-2".into()),
+                sessions: Vec::new(),
+                active_tab: None,
+            },
+        ];
+        let cmds = reduce(
+            &mut s,
+            Action::WorktreesImported {
+                project_idx: 0,
+                entries,
+            },
+        );
+        assert_eq!(s.projects[0].worktrees.len(), 4);
+        assert!(matches!(cmds.as_slice(), [Command::SaveProjectConfig(0)]));
+        assert_eq!(s.command_status.as_deref(), Some("imported 2 worktrees"));
+    }
+
+    #[test]
+    fn worktrees_imported_empty_set_says_nothing_to_import() {
+        let mut s = AppState::new();
+        s.projects = mock_projects();
+        let cmds = reduce(
+            &mut s,
+            Action::WorktreesImported {
+                project_idx: 0,
+                entries: Vec::new(),
+            },
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(s.projects[0].worktrees.len(), 2);
+        assert_eq!(
+            s.command_status.as_deref(),
+            Some("no new worktrees to import")
+        );
+    }
+
+    #[test]
+    fn terminal_chord_replay_forwards_buffered_keys_on_mismatch() {
+        let mut s = AppState::new();
+        s.term_size = TermSize::new(40, 200);
+        s.mode = Mode::Terminal;
+        let fake = FakeSession::new(7);
+        let _ = reduce(
+            &mut s,
+            Action::SessionSpawned {
+                session: fake,
+                dest: (0, 0),
+            },
+        );
+        s.projects = vec![Project {
+            slug: "p".into(),
+            name: "p".into(),
+            repo_path: PathBuf::from("."),
+            worktrees: vec![Worktree {
+                name: "w".into(),
+                path: PathBuf::from("."),
+                branch: Some("w".into()),
+                sessions: vec![7],
+                active_tab: Some(0),
+            }],
+            expanded: true,
+            setup_script: None,
+            launchers: Vec::new(),
+            github_enabled: false,
+            gh_poll_interval_secs: None,
+        }];
+        s.active_worktree = Some((0, 0));
+
+        // Ctrl-\ alone is a prefix — buffered, nothing reaches the PTY.
+        let cmds = reduce(&mut s, Action::Key(ctrl('\\')));
+        assert!(cmds.is_empty());
+        assert_eq!(s.pending_chord.len(), 1);
+        // Mismatch: replay both buffered keys to the PTY in order.
+        let cmds = reduce(&mut s, Action::Key(plain('q')));
+        assert_eq!(cmds.len(), 2);
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::WriteKey(7, _), Command::WriteKey(7, _)]
+        ));
+        assert!(s.pending_chord.is_empty());
+        assert_eq!(s.mode, Mode::Terminal);
     }
 }

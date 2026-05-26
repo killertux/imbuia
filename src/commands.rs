@@ -79,6 +79,12 @@ pub const COMMANDS: &[CmdSpec] = &[
         handler: cmd_worktree_remove,
     },
     CmdSpec {
+        names: &["import"],
+        usage: ":import",
+        description: "Import any git worktrees of the selected project not already in imbuia.",
+        handler: cmd_import,
+    },
+    CmdSpec {
         names: &["restart-supervisor", "rs"],
         usage: ":restart-supervisor",
         description: "Kill the PTY supervisor and all its sessions; respawn on next launch.",
@@ -194,6 +200,7 @@ pub(crate) fn cmd_open(state: &mut AppState, args: &[&str], cmds: &mut Commands)
         cmds.push(Command::OpenProject {
             path: expanded,
             setup_script: None,
+            import_existing: false,
         });
     } else {
         use crate::app::{OpenProjectFocus, OpenProjectPopup};
@@ -205,6 +212,7 @@ pub(crate) fn cmd_open(state: &mut AppState, args: &[&str], cmds: &mut Commands)
             path: String::new(),
             script,
             focus: OpenProjectFocus::default(),
+            import_existing: false,
         });
     }
 }
@@ -267,6 +275,19 @@ fn selected_project_idx(state: &AppState) -> Option<usize> {
         return Some(p);
     }
     state.active_worktree.map(|(p, _)| p)
+}
+
+fn cmd_import(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
+    let Some(pi) = selected_project_idx(state) else {
+        state.command_status = Some("select a project in the sidebar first".into());
+        return;
+    };
+    let repo_path = state.projects[pi].repo_path.clone();
+    state.pending_op = Some("Importing existing worktrees…".into());
+    cmds.push(Command::ImportWorktrees {
+        project_idx: pi,
+        repo_path,
+    });
 }
 
 pub(crate) fn cmd_worktree_remove(state: &mut AppState, _args: &[&str], _cmds: &mut Commands) {

@@ -67,6 +67,51 @@ pub fn worktree_add(repo: &Path, dest: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// One row from `git worktree list --porcelain`. `branch` is `None` for
+/// detached HEAD worktrees (we still report them so the caller can decide).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeListEntry {
+    pub path: std::path::PathBuf,
+    pub branch: Option<String>,
+}
+
+/// Enumerate every worktree git knows about for `repo`. Uses porcelain
+/// output — stable and easy to parse:
+///
+/// ```text
+/// worktree /Users/me/proj
+/// HEAD abcd
+/// branch refs/heads/main
+///
+/// worktree /Users/me/proj-worktrees/feat
+/// HEAD beef
+/// branch refs/heads/feat
+/// ```
+pub fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeListEntry>> {
+    let out = run(&["worktree", "list", "--porcelain"], Some(repo))?;
+    let mut entries = Vec::new();
+    let mut path: Option<std::path::PathBuf> = None;
+    let mut branch: Option<String> = None;
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            if let Some(prev) = path.take() {
+                entries.push(WorktreeListEntry {
+                    path: prev,
+                    branch: branch.take(),
+                });
+            }
+            path = Some(std::path::PathBuf::from(p));
+            branch = None;
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+        }
+    }
+    if let Some(prev) = path {
+        entries.push(WorktreeListEntry { path: prev, branch });
+    }
+    Ok(entries)
+}
+
 /// Remove the worktree at `dest` and (optionally) delete the local branch.
 /// Uses `--force` so dirty worktrees are still removed — the user is the one
 /// who asked for this. Branch deletion failures are reported but don't abort.

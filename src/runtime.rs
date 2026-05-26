@@ -59,6 +59,8 @@ pub async fn run() -> Result<()> {
         })
         .collect();
     state.gh_poll_interval_secs = global.gh_poll_interval_secs;
+    state.keybinds_config = global.keybinds.clone();
+    state.keymap = std::sync::Arc::new(crate::keybinds::load_overlay(&global.keybinds));
     state.projects = project_cfgs.into_iter().map(Project::from_config).collect();
     if !state.projects.is_empty() {
         state.sidebar_selection = Some((0, None));
@@ -251,15 +253,24 @@ fn execute(
         }
         Command::SubscribeUsage => supervisor.subscribe_usage(),
         Command::UnsubscribeUsage => supervisor.unsubscribe_usage(),
-        Command::OpenProject { path, setup_script } => {
+        Command::OpenProject {
+            path,
+            setup_script,
+            import_existing,
+        } => {
             spawn_open_project(
                 path,
                 setup_script,
+                import_existing,
                 state.config_dir.clone(),
                 state_slugs(state),
                 action_tx,
             );
         }
+        Command::ImportWorktrees {
+            project_idx,
+            repo_path,
+        } => spawn_import_worktrees(project_idx, repo_path, action_tx),
         Command::AddWorktree {
             project_idx,
             repo_path,
@@ -297,6 +308,7 @@ fn execute(
                     })
                     .collect(),
                 gh_poll_interval_secs: state.gh_poll_interval_secs,
+                keybinds: state.keybinds_config.clone(),
             };
             if let Err(e) = config::save_global(&state.config_dir, &global) {
                 tracing::warn!("save_global failed: {e}");
@@ -508,6 +520,7 @@ fn state_slugs(state: &AppState) -> Vec<String> {
 fn spawn_open_project(
     path: PathBuf,
     setup_script: Option<String>,
+    import_existing: bool,
     config_dir: PathBuf,
     existing_slugs: Vec<String>,
     action_tx: &mpsc::Sender<Action>,
@@ -517,11 +530,54 @@ fn spawn_open_project(
         match do_open_project(&path, setup_script, &config_dir, &existing_slugs) {
             Ok(cfg) => {
                 tracing::info!(slug = %cfg.slug, "project opened");
-                let _ = tx.blocking_send(Action::ProjectOpened(Project::from_config(cfg)));
+                let _ = tx.blocking_send(Action::ProjectOpened {
+                    project: Project::from_config(cfg),
+                    import_existing,
+                });
             }
             Err(e) => {
                 let _ = tx.blocking_send(Action::OperationFailed(format!("open: {e}")));
             }
+        }
+    });
+}
+
+fn spawn_import_worktrees(
+    project_idx: usize,
+    repo_path: PathBuf,
+    action_tx: &mpsc::Sender<Action>,
+) {
+    let tx = action_tx.clone();
+    std::thread::spawn(move || match git::list_worktrees(&repo_path) {
+        Ok(entries) => {
+            tracing::info!(
+                project_idx,
+                count = entries.len(),
+                "import: git worktree list"
+            );
+            let imported: Vec<crate::app::Worktree> = entries
+                .into_iter()
+                .map(|e| crate::app::Worktree {
+                    name: e.branch.clone().unwrap_or_else(|| {
+                        e.path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "worktree".into())
+                    }),
+                    path: e.path,
+                    branch: e.branch,
+                    sessions: Vec::new(),
+                    active_tab: None,
+                })
+                .collect();
+            let _ = tx.blocking_send(Action::WorktreesImported {
+                project_idx,
+                entries: imported,
+            });
+        }
+        Err(e) => {
+            tracing::warn!(project_idx, "git worktree list failed: {e}");
+            let _ = tx.blocking_send(Action::OperationFailed(format!("import: {e}")));
         }
     });
 }

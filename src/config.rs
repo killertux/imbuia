@@ -2,6 +2,7 @@ use crate::layout::DEFAULT_SIDEBAR_WIDTH;
 use crate::theme::ThemeKind;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +23,13 @@ pub struct GlobalConfig {
     /// `None` means the runtime falls back to its built-in default (120s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gh_poll_interval_secs: Option<u64>,
+    /// User keybinding overrides (action name → vim-style binding string).
+    /// Populated with every default on first launch; thereafter the user
+    /// owns the table. Unknown action names and unparseable bindings are
+    /// logged and ignored — the action falls back to its compile-time
+    /// default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub keybinds: BTreeMap<String, String>,
 }
 
 impl Default for GlobalConfig {
@@ -32,6 +40,7 @@ impl Default for GlobalConfig {
             projects: Vec::new(),
             launchers: Vec::new(),
             gh_poll_interval_secs: None,
+            keybinds: BTreeMap::new(),
         }
     }
 }
@@ -111,7 +120,16 @@ pub fn resolve_config_dir() -> PathBuf {
 }
 
 pub fn load_or_default(dir: &Path) -> (GlobalConfig, Vec<ProjectConfig>) {
-    let global = load_global(dir).unwrap_or_default();
+    let mut global = load_global(dir).unwrap_or_default();
+    // First launch (or any state where keybinds is empty): seed the toml
+    // with every default so the user can discover/customise them. Failure
+    // to write is logged, not fatal — the in-memory map still has them.
+    if global.keybinds.is_empty() {
+        global.keybinds = crate::keybinds::defaults_as_config();
+        if let Err(e) = save_global(dir, &global) {
+            tracing::warn!("seeding default keybinds failed: {e}");
+        }
+    }
     let mut projects = Vec::with_capacity(global.projects.len());
     for slug in &global.projects {
         if !is_valid_slug(slug) {
@@ -257,6 +275,7 @@ mod tests {
             projects: vec!["../etc".into(), "ok".into()],
             launchers: Vec::new(),
             gh_poll_interval_secs: None,
+            keybinds: BTreeMap::new(),
         };
         save_global(&dir, &global).unwrap();
         let proj = ProjectConfig {
@@ -289,6 +308,7 @@ mod tests {
             projects: vec!["foo".into()],
             launchers: Vec::new(),
             gh_poll_interval_secs: None,
+            keybinds: BTreeMap::new(),
         };
         save_global(&dir, &global).unwrap();
         let loaded = load_global(&dir).unwrap();
