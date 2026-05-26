@@ -212,7 +212,7 @@ fn render_open_project_popup(
     use ratatui::layout::{Constraint, Direction, Layout};
 
     let width = 70u16.min(area.width.saturating_sub(4));
-    let height = 14u16.min(area.height.saturating_sub(4));
+    let height = 16u16.min(area.height.saturating_sub(4));
     let r = centered_rect(width, height, area);
     frame.render_widget(Clear, r);
     let block = Block::default()
@@ -238,6 +238,7 @@ fn render_open_project_popup(
             Constraint::Length(1), // hint
             Constraint::Length(1), // setup-script label
             Constraint::Min(3),    // textarea
+            Constraint::Length(1), // import toggle
             Constraint::Length(1), // footer
         ])
         .split(inner);
@@ -281,12 +282,32 @@ fn render_open_project_popup(
     );
     frame.render_widget(&popup.script, chunks[3]);
 
+    let import_focused = popup.focus == OpenProjectFocus::Import;
+    let import_style = if import_focused {
+        Style::default()
+            .fg(theme.header_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.fg_dim)
+    };
+    let checkbox = if popup.import_existing { "[x]" } else { "[ ]" };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {checkbox} "), import_style),
+            Span::styled(
+                "import existing worktrees (git worktree list)",
+                import_style,
+            ),
+        ])),
+        chunks[4],
+    );
+
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " Tab switch · Enter or Ctrl-S confirm · Esc cancel",
+            " Tab cycle · Space toggle · Enter or Ctrl-S confirm · Esc cancel",
             Style::default().fg(theme.fg_dim),
         ))),
-        chunks[4],
+        chunks[5],
     );
 
     if path_focused {

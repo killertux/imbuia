@@ -40,8 +40,12 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
             state.sessions.remove(&id);
             remove_session_from_worktrees(state, id);
         }
-        Action::ProjectOpened(project) => {
+        Action::ProjectOpened {
+            project,
+            import_existing,
+        } => {
             state.pending_op = None;
+            let repo_path = project.repo_path.clone();
             state.projects.push(project);
             let new_idx = state.projects.len() - 1;
             if state.sidebar_selection.is_none() {
@@ -49,6 +53,40 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
             }
             cmds.push(Command::SaveGlobalConfig);
             cmds.push(Command::SaveProjectConfig(new_idx));
+            if import_existing {
+                state.pending_op = Some("Importing existing worktrees…".into());
+                cmds.push(Command::ImportWorktrees {
+                    project_idx: new_idx,
+                    repo_path,
+                });
+            }
+        }
+        Action::WorktreesImported {
+            project_idx,
+            entries,
+        } => {
+            state.pending_op = None;
+            let Some(project) = state.projects.get_mut(project_idx) else {
+                return cmds;
+            };
+            let mut added = 0usize;
+            for wt in entries {
+                // Dedup by path — the main worktree is already in the project.
+                if project.worktrees.iter().any(|w| w.path == wt.path) {
+                    continue;
+                }
+                project.worktrees.push(wt);
+                added += 1;
+            }
+            if added > 0 {
+                cmds.push(Command::SaveProjectConfig(project_idx));
+                state.command_status = Some(format!(
+                    "imported {added} worktree{}",
+                    if added == 1 { "" } else { "s" }
+                ));
+            } else {
+                state.command_status = Some("no new worktrees to import".into());
+            }
         }
         Action::WorktreeAdded {
             project_idx,
@@ -1309,16 +1347,22 @@ fn handle_open_project_popup_key(state: &mut AppState, k: KeyEvent, cmds: &mut C
     // Ctrl-S submits from any focus.
     let ctrl_s = k.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(k.code, KeyCode::Char('s') | KeyCode::Char('S'));
-    let enter_on_path = matches!(k.code, KeyCode::Enter)
-        && state
-            .open_project_popup
-            .as_ref()
-            .is_some_and(|p| p.focus == OpenProjectFocus::Path);
-    if ctrl_s || enter_on_path {
+    // Enter submits when on Path; on Import it toggles the flag (so the
+    // user can both navigate to + check it with one Enter). On Script it
+    // still inserts a newline via the textarea path below.
+    let on_path = state
+        .open_project_popup
+        .as_ref()
+        .is_some_and(|p| p.focus == OpenProjectFocus::Path);
+    let on_import = state
+        .open_project_popup
+        .as_ref()
+        .is_some_and(|p| p.focus == OpenProjectFocus::Import);
+    let enter_submit = matches!(k.code, KeyCode::Enter) && on_path;
+    if ctrl_s || enter_submit {
         if let Some(popup) = state.open_project_popup.take() {
             let path = popup.path.trim().to_string();
             if path.is_empty() {
-                // Re-open with the script preserved so the user doesn't lose it.
                 state.open_project_popup = Some(popup);
                 state.command_status = Some("path required".into());
                 return;
@@ -1336,17 +1380,26 @@ fn handle_open_project_popup_key(state: &mut AppState, k: KeyEvent, cmds: &mut C
             cmds.push(Command::OpenProject {
                 path: expanded,
                 setup_script,
+                import_existing: popup.import_existing,
             });
         }
         return;
     }
-    // Tab toggles focus.
+    // Tab cycles Path → Script → Import → Path.
     if matches!(k.code, KeyCode::Tab) {
         if let Some(popup) = state.open_project_popup.as_mut() {
             popup.focus = match popup.focus {
                 OpenProjectFocus::Path => OpenProjectFocus::Script,
-                OpenProjectFocus::Script => OpenProjectFocus::Path,
+                OpenProjectFocus::Script => OpenProjectFocus::Import,
+                OpenProjectFocus::Import => OpenProjectFocus::Path,
             };
+        }
+        return;
+    }
+    // Space (or Enter) on the Import row toggles the flag.
+    if on_import && matches!(k.code, KeyCode::Char(' ') | KeyCode::Enter) {
+        if let Some(popup) = state.open_project_popup.as_mut() {
+            popup.import_existing = !popup.import_existing;
         }
         return;
     }
@@ -1364,6 +1417,10 @@ fn handle_open_project_popup_key(state: &mut AppState, k: KeyEvent, cmds: &mut C
             },
             OpenProjectFocus::Script => {
                 popup.script.input(crossterm_key_to_input(k));
+            }
+            OpenProjectFocus::Import => {
+                // No other keys do anything when the Import row is focused;
+                // ignore so a stray keystroke doesn't fall through.
             }
         }
     }
@@ -2570,7 +2627,7 @@ mod tests {
         let cmds = submit_command(&mut s, "open /tmp/some-repo");
         assert!(matches!(
             cmds.as_slice(),
-            [Command::OpenProject { path, setup_script: None }]
+            [Command::OpenProject { path, setup_script: None, .. }]
                 if path.as_os_str() == "/tmp/some-repo"
         ));
         assert!(s.open_project_popup.is_none());
@@ -2799,7 +2856,7 @@ mod tests {
         assert!(s.open_project_popup.is_none());
         assert!(matches!(
             cmds.as_slice(),
-            [Command::OpenProject { path, setup_script: None }]
+            [Command::OpenProject { path, setup_script: None, .. }]
                 if path.as_os_str() == "/tmp"
         ));
     }
@@ -2826,7 +2883,7 @@ mod tests {
         assert!(s.open_project_popup.is_none());
         assert!(matches!(
             cmds.as_slice(),
-            [Command::OpenProject { path, setup_script: Some(script) }]
+            [Command::OpenProject { path, setup_script: Some(script), .. }]
                 if path.as_os_str() == "/x" && script == "echo"
         ));
     }
@@ -2877,7 +2934,13 @@ mod tests {
             github_enabled: false,
             gh_poll_interval_secs: None,
         };
-        let _ = reduce(&mut s, Action::ProjectOpened(project));
+        let _ = reduce(
+            &mut s,
+            Action::ProjectOpened {
+                project,
+                import_existing: false,
+            },
+        );
         assert!(s.pending_op.is_none());
     }
 
@@ -2935,7 +2998,13 @@ mod tests {
             github_enabled: false,
             gh_poll_interval_secs: None,
         };
-        let cmds = reduce(&mut s, Action::ProjectOpened(project));
+        let cmds = reduce(
+            &mut s,
+            Action::ProjectOpened {
+                project,
+                import_existing: false,
+            },
+        );
         assert_eq!(s.projects.len(), 1);
         assert_eq!(s.projects[0].slug, "test");
         assert!(matches!(
@@ -3337,6 +3406,73 @@ mod tests {
         assert_eq!(
             s.keymap.binding_for(BindableAction::OpenTab).as_deref(),
             Some("<Space>t")
+        );
+    }
+
+    #[test]
+    fn worktrees_imported_appends_new_and_skips_dupes() {
+        let mut s = AppState::new();
+        s.projects = mock_projects();
+        let main_path = s.projects[0].worktrees[0].path.clone();
+        let feat_path = s.projects[0].worktrees[1].path.clone();
+        let entries = vec![
+            Worktree {
+                name: "main".into(),
+                path: main_path,
+                branch: Some("main".into()),
+                sessions: Vec::new(),
+                active_tab: None,
+            },
+            Worktree {
+                name: "feat-x".into(),
+                path: feat_path,
+                branch: Some("feat-x".into()),
+                sessions: Vec::new(),
+                active_tab: None,
+            },
+            Worktree {
+                name: "fresh-1".into(),
+                path: PathBuf::from("/tmp/fresh-1"),
+                branch: Some("fresh-1".into()),
+                sessions: Vec::new(),
+                active_tab: None,
+            },
+            Worktree {
+                name: "fresh-2".into(),
+                path: PathBuf::from("/tmp/fresh-2"),
+                branch: Some("fresh-2".into()),
+                sessions: Vec::new(),
+                active_tab: None,
+            },
+        ];
+        let cmds = reduce(
+            &mut s,
+            Action::WorktreesImported {
+                project_idx: 0,
+                entries,
+            },
+        );
+        assert_eq!(s.projects[0].worktrees.len(), 4);
+        assert!(matches!(cmds.as_slice(), [Command::SaveProjectConfig(0)]));
+        assert_eq!(s.command_status.as_deref(), Some("imported 2 worktrees"));
+    }
+
+    #[test]
+    fn worktrees_imported_empty_set_says_nothing_to_import() {
+        let mut s = AppState::new();
+        s.projects = mock_projects();
+        let cmds = reduce(
+            &mut s,
+            Action::WorktreesImported {
+                project_idx: 0,
+                entries: Vec::new(),
+            },
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(s.projects[0].worktrees.len(), 2);
+        assert_eq!(
+            s.command_status.as_deref(),
+            Some("no new worktrees to import")
         );
     }
 

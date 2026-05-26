@@ -130,6 +130,10 @@ pub struct OpenProjectPopup {
     pub path: String,
     pub script: ratatui_textarea::TextArea<'static>,
     pub focus: OpenProjectFocus,
+    /// When `true`, after the project is opened the runtime enumerates the
+    /// repo's existing git worktrees and adds any not already in the
+    /// project. Toggled with Space / Enter while the Import row has focus.
+    pub import_existing: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
@@ -137,6 +141,7 @@ pub enum OpenProjectFocus {
     #[default]
     Path,
     Script,
+    Import,
 }
 
 /// Modal picker for `:launch` — shows the project's configured launchers plus
@@ -465,9 +470,13 @@ pub enum Action {
     Resize(TermSize),
     SessionExited(SessionId),
     /// Runtime → reducer: a new project has finished validating & saving.
-    /// The persistence layer's TOML schema is *not* leaked here — the runtime
-    /// constructs the domain `Project` from its `ProjectConfig` first.
-    ProjectOpened(Project),
+    /// `import_existing` is forwarded from the originating `Command::OpenProject`
+    /// — when `true`, the reducer fires an `ImportWorktrees` command once
+    /// the project is in `state.projects`.
+    ProjectOpened {
+        project: Project,
+        import_existing: bool,
+    },
     /// Runtime → reducer: a worktree finished `git worktree add`.
     WorktreeAdded {
         project_idx: usize,
@@ -477,6 +486,12 @@ pub enum Action {
     WorktreeRemoved {
         project_idx: usize,
         worktree_idx: usize,
+    },
+    /// Runtime → reducer: `git worktree list` returned these entries; the
+    /// reducer adds whichever ones aren't already in the project.
+    WorktreesImported {
+        project_idx: usize,
+        entries: Vec<Worktree>,
     },
     /// Runtime → reducer: an async operation failed; show the message.
     OperationFailed(String),
@@ -528,7 +543,14 @@ impl std::fmt::Debug for Action {
             Action::Paste(s) => f.debug_tuple("Paste").field(&s.len()).finish(),
             Action::Resize(sz) => f.debug_tuple("Resize").field(sz).finish(),
             Action::SessionExited(id) => f.debug_tuple("SessionExited").field(id).finish(),
-            Action::ProjectOpened(p) => f.debug_tuple("ProjectOpened").field(&p.slug).finish(),
+            Action::ProjectOpened {
+                project,
+                import_existing,
+            } => f
+                .debug_struct("ProjectOpened")
+                .field("slug", &project.slug)
+                .field("import_existing", import_existing)
+                .finish(),
             Action::WorktreeAdded {
                 project_idx,
                 worktree,
@@ -544,6 +566,14 @@ impl std::fmt::Debug for Action {
                 .debug_struct("WorktreeRemoved")
                 .field("project_idx", project_idx)
                 .field("worktree_idx", worktree_idx)
+                .finish(),
+            Action::WorktreesImported {
+                project_idx,
+                entries,
+            } => f
+                .debug_struct("WorktreesImported")
+                .field("project_idx", project_idx)
+                .field("count", &entries.len())
                 .finish(),
             Action::OperationFailed(s) => f.debug_tuple("OperationFailed").field(s).finish(),
             Action::SupervisorLost(s) => f.debug_tuple("SupervisorLost").field(s).finish(),
@@ -612,6 +642,16 @@ pub enum Command {
     OpenProject {
         path: PathBuf,
         setup_script: Option<String>,
+        /// If `true`, the reducer auto-dispatches `ImportWorktrees` once the
+        /// project lands. Set by the `[x] Import existing worktrees` toggle
+        /// in the open-project popup.
+        import_existing: bool,
+    },
+    /// Run `git worktree list --porcelain` and append every entry not
+    /// already in the project. Asynchronous.
+    ImportWorktrees {
+        project_idx: usize,
+        repo_path: PathBuf,
     },
     /// Run `git worktree add` and persist. Asynchronous.
     AddWorktree {
