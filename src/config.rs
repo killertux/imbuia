@@ -61,8 +61,10 @@ pub struct ProjectConfig {
     /// `:launch` or the launch popup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub launchers: Vec<LauncherConfig>,
-    /// Opt-in GitHub PR-status integration. Toggled by `:gh-enable`/`:gh-disable`.
-    #[serde(default, skip_serializing_if = "is_false")]
+    /// GitHub PR-status integration. **Enabled by default**; disable with
+    /// `:gh-disable`. The default keeps the toml clean — only an explicit
+    /// disable gets persisted.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub github_enabled: bool,
     /// Per-project poll cadence override (seconds). Overrides the global
     /// `gh_poll_interval_secs`; `None` defers to the global setting.
@@ -70,8 +72,12 @@ pub struct ProjectConfig {
     pub gh_poll_interval_secs: Option<u64>,
 }
 
-fn is_false(b: &bool) -> bool {
-    !*b
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

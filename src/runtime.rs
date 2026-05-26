@@ -553,7 +553,7 @@ fn do_open_project(
         setup_script,
         worktrees: vec![main],
         launchers: Vec::new(),
-        github_enabled: false,
+        github_enabled: true,
         gh_poll_interval_secs: None,
     };
     config::save_project(config_dir, &cfg)?;

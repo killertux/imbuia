@@ -313,6 +313,33 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
     cmds
 }
 
+/// Push a `FetchPrStatuses` for a single worktree on this project, provided
+/// the project still has GitHub integration enabled. Used to refresh the
+/// sidebar bar as soon as the user activates a worktree, instead of waiting
+/// for the next 2-min poll. The worker thread serialises against the
+/// periodic tick so this can't double up on gh calls.
+fn request_pr_refresh_for(
+    state: &AppState,
+    project_idx: usize,
+    worktree_idx: usize,
+    cmds: &mut Commands,
+) {
+    let Some(p) = state.projects.get(project_idx) else {
+        return;
+    };
+    if !p.github_enabled {
+        return;
+    }
+    let Some(wt) = p.worktrees.get(worktree_idx) else {
+        return;
+    };
+    cmds.push(Command::FetchPrStatuses {
+        project_idx,
+        repo_path: p.repo_path.clone(),
+        worktrees: vec![(worktree_idx, wt.path.clone())],
+    });
+}
+
 fn worktree_paths(project: &crate::app::Project) -> Vec<(usize, std::path::PathBuf)> {
     project
         .worktrees
@@ -843,8 +870,12 @@ fn clamp_sidebar_scroll(state: &mut AppState) {
     }
 }
 
-fn activate_worktree(state: &mut AppState, pi: usize, wi: usize, _cmds: &mut Commands) {
+fn activate_worktree(state: &mut AppState, pi: usize, wi: usize, cmds: &mut Commands) {
+    let changed = state.active_worktree != Some((pi, wi));
     state.active_worktree = Some((pi, wi));
+    if changed {
+        request_pr_refresh_for(state, pi, wi, cmds);
+    }
     // Focus stays on the sidebar — the user can press `l` (or click) to
     // interact with the terminal once they're ready. No auto-spawn: the
     // user opens a tab explicitly via `o` or `:tabnew`.
