@@ -1,6 +1,14 @@
+use crate::proc::output_with_timeout;
 use anyhow::{Result, anyhow};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
+
+/// Cap how long any git invocation may take. Healthy local ops finish in
+/// milliseconds; this is the "something is wedged" cutoff (filesystem
+/// frozen, git hook hung, etc.) so a poll-loop worker doesn't pin.
+/// `worktree add` against a giant repo is the slowest realistic case.
+const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn run(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     let mut cmd = Command::new("git");
@@ -8,9 +16,8 @@ fn run(args: &[&str], cwd: Option<&Path>) -> Result<String> {
         cmd.arg("-C").arg(c);
     }
     cmd.args(args);
-    let out = cmd
-        .output()
-        .map_err(|e| anyhow!("failed to spawn git: {e}"))?;
+    let out = output_with_timeout(&mut cmd, GIT_TIMEOUT)
+        .map_err(|e| anyhow!("git {}: {e}", args.join(" ")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(anyhow!(
@@ -38,9 +45,8 @@ pub fn head_branch(path: &Path) -> Result<Option<String>> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(path);
     cmd.args(["symbolic-ref", "--quiet", "--short", "HEAD"]);
-    let out = cmd
-        .output()
-        .map_err(|e| anyhow!("failed to spawn git: {e}"))?;
+    let out =
+        output_with_timeout(&mut cmd, GIT_TIMEOUT).map_err(|e| anyhow!("git symbolic-ref: {e}"))?;
     if out.status.success() {
         Ok(Some(
             String::from_utf8_lossy(&out.stdout).trim().to_string(),

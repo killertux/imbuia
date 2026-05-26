@@ -8,11 +8,18 @@
 //! match branch names against a project-wide list.
 
 use crate::app::PrStatus;
+use crate::proc::output_with_timeout;
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::Duration;
+
+/// Cap on a single `gh pr list` invocation. Network-bound (auth refresh,
+/// TLS, GitHub API), so we tolerate more than a local git op — but not
+/// enough to wedge the polling worker if the network goes away.
+const GH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One PR as returned by `gh pr list --json …`. Field set is intentionally
 /// minimal — only what we need to classify into a [`PrStatus`].
@@ -59,9 +66,9 @@ pub struct CheckRollupEntry {
 pub fn gh_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        Command::new("gh")
-            .arg("--version")
-            .output()
+        let mut cmd = Command::new("gh");
+        cmd.arg("--version");
+        output_with_timeout(&mut cmd, Duration::from_secs(3))
             .map(|o| o.status.success())
             .unwrap_or(false)
     })
@@ -74,23 +81,19 @@ pub fn gh_available() -> bool {
 /// worktree doesn't reliably resolve the branch.
 pub fn fetch_pr_by_branch(repo_path: &Path, branch: &str) -> Result<Option<PrStatus>> {
     let mut cmd = Command::new("gh");
-    cmd.current_dir(repo_path)
-        .args([
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--state",
-            "all",
-            "--limit",
-            "1",
-            "--json",
-            "headRefName,state,reviewDecision,mergeable,statusCheckRollup",
-        ])
-        .stdin(std::process::Stdio::null());
-    let out = cmd
-        .output()
-        .map_err(|e| anyhow!("failed to spawn gh: {e}"))?;
+    cmd.current_dir(repo_path).args([
+        "pr",
+        "list",
+        "--head",
+        branch,
+        "--state",
+        "all",
+        "--limit",
+        "1",
+        "--json",
+        "headRefName,state,reviewDecision,mergeable,statusCheckRollup",
+    ]);
+    let out = output_with_timeout(&mut cmd, GH_TIMEOUT).map_err(|e| anyhow!("gh pr list: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(anyhow!("gh pr list failed ({}): {}", out.status, stderr));
