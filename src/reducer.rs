@@ -398,10 +398,10 @@ fn handle_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
         return;
     }
     // Help popup is modal and scrollable: j/k/arrows scroll, PageUp/Down
-    // jumps, Esc (or `:` and `i`, which start a new flow) closes.
+    // jumps, Esc/`q` (or `:` and `i`, which start a new flow) closes.
     if state.help_open {
         match k.code {
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Char('q') => {
                 state.help_open = false;
                 state.help_scroll = 0;
                 return;
@@ -2505,6 +2505,14 @@ mod tests {
             &mut s,
             Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         );
+        assert!(!s.help_open);
+    }
+
+    #[test]
+    fn q_closes_help_popup() {
+        let mut s = AppState::new();
+        s.help_open = true;
+        let _ = reduce(&mut s, Action::Key(plain('q')));
         assert!(!s.help_open);
     }
 
