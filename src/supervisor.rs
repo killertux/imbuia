@@ -38,8 +38,10 @@ struct OutputLog {
     buf: VecDeque<u8>,
     truncated: bool,
 }
+use arc_swap::ArcSwapOption;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -66,10 +68,6 @@ struct Supervised {
 struct Registry {
     sessions: HashMap<SessionId, Arc<Supervised>>,
     next_id: SessionId,
-    active: Option<ClientWriter>,
-    /// Generation counter; bumped when `active` changes. Per-session reader
-    /// threads use it to know if their cached writer is stale.
-    active_generation: u64,
     /// Set when the active client subscribed to usage frames. The sampler
     /// thread polls this and exits when it goes false.
     usage_subscribed: bool,
@@ -80,16 +78,32 @@ struct Registry {
     active_client_pid: Option<u32>,
 }
 
-impl Registry {
+/// Process-wide shared state. Hot path (PTY reader threads forwarding
+/// `OutputDelta`) reads `active_writer` + `active_generation` without
+/// touching the registry mutex; writes to those fields are synchronized
+/// via the registry mutex so attach/cleanup stays linearizable.
+struct Shared {
+    registry: Mutex<Registry>,
+    /// Currently-attached client's writer half, or `None` when no client is
+    /// connected. Updated under `registry` lock to serialize with cleanup.
+    active_writer: ArcSwapOption<Mutex<UnixStream>>,
+    /// Generation counter; bumped when `active_writer` changes. Per-session
+    /// reader threads use it to know if their cached writer is stale.
+    active_generation: AtomicU64,
+}
+
+impl Shared {
     fn new() -> Self {
         Self {
-            sessions: HashMap::new(),
-            next_id: 1,
-            active: None,
-            active_generation: 0,
-            usage_subscribed: false,
-            usage_thread_alive: false,
-            active_client_pid: None,
+            registry: Mutex::new(Registry {
+                sessions: HashMap::new(),
+                next_id: 1,
+                usage_subscribed: false,
+                usage_thread_alive: false,
+                active_client_pid: None,
+            }),
+            active_writer: ArcSwapOption::empty(),
+            active_generation: AtomicU64::new(0),
         }
     }
 }
@@ -105,14 +119,14 @@ pub fn run() -> Result<()> {
     let listener = UnixListener::bind(&sock).context("bind supervisor socket")?;
     tracing::info!(socket = %sock.display(), pid = std::process::id(), "supervisor up");
 
-    let registry = Arc::new(Mutex::new(Registry::new()));
+    let shared = Arc::new(Shared::new());
 
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
-                let reg = Arc::clone(&registry);
+                let sh = Arc::clone(&shared);
                 thread::spawn(move || {
-                    if let Err(e) = serve_client(reg, stream) {
+                    if let Err(e) = serve_client(sh, stream) {
                         tracing::warn!("client session ended: {e}");
                     }
                 });
@@ -126,7 +140,7 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn serve_client(registry: Arc<Mutex<Registry>>, stream: UnixStream) -> Result<()> {
+fn serve_client(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
     // Split into a read half (for ClientMsg) and a write half (shared with
     // per-session reader threads forwarding OutputDelta).
     let mut reader = stream.try_clone()?;
@@ -143,25 +157,30 @@ fn serve_client(registry: Arc<Mutex<Registry>>, stream: UnixStream) -> Result<()
     }
 
     // Steal active slot. Old client gets `Detached`, then we close their writer.
-    let (sessions_snapshot, generation) = {
-        let mut reg = registry.lock().unwrap();
-        if let Some(old) = reg.active.take()
-            && let Ok(mut g) = old.lock()
-        {
-            let _ = ipc::write_frame(
-                &mut *g,
-                &SupervisorMsg::Detached {
-                    reason: "new client attached".into(),
-                },
-            );
-            let _ = g.shutdown(std::net::Shutdown::Both);
-        }
-        reg.active = Some(Arc::clone(&writer));
-        reg.active_generation = reg.active_generation.wrapping_add(1);
+    // We swap `active_writer` under the registry mutex so cleanup paths (which
+    // also hold the mutex) observe a consistent (writer, pid) pair.
+    let (sessions_snapshot, generation, old) = {
+        let mut reg = shared.registry.lock().unwrap();
+        let old = shared.active_writer.swap(Some(Arc::clone(&writer)));
+        let generation = shared
+            .active_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
         reg.active_client_pid = Some(req.client_pid);
         let snap: Vec<SessionMeta> = reg.sessions.values().map(|s| s.meta.clone()).collect();
-        (snap, reg.active_generation)
+        (snap, generation, old)
     };
+    if let Some(old) = old
+        && let Ok(mut g) = old.lock()
+    {
+        let _ = ipc::write_frame(
+            &mut *g,
+            &SupervisorMsg::Detached {
+                reason: "new client attached".into(),
+            },
+        );
+        let _ = g.shutdown(std::net::Shutdown::Both);
+    }
 
     let resp = HandshakeResp::Ok {
         supervisor_pid: std::process::id(),
@@ -172,7 +191,7 @@ fn serve_client(registry: Arc<Mutex<Registry>>, stream: UnixStream) -> Result<()
     // Immediately push a dump for every existing session so the client can
     // restore its rendered view.
     for meta in &sessions_snapshot {
-        if let Some(sess) = registry.lock().unwrap().sessions.get(&meta.id).cloned() {
+        if let Some(sess) = shared.registry.lock().unwrap().sessions.get(&meta.id).cloned() {
             send_dump(&writer, meta.id, &sess);
         }
     }
@@ -192,7 +211,7 @@ fn serve_client(registry: Arc<Mutex<Registry>>, stream: UnixStream) -> Result<()
                     initial_command,
                 } => {
                     let result = spawn_session(
-                        &registry,
+                        &shared,
                         project_slug,
                         worktree_name,
                         rows,
@@ -213,7 +232,7 @@ fn serve_client(registry: Arc<Mutex<Registry>>, stream: UnixStream) -> Result<()
                             // order as long as no one else writes between.
                             ipc::write_frame(&mut *w, &SupervisorMsg::Spawned { request_id, id })?;
                             drop(w);
-                            if let Some(sess) = registry.lock().unwrap().sessions.get(&id).cloned()
+                            if let Some(sess) = shared.registry.lock().unwrap().sessions.get(&id).cloned()
                             {
                                 send_dump(&writer, id, &sess);
                             }
@@ -230,14 +249,14 @@ fn serve_client(registry: Arc<Mutex<Registry>>, stream: UnixStream) -> Result<()
                     }
                 }
                 ClientMsg::WriteBytes { id, bytes } => {
-                    if let Some(sess) = registry.lock().unwrap().sessions.get(&id).cloned() {
+                    if let Some(sess) = shared.registry.lock().unwrap().sessions.get(&id).cloned() {
                         let mut w = sess.writer.lock().unwrap();
                         let _ = w.write_all(&bytes);
                         let _ = w.flush();
                     }
                 }
                 ClientMsg::Resize { id, rows, cols } => {
-                    if let Some(sess) = registry.lock().unwrap().sessions.get(&id).cloned() {
+                    if let Some(sess) = shared.registry.lock().unwrap().sessions.get(&id).cloned() {
                         let _ = sess.master.lock().unwrap().resize(PtySize {
                             rows,
                             cols,
@@ -250,28 +269,28 @@ fn serve_client(registry: Arc<Mutex<Registry>>, stream: UnixStream) -> Result<()
                     }
                 }
                 ClientMsg::Kill { id } => {
-                    kill_session(&registry, id);
+                    kill_session(&shared, id);
                 }
                 ClientMsg::Attach { id } => {
-                    if let Some(sess) = registry.lock().unwrap().sessions.get(&id).cloned() {
+                    if let Some(sess) = shared.registry.lock().unwrap().sessions.get(&id).cloned() {
                         send_dump(&writer, id, &sess);
                     }
                 }
                 ClientMsg::SubscribeUsage => {
-                    let mut reg = registry.lock().unwrap();
+                    let mut reg = shared.registry.lock().unwrap();
                     reg.usage_subscribed = true;
                     if !reg.usage_thread_alive {
                         reg.usage_thread_alive = true;
                         drop(reg);
-                        spawn_usage_sampler(Arc::clone(&registry));
+                        spawn_usage_sampler(Arc::clone(&shared));
                     }
                 }
                 ClientMsg::UnsubscribeUsage => {
-                    registry.lock().unwrap().usage_subscribed = false;
+                    shared.registry.lock().unwrap().usage_subscribed = false;
                 }
                 ClientMsg::Shutdown => {
                     tracing::info!("shutdown requested by client");
-                    shutdown_all(&registry);
+                    shutdown_all(&shared);
                     // Unlink the socket *before* exiting so a racing client
                     // probe gets ENOENT and respawns instead of attaching to
                     // a half-dead supervisor.
@@ -283,24 +302,22 @@ fn serve_client(registry: Arc<Mutex<Registry>>, stream: UnixStream) -> Result<()
         }
     })();
 
-    // Clean up if we're still the active client.
-    let mut reg = registry.lock().unwrap();
-    if reg
-        .active
-        .as_ref()
-        .map(|w| Arc::ptr_eq(w, &writer))
-        .unwrap_or(false)
-        && reg.active_generation == generation
-    {
-        reg.active = None;
+    // Clean up if we're still the active client. We synchronize against
+    // attach via the registry mutex — attach updates `active_writer` while
+    // holding this lock, so checking generation here gives a consistent view.
+    let mut reg = shared.registry.lock().unwrap();
+    if shared.active_generation.load(Ordering::Acquire) == generation {
+        shared.active_writer.store(None);
         reg.usage_subscribed = false;
         reg.active_client_pid = None;
     }
+    drop(reg);
+    let _ = writer;
     result
 }
 
 fn spawn_session(
-    registry: &Arc<Mutex<Registry>>,
+    shared: &Arc<Shared>,
     project_slug: String,
     worktree_name: String,
     rows: u16,
@@ -345,7 +362,7 @@ fn spawn_session(
     // Allocate id & register before we start the reader thread so any early
     // output can find the active client.
     let id = {
-        let mut reg = registry.lock().unwrap();
+        let mut reg = shared.registry.lock().unwrap();
         let id = reg.next_id;
         reg.next_id += 1;
         let meta = SessionMeta {
@@ -371,14 +388,15 @@ fn spawn_session(
 
     // PTY reader → parser + forward as OutputDelta.
     {
-        let registry = Arc::clone(registry);
+        let shared = Arc::clone(shared);
         let parser = Arc::clone(&parser);
         let output_log = Arc::clone(&output_log);
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             // Cached `(active_generation, writer)` so the hot per-byte path
-            // doesn't lock the global registry on every chunk. Refresh on
-            // generation mismatch (steal-on-attach changed the active slot).
+            // never touches the registry mutex. ArcSwap reads are lock-free;
+            // we only reload when the generation counter moves (steal-on-
+            // attach changed the active slot).
             let mut cached: Option<(u64, ClientWriter)> = None;
             loop {
                 match reader.read(&mut buf) {
@@ -390,17 +408,10 @@ fn spawn_session(
                         if let Ok(mut log) = output_log.lock() {
                             push_output_log(&mut log, &buf[..n]);
                         }
-                        let current_gen = {
-                            let reg = registry.lock().unwrap();
-                            if cached.as_ref().map(|(g, _)| *g) != Some(reg.active_generation) {
-                                cached = reg
-                                    .active
-                                    .as_ref()
-                                    .map(|w| (reg.active_generation, Arc::clone(w)));
-                            }
-                            reg.active_generation
-                        };
-                        let _ = current_gen;
+                        let cur_gen = shared.active_generation.load(Ordering::Acquire);
+                        if cached.as_ref().map(|(g, _)| *g) != Some(cur_gen) {
+                            cached = shared.active_writer.load_full().map(|w| (cur_gen, w));
+                        }
                         let write_err = if let Some((_, w)) = &cached {
                             match w.lock() {
                                 Ok(mut g) => ipc::write_frame(
@@ -433,18 +444,18 @@ fn spawn_session(
 
     // Child reaper.
     {
-        let registry = Arc::clone(registry);
+        let shared = Arc::clone(shared);
         thread::spawn(move || {
             let _ = child.wait();
             // Single critical section: remove the session *and* snapshot the
-            // active writer. Splitting these two locks lets an attaching
-            // client land between them — it would miss the session in the
-            // resume list and then receive an `Exited` for an id it never
-            // saw, confusing the rebind logic.
+            // active writer under the registry mutex. Attach also updates
+            // `active_writer` under this mutex, so the snapshot is
+            // consistent — an attaching client either lands fully before us
+            // (no missed Exited) or fully after (sees no session, no Exited).
             let active = {
-                let mut reg = registry.lock().unwrap();
+                let mut reg = shared.registry.lock().unwrap();
                 reg.sessions.remove(&id);
-                reg.active.clone()
+                shared.active_writer.load_full()
             };
             if let Some(w) = active
                 && let Ok(mut g) = w.lock()
@@ -456,8 +467,8 @@ fn spawn_session(
     Ok(id)
 }
 
-fn kill_session(registry: &Arc<Mutex<Registry>>, id: SessionId) {
-    let sess = registry.lock().unwrap().sessions.get(&id).cloned();
+fn kill_session(shared: &Arc<Shared>, id: SessionId) {
+    let sess = shared.registry.lock().unwrap().sessions.get(&id).cloned();
     if let Some(sess) = sess {
         let _ = sess.killer.lock().unwrap().kill();
     }
@@ -466,8 +477,9 @@ fn kill_session(registry: &Arc<Mutex<Registry>>, id: SessionId) {
 /// Snapshot all sessions, SIGTERM each child's PID group, give the reapers
 /// up to ~500 ms to wait() them, then move on. Reaper threads do the actual
 /// `child.wait()` — we just nudge them and poll the session map.
-fn shutdown_all(registry: &Arc<Mutex<Registry>>) {
-    let sessions: Vec<Arc<Supervised>> = registry
+fn shutdown_all(shared: &Arc<Shared>) {
+    let sessions: Vec<Arc<Supervised>> = shared
+        .registry
         .lock()
         .unwrap()
         .sessions
@@ -481,7 +493,7 @@ fn shutdown_all(registry: &Arc<Mutex<Registry>>) {
     }
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     while std::time::Instant::now() < deadline {
-        if registry.lock().unwrap().sessions.is_empty() {
+        if shared.registry.lock().unwrap().sessions.is_empty() {
             break;
         }
         thread::sleep(Duration::from_millis(20));
@@ -581,7 +593,7 @@ fn push_output_log(log: &mut OutputLog, chunk: &[u8]) {
 /// Background thread that samples process trees and pushes one
 /// [`UsageReport`] per second to the active client while
 /// `registry.usage_subscribed` is true.
-fn spawn_usage_sampler(registry: Arc<Mutex<Registry>>) {
+fn spawn_usage_sampler(shared: Arc<Shared>) {
     use std::collections::{HashSet, VecDeque};
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
@@ -604,14 +616,15 @@ fn spawn_usage_sampler(registry: Arc<Mutex<Registry>>) {
             // would see "alive=true" and skip spawning a sampler — leaving
             // `subscribed=true` with no producer.
             let snapshot = {
-                let mut reg = registry.lock().unwrap();
-                if !reg.usage_subscribed || reg.active.is_none() {
+                let mut reg = shared.registry.lock().unwrap();
+                let active = shared.active_writer.load_full();
+                if !reg.usage_subscribed || active.is_none() {
                     reg.usage_thread_alive = false;
                     tracing::debug!("usage sampler exiting");
                     return;
                 }
                 (
-                    reg.active.clone().unwrap(),
+                    active.unwrap(),
                     reg.sessions
                         .values()
                         .map(|s| (s.meta.clone(), s.child_pid))

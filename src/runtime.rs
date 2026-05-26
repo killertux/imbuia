@@ -487,7 +487,7 @@ fn do_fetch(req: GhRequest, action_tx: &mpsc::Sender<Action>) {
 
 fn spawn_update_check(action_tx: &mpsc::Sender<Action>) {
     let tx = action_tx.clone();
-    std::thread::spawn(move || {
+    tokio::task::spawn_blocking(move || {
         let result = crate::updater::check_for_update().map_err(|e| format!("{e:#}"));
         let _ = tx.blocking_send(Action::UpdateChecked(result));
     });
@@ -495,7 +495,7 @@ fn spawn_update_check(action_tx: &mpsc::Sender<Action>) {
 
 fn spawn_update_install(tag: String, action_tx: &mpsc::Sender<Action>) {
     let tx = action_tx.clone();
-    std::thread::spawn(move || {
+    tokio::task::spawn_blocking(move || {
         // Re-derive UpdateInfo from the tag; semver is cheap to parse and we
         // don't want to thread the full struct through the command queue.
         let version_str = tag.strip_prefix('v').unwrap_or(&tag).to_string();
@@ -517,6 +517,46 @@ fn state_slugs(state: &AppState) -> Vec<String> {
     state.projects.iter().map(|p| p.slug.clone()).collect()
 }
 
+/// Drop guard for `state.pending_op`-bearing async ops. The reducer sets
+/// `pending_op = Some(label)` when an op kicks off and clears it only when
+/// it sees a terminal `Action` (`*Added`, `*Removed`, `ProjectOpened`,
+/// `WorktreesImported`, `OperationFailed`). If a blocking task panics or
+/// exits without posting any of those, the status bar would stick on the
+/// "doing X…" message forever. The guard's `Drop` posts an
+/// `OperationFailed` in that case, which clears `pending_op`.
+struct OpGuard {
+    tx: mpsc::Sender<Action>,
+    label: &'static str,
+    armed: bool,
+}
+
+impl OpGuard {
+    fn new(tx: mpsc::Sender<Action>, label: &'static str) -> Self {
+        Self {
+            tx,
+            label,
+            armed: true,
+        }
+    }
+
+    /// Post the terminal action and disarm. Both success and explicit-error
+    /// paths go through here — the `Drop` impl is only the safety net.
+    fn complete(mut self, action: Action) {
+        let _ = self.tx.blocking_send(action);
+        self.armed = false;
+    }
+}
+
+impl Drop for OpGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let msg = format!("{}: task ended without a result", self.label);
+            tracing::warn!("{msg}");
+            let _ = self.tx.blocking_send(Action::OperationFailed(msg));
+        }
+    }
+}
+
 fn spawn_open_project(
     path: PathBuf,
     setup_script: Option<String>,
@@ -526,19 +566,19 @@ fn spawn_open_project(
     action_tx: &mpsc::Sender<Action>,
 ) {
     let tx = action_tx.clone();
-    std::thread::spawn(move || {
-        match do_open_project(&path, setup_script, &config_dir, &existing_slugs) {
+    tokio::task::spawn_blocking(move || {
+        let guard = OpGuard::new(tx, "open project");
+        let action = match do_open_project(&path, setup_script, &config_dir, &existing_slugs) {
             Ok(cfg) => {
                 tracing::info!(slug = %cfg.slug, "project opened");
-                let _ = tx.blocking_send(Action::ProjectOpened {
+                Action::ProjectOpened {
                     project: Project::from_config(cfg),
                     import_existing,
-                });
+                }
             }
-            Err(e) => {
-                let _ = tx.blocking_send(Action::OperationFailed(format!("open: {e}")));
-            }
-        }
+            Err(e) => Action::OperationFailed(format!("open: {e}")),
+        };
+        guard.complete(action);
     });
 }
 
@@ -548,37 +588,41 @@ fn spawn_import_worktrees(
     action_tx: &mpsc::Sender<Action>,
 ) {
     let tx = action_tx.clone();
-    std::thread::spawn(move || match git::list_worktrees(&repo_path) {
-        Ok(entries) => {
-            tracing::info!(
-                project_idx,
-                count = entries.len(),
-                "import: git worktree list"
-            );
-            let imported: Vec<crate::app::Worktree> = entries
-                .into_iter()
-                .map(|e| crate::app::Worktree {
-                    name: e.branch.clone().unwrap_or_else(|| {
-                        e.path
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "worktree".into())
-                    }),
-                    path: e.path,
-                    branch: e.branch,
-                    sessions: Vec::new(),
-                    active_tab: None,
-                })
-                .collect();
-            let _ = tx.blocking_send(Action::WorktreesImported {
-                project_idx,
-                entries: imported,
-            });
-        }
-        Err(e) => {
-            tracing::warn!(project_idx, "git worktree list failed: {e}");
-            let _ = tx.blocking_send(Action::OperationFailed(format!("import: {e}")));
-        }
+    tokio::task::spawn_blocking(move || {
+        let guard = OpGuard::new(tx, "import worktrees");
+        let action = match git::list_worktrees(&repo_path) {
+            Ok(entries) => {
+                tracing::info!(
+                    project_idx,
+                    count = entries.len(),
+                    "import: git worktree list"
+                );
+                let imported: Vec<crate::app::Worktree> = entries
+                    .into_iter()
+                    .map(|e| crate::app::Worktree {
+                        name: e.branch.clone().unwrap_or_else(|| {
+                            e.path
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "worktree".into())
+                        }),
+                        path: e.path,
+                        branch: e.branch,
+                        sessions: Vec::new(),
+                        active_tab: None,
+                    })
+                    .collect();
+                Action::WorktreesImported {
+                    project_idx,
+                    entries: imported,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(project_idx, "git worktree list failed: {e}");
+                Action::OperationFailed(format!("import: {e}"))
+            }
+        };
+        guard.complete(action);
     });
 }
 
@@ -623,17 +667,19 @@ fn spawn_add_worktree(
     action_tx: &mpsc::Sender<Action>,
 ) {
     let tx = action_tx.clone();
-    std::thread::spawn(move || match do_add_worktree(&repo_path, &branch) {
-        Ok(worktree) => {
-            tracing::info!(branch = %branch, "worktree added");
-            let _ = tx.blocking_send(Action::WorktreeAdded {
-                project_idx,
-                worktree,
-            });
-        }
-        Err(e) => {
-            let _ = tx.blocking_send(Action::OperationFailed(format!("worktree: {e}")));
-        }
+    tokio::task::spawn_blocking(move || {
+        let guard = OpGuard::new(tx, "add worktree");
+        let action = match do_add_worktree(&repo_path, &branch) {
+            Ok(worktree) => {
+                tracing::info!(branch = %branch, "worktree added");
+                Action::WorktreeAdded {
+                    project_idx,
+                    worktree,
+                }
+            }
+            Err(e) => Action::OperationFailed(format!("worktree: {e}")),
+        };
+        guard.complete(action);
     });
 }
 
@@ -658,19 +704,19 @@ fn spawn_remove_worktree(
     action_tx: &mpsc::Sender<Action>,
 ) {
     let tx = action_tx.clone();
-    std::thread::spawn(move || {
-        match git::worktree_remove(&repo_path, &dest_path, branch.as_deref()) {
+    tokio::task::spawn_blocking(move || {
+        let guard = OpGuard::new(tx, "remove worktree");
+        let action = match git::worktree_remove(&repo_path, &dest_path, branch.as_deref()) {
             Ok(()) => {
                 tracing::info!(branch = ?branch, "worktree removed");
-                let _ = tx.blocking_send(Action::WorktreeRemoved {
+                Action::WorktreeRemoved {
                     project_idx,
                     worktree_idx,
-                });
+                }
             }
-            Err(e) => {
-                let _ = tx.blocking_send(Action::OperationFailed(format!("remove worktree: {e}")));
-            }
-        }
+            Err(e) => Action::OperationFailed(format!("remove worktree: {e}")),
+        };
+        guard.complete(action);
     });
 }
 
