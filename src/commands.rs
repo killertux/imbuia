@@ -105,7 +105,7 @@ pub const COMMANDS: &[CmdSpec] = &[
     CmdSpec {
         names: &["gh-enable"],
         usage: ":gh-enable",
-        description: "Enable GitHub PR status indicators for the selected project.",
+        description: "Re-enable GitHub PR status indicators (default on).",
         handler: cmd_gh_enable,
     },
     CmdSpec {
