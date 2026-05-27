@@ -42,12 +42,19 @@ use arc_swap::ArcSwapOption;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-/// Shared writer-half of the currently-active client connection.
-type ClientWriter = Arc<Mutex<UnixStream>>;
+/// Active-client handle: a bounded queue of outgoing frames drained by a
+/// dedicated writer thread, plus an Arc'd `UnixStream` retained solely so
+/// steal-on-attach can `shutdown()` the fd — that's what unblocks the writer
+/// thread if it's parked in `write_frame` on a back-pressured socket.
+struct ClientChan {
+    tx: SyncSender<SupervisorMsg>,
+    stream: Arc<UnixStream>,
+}
 
 struct Supervised {
     meta: SessionMeta,
@@ -55,7 +62,11 @@ struct Supervised {
     /// for descendant walks in the usage sampler.
     child_pid: Option<u32>,
     master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    /// Bounded queue feeding a per-session writer thread. The command loop
+    /// pushes here and returns immediately; the writer thread does the
+    /// blocking `write_all` to the PTY. This keeps the command loop
+    /// responsive when a big paste fills the PTY's kernel buffer.
+    write_tx: SyncSender<Vec<u8>>,
     parser: Arc<Mutex<vt100::Parser>>,
     /// Bounded ring of every raw PTY byte we've seen. Replayed verbatim on
     /// attach so the client's local vt100 parser populates its own scrollback
@@ -79,16 +90,17 @@ struct Registry {
 }
 
 /// Process-wide shared state. Hot path (PTY reader threads forwarding
-/// `OutputDelta`) reads `active_writer` + `active_generation` without
-/// touching the registry mutex; writes to those fields are synchronized
-/// via the registry mutex so attach/cleanup stays linearizable.
+/// `OutputDelta`) reads `active` + `active_generation` without touching the
+/// registry mutex; writes to those fields are synchronized via the registry
+/// mutex so attach/cleanup stays linearizable.
 struct Shared {
     registry: Mutex<Registry>,
-    /// Currently-attached client's writer half, or `None` when no client is
-    /// connected. Updated under `registry` lock to serialize with cleanup.
-    active_writer: ArcSwapOption<Mutex<UnixStream>>,
-    /// Generation counter; bumped when `active_writer` changes. Per-session
-    /// reader threads use it to know if their cached writer is stale.
+    /// Currently-attached client's frame queue + stream handle, or `None`
+    /// when no client is connected. Updated under `registry` lock to
+    /// serialize with cleanup.
+    active: ArcSwapOption<ClientChan>,
+    /// Generation counter; bumped when `active` changes. Per-session reader
+    /// threads use it to know if their cached handle is stale.
     active_generation: AtomicU64,
 }
 
@@ -102,7 +114,7 @@ impl Shared {
                 usage_thread_alive: false,
                 active_client_pid: None,
             }),
-            active_writer: ArcSwapOption::empty(),
+            active: ArcSwapOption::empty(),
             active_generation: AtomicU64::new(0),
         }
     }
@@ -141,52 +153,71 @@ pub fn run() -> Result<()> {
 }
 
 fn serve_client(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
-    // Split into a read half (for ClientMsg) and a write half (shared with
-    // per-session reader threads forwarding OutputDelta).
+    // Read half for ClientMsg; the write half goes to the writer thread.
     let mut reader = stream.try_clone()?;
-    let writer = Arc::new(Mutex::new(stream));
 
-    // Handshake
+    // Handshake — done synchronously against the bare stream before any
+    // writer thread exists.
     let req: HandshakeReq = ipc::read_frame(&mut reader)?;
+    let mut handshake_stream = stream;
     if req.protocol != PROTOCOL_VERSION {
         let resp = HandshakeResp::VersionMismatch {
             supervisor_protocol: PROTOCOL_VERSION,
         };
-        let _ = ipc::write_frame(&mut *writer.lock().unwrap(), &resp);
+        let _ = ipc::write_frame(&mut handshake_stream, &resp);
         return Ok(());
     }
 
-    // Steal active slot. Old client gets `Detached`, then we close their writer.
-    // We swap `active_writer` under the registry mutex so cleanup paths (which
-    // also hold the mutex) observe a consistent (writer, pid) pair.
-    let (sessions_snapshot, generation, old) = {
+    // Snapshot existing sessions for the handshake reply *before* the steal —
+    // we want the new client to see the session list the supervisor has right
+    // now, not whatever raced in during the swap.
+    let sessions_snapshot: Vec<SessionMeta> = shared
+        .registry
+        .lock()
+        .unwrap()
+        .sessions
+        .values()
+        .map(|s| s.meta.clone())
+        .collect();
+    let resp = HandshakeResp::Ok {
+        supervisor_pid: std::process::id(),
+        sessions: sessions_snapshot.clone(),
+    };
+    ipc::write_frame(&mut handshake_stream, &resp)?;
+    let stream = handshake_stream;
+
+    // Spin up the per-client writer thread. From here on, *every* outgoing
+    // frame goes through `tx`. `stream_arc` is retained so steal-on-attach
+    // can shutdown() the fd and unblock the writer if needed.
+    let stream_arc = Arc::new(stream);
+    let (tx, rx) = sync_channel::<SupervisorMsg>(512);
+    spawn_socket_writer(Arc::clone(&stream_arc), rx);
+    let chan = Arc::new(ClientChan {
+        tx: tx.clone(),
+        stream: Arc::clone(&stream_arc),
+    });
+
+    // Steal active slot. We swap `active` under the registry mutex so cleanup
+    // paths (which also hold the mutex) observe a consistent (chan, pid) pair.
+    let (generation, old) = {
         let mut reg = shared.registry.lock().unwrap();
-        let old = shared.active_writer.swap(Some(Arc::clone(&writer)));
+        let old = shared.active.swap(Some(Arc::clone(&chan)));
         let generation = shared
             .active_generation
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
         reg.active_client_pid = Some(req.client_pid);
-        let snap: Vec<SessionMeta> = reg.sessions.values().map(|s| s.meta.clone()).collect();
-        (snap, generation, old)
+        (generation, old)
     };
-    if let Some(old) = old
-        && let Ok(mut g) = old.lock()
-    {
-        let _ = ipc::write_frame(
-            &mut *g,
-            &SupervisorMsg::Detached {
-                reason: "new client attached".into(),
-            },
-        );
-        let _ = g.shutdown(std::net::Shutdown::Both);
+    if let Some(old) = old {
+        // try_send so we never block on a wedged old client; the shutdown()
+        // below is what actually frees its writer thread if the channel is
+        // full or the socket is jammed.
+        let _ = old.tx.try_send(SupervisorMsg::Detached {
+            reason: "new client attached".into(),
+        });
+        let _ = old.stream.shutdown(std::net::Shutdown::Both);
     }
-
-    let resp = HandshakeResp::Ok {
-        supervisor_pid: std::process::id(),
-        sessions: sessions_snapshot.clone(),
-    };
-    ipc::write_frame(&mut *writer.lock().unwrap(), &resp)?;
 
     // Immediately push a dump for every existing session so the client can
     // restore its rendered view.
@@ -199,7 +230,7 @@ fn serve_client(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
             .get(&meta.id)
             .cloned()
         {
-            send_dump(&writer, meta.id, &sess);
+            send_dump(&tx, meta.id, &sess);
         }
     }
 
@@ -226,41 +257,40 @@ fn serve_client(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
                         cwd,
                         initial_command,
                     );
-                    let mut w = writer.lock().unwrap();
                     match result {
                         Ok(id) => {
                             // Wire-protocol invariant: `Spawned` MUST be sent
                             // before `OutputDump` for the same id, on the same
-                            // writer mutex. The client only allocates a local
-                            // parser on `Spawned`; any dump that races ahead
-                            // would arrive for an unknown session and be
-                            // silently dropped. Both frames go through the
-                            // shared `writer` mutex below, which preserves
-                            // order as long as no one else writes between.
-                            ipc::write_frame(&mut *w, &SupervisorMsg::Spawned { request_id, id })?;
-                            drop(w);
+                            // channel. The writer thread drains FIFO so as
+                            // long as we push Spawned before the dump, order
+                            // is preserved.
+                            tx.send(SupervisorMsg::Spawned { request_id, id })
+                                .map_err(|_| anyhow::anyhow!("writer thread closed"))?;
                             if let Some(sess) =
                                 shared.registry.lock().unwrap().sessions.get(&id).cloned()
                             {
-                                send_dump(&writer, id, &sess);
+                                send_dump(&tx, id, &sess);
                             }
                         }
                         Err(e) => {
-                            ipc::write_frame(
-                                &mut *w,
-                                &SupervisorMsg::SpawnFailed {
-                                    request_id,
-                                    error: format!("{e:#}"),
-                                },
-                            )?;
+                            tx.send(SupervisorMsg::SpawnFailed {
+                                request_id,
+                                error: format!("{e:#}"),
+                            })
+                            .map_err(|_| anyhow::anyhow!("writer thread closed"))?;
                         }
                     }
                 }
                 ClientMsg::WriteBytes { id, bytes } => {
                     if let Some(sess) = shared.registry.lock().unwrap().sessions.get(&id).cloned() {
-                        let mut w = sess.writer.lock().unwrap();
-                        let _ = w.write_all(&bytes);
-                        let _ = w.flush();
+                        // try_send so the command loop is never parked by a
+                        // wedged PTY (e.g. shell readline grinding on a huge
+                        // paste). Backpressure: if the per-session queue is
+                        // full, drop the chunk and warn — clients should be
+                        // chunking large pastes so this stays a soft signal.
+                        if let Err(e) = sess.write_tx.try_send(bytes) {
+                            tracing::warn!(session = id, "PTY write queue full: {e}");
+                        }
                     }
                 }
                 ClientMsg::Resize { id, rows, cols } => {
@@ -281,7 +311,7 @@ fn serve_client(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
                 }
                 ClientMsg::Attach { id } => {
                     if let Some(sess) = shared.registry.lock().unwrap().sessions.get(&id).cloned() {
-                        send_dump(&writer, id, &sess);
+                        send_dump(&tx, id, &sess);
                     }
                 }
                 ClientMsg::SubscribeUsage => {
@@ -311,17 +341,44 @@ fn serve_client(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
     })();
 
     // Clean up if we're still the active client. We synchronize against
-    // attach via the registry mutex — attach updates `active_writer` while
-    // holding this lock, so checking generation here gives a consistent view.
+    // attach via the registry mutex — attach updates `active` while holding
+    // this lock, so checking generation here gives a consistent view.
     let mut reg = shared.registry.lock().unwrap();
     if shared.active_generation.load(Ordering::Acquire) == generation {
-        shared.active_writer.store(None);
+        shared.active.store(None);
         reg.usage_subscribed = false;
         reg.active_client_pid = None;
     }
     drop(reg);
-    let _ = writer;
+    // Dropping `tx` and `chan` here ends the writer thread once any frames
+    // already in flight have been flushed.
+    drop(chan);
+    drop(tx);
+    // Shutdown the read half of the underlying stream too — `ipc::read_frame`
+    // on the client side returns EOF cleanly. The writer thread still owns
+    // its clone for ordered shutdown.
+    let _ = stream_arc.shutdown(std::net::Shutdown::Read);
     result
+}
+
+/// Drains outgoing frames from `rx` and writes them to `stream` until the
+/// channel disconnects or the socket errors. Shutting down the fd from the
+/// outside (steal-on-attach) makes the next `write_frame` return an error,
+/// which is what lets this thread terminate even when parked on back-pressure.
+fn spawn_socket_writer(stream: Arc<UnixStream>, rx: std::sync::mpsc::Receiver<SupervisorMsg>) {
+    thread::spawn(move || {
+        let mut s: &UnixStream = &stream;
+        while let Ok(msg) = rx.recv() {
+            let is_detached = matches!(msg, SupervisorMsg::Detached { .. });
+            if ipc::write_frame(&mut s, &msg).is_err() {
+                break;
+            }
+            if is_detached {
+                break;
+            }
+        }
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    });
 }
 
 fn spawn_session(
@@ -364,6 +421,19 @@ fn spawn_session(
         let _ = writer.write_all(&bytes);
     }
 
+    // Per-session writer thread. Bounded queue so a runaway producer can't
+    // grow memory unboundedly; the command loop uses `try_send` and drops
+    // chunks if this fills (clients should chunk large pastes).
+    let (write_tx, write_rx) = sync_channel::<Vec<u8>>(64);
+    thread::spawn(move || {
+        while let Ok(bytes) = write_rx.recv() {
+            if writer.write_all(&bytes).is_err() {
+                break;
+            }
+            let _ = writer.flush();
+        }
+    });
+
     let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
     let output_log = Arc::new(Mutex::new(OutputLog::default()));
 
@@ -385,7 +455,7 @@ fn spawn_session(
             meta,
             child_pid,
             master: Mutex::new(pair.master),
-            writer: Mutex::new(writer),
+            write_tx,
             parser: Arc::clone(&parser),
             output_log: Arc::clone(&output_log),
             killer: Mutex::new(killer),
@@ -401,11 +471,11 @@ fn spawn_session(
         let output_log = Arc::clone(&output_log);
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
-            // Cached `(active_generation, writer)` so the hot per-byte path
+            // Cached `(active_generation, chan)` so the hot per-byte path
             // never touches the registry mutex. ArcSwap reads are lock-free;
             // we only reload when the generation counter moves (steal-on-
             // attach changed the active slot).
-            let mut cached: Option<(u64, ClientWriter)> = None;
+            let mut cached: Option<(u64, Arc<ClientChan>)> = None;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -418,27 +488,22 @@ fn spawn_session(
                         }
                         let cur_gen = shared.active_generation.load(Ordering::Acquire);
                         if cached.as_ref().map(|(g, _)| *g) != Some(cur_gen) {
-                            cached = shared.active_writer.load_full().map(|w| (cur_gen, w));
+                            cached = shared.active.load_full().map(|c| (cur_gen, c));
                         }
-                        let write_err = if let Some((_, w)) = &cached {
-                            match w.lock() {
-                                Ok(mut g) => ipc::write_frame(
-                                    &mut *g,
-                                    &SupervisorMsg::OutputDelta {
-                                        id,
-                                        bytes: buf[..n].to_vec(),
-                                    },
-                                )
-                                .is_err(),
-                                Err(_) => true,
+                        if let Some((_, chan)) = &cached {
+                            // Bounded send: a slow client back-pressures the
+                            // PTY reader (capacity 512). If the client's
+                            // socket dies, the writer thread bails on EPIPE,
+                            // drops the receiver, and this send returns Err —
+                            // at which point we clear the cache so the next
+                            // iteration sees None (or a new attached client).
+                            let res = chan.tx.send(SupervisorMsg::OutputDelta {
+                                id,
+                                bytes: buf[..n].to_vec(),
+                            });
+                            if res.is_err() {
+                                cached = None;
                             }
-                        } else {
-                            false
-                        };
-                        if write_err {
-                            // Active client's socket died; drop cache so
-                            // next iteration repopulates (or stays None).
-                            cached = None;
                         }
                     }
                     Err(e) => {
@@ -463,12 +528,10 @@ fn spawn_session(
             let active = {
                 let mut reg = shared.registry.lock().unwrap();
                 reg.sessions.remove(&id);
-                shared.active_writer.load_full()
+                shared.active.load_full()
             };
-            if let Some(w) = active
-                && let Ok(mut g) = w.lock()
-            {
-                let _ = ipc::write_frame(&mut *g, &SupervisorMsg::Exited { id });
+            if let Some(chan) = active {
+                let _ = chan.tx.send(SupervisorMsg::Exited { id });
             }
         });
     }
@@ -518,7 +581,7 @@ fn shutdown_all(shared: &Arc<Shared>) {
 /// Falls back to `contents_formatted()` if the log is empty (fresh session)
 /// or hard-truncated (no newline boundary inside the scan window, so replay
 /// could land mid-CSI).
-fn send_dump(writer: &ClientWriter, id: SessionId, sess: &Supervised) {
+fn send_dump(tx: &SyncSender<SupervisorMsg>, id: SessionId, sess: &Supervised) {
     let mut bytes = mode_prelude(&sess.parser.lock().unwrap());
     {
         let log = sess.output_log.lock().unwrap();
@@ -530,9 +593,7 @@ fn send_dump(writer: &ClientWriter, id: SessionId, sess: &Supervised) {
             bytes.extend(log.buf.iter().copied());
         }
     }
-    if let Ok(mut g) = writer.lock() {
-        let _ = ipc::write_frame(&mut *g, &SupervisorMsg::OutputDump { id, bytes });
-    }
+    let _ = tx.send(SupervisorMsg::OutputDump { id, bytes });
 }
 
 /// Escape-sequence prelude that puts the receiving vt100 parser back into
@@ -625,7 +686,7 @@ fn spawn_usage_sampler(shared: Arc<Shared>) {
             // `subscribed=true` with no producer.
             let snapshot = {
                 let mut reg = shared.registry.lock().unwrap();
-                let active = shared.active_writer.load_full();
+                let active = shared.active.load_full();
                 if !reg.usage_subscribed || active.is_none() {
                     reg.usage_thread_alive = false;
                     tracing::debug!("usage sampler exiting");
@@ -640,7 +701,7 @@ fn spawn_usage_sampler(shared: Arc<Shared>) {
                     reg.active_client_pid,
                 )
             };
-            let (writer, sessions_snapshot, client_pid) = snapshot;
+            let (chan, sessions_snapshot, client_pid) = snapshot;
 
             system.refresh_processes_specifics(
                 ProcessesToUpdate::All,
@@ -758,9 +819,9 @@ fn spawn_usage_sampler(shared: Arc<Shared>) {
                     .unwrap_or(0),
                 cpu_count,
             };
-            if let Ok(mut g) = writer.lock() {
-                let _ = ipc::write_frame(&mut *g, &SupervisorMsg::Usage(report));
-            }
+            // try_send: usage frames are best-effort. If the client can't
+            // keep up with even periodic samples, skipping is the right call.
+            let _ = chan.tx.try_send(SupervisorMsg::Usage(report));
             thread::sleep(Duration::from_secs(1));
         }
     });
