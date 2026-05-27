@@ -110,10 +110,7 @@ impl Session for ProxySession {
             if end == body.len() {
                 bytes.extend_from_slice(b"\x1b[201~");
             }
-            self.send(ClientMsg::WriteBytes {
-                id: self.id,
-                bytes,
-            })?;
+            self.send(ClientMsg::WriteBytes { id: self.id, bytes })?;
             off = end;
         }
         Ok(())
