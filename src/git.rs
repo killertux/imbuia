@@ -4,19 +4,28 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-/// Cap how long any git invocation may take. Healthy local ops finish in
-/// milliseconds; this is the "something is wedged" cutoff (filesystem
-/// frozen, git hook hung, etc.) so a poll-loop worker doesn't pin.
-/// `worktree add` against a giant repo is the slowest realistic case.
+/// Default cap for cheap git invocations (rev-parse, symbolic-ref, branch,
+/// worktree list). These finish in milliseconds; the timeout is the
+/// "something is wedged" cutoff so a poll-loop worker can't pin.
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Longer cap for git ops that touch the working tree on disk
+/// (`worktree add` / `remove`). A monorepo's checkout/delete can take
+/// minutes on slow filesystems; the cap is still a safety net for wedged
+/// hooks or frozen NFS, not a productive wait.
+const GIT_LONG_TIMEOUT: Duration = Duration::from_secs(600);
+
 fn run(args: &[&str], cwd: Option<&Path>) -> Result<String> {
+    run_with(args, cwd, GIT_TIMEOUT)
+}
+
+fn run_with(args: &[&str], cwd: Option<&Path>, timeout: Duration) -> Result<String> {
     let mut cmd = Command::new("git");
     if let Some(c) = cwd {
         cmd.arg("-C").arg(c);
     }
     cmd.args(args);
-    let out = output_with_timeout(&mut cmd, GIT_TIMEOUT)
+    let out = output_with_timeout(&mut cmd, timeout)
         .map_err(|e| anyhow!("git {}: {e}", args.join(" ")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -64,12 +73,20 @@ pub fn worktree_add(repo: &Path, dest: &Path, branch: &str) -> Result<()> {
     }
     let dest_str = dest.to_string_lossy().to_string();
     // First attempt: existing branch.
-    let direct = run(&["worktree", "add", &dest_str, branch], Some(repo));
+    let direct = run_with(
+        &["worktree", "add", &dest_str, branch],
+        Some(repo),
+        GIT_LONG_TIMEOUT,
+    );
     if direct.is_ok() {
         return Ok(());
     }
     // Fallback: create the branch.
-    run(&["worktree", "add", "-b", branch, &dest_str], Some(repo))?;
+    run_with(
+        &["worktree", "add", "-b", branch, &dest_str],
+        Some(repo),
+        GIT_LONG_TIMEOUT,
+    )?;
     Ok(())
 }
 
@@ -123,7 +140,11 @@ pub fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeListEntry>> {
 /// who asked for this. Branch deletion failures are reported but don't abort.
 pub fn worktree_remove(repo: &Path, dest: &Path, branch: Option<&str>) -> Result<()> {
     let dest_str = dest.to_string_lossy().to_string();
-    run(&["worktree", "remove", "--force", &dest_str], Some(repo))?;
+    run_with(
+        &["worktree", "remove", "--force", &dest_str],
+        Some(repo),
+        GIT_LONG_TIMEOUT,
+    )?;
     if let Some(b) = branch {
         // `-D` (force) — the worktree we just removed was likely on this branch
         // so `-d` would refuse on "not merged" grounds. The user asked to nuke it.

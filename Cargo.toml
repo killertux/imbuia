@@ -1,6 +1,6 @@
 [package]
 name = "imbuia"
-version = "0.9.3"
+version = "0.9.4"
 edition = "2024"
 authors = ["Clemente <clemente@brick.so>"]
 description = "Elm-architecture TUI that supervises persistent terminal sessions across project worktrees."
