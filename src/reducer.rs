@@ -137,17 +137,9 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
                 .get(project_idx)
                 .and_then(|p| p.worktrees.get(worktree_idx))
                 .map(|w| w.name.clone());
-            // Close any live sessions in that worktree before removing it.
-            let session_ids: Vec<SessionId> = state
-                .projects
-                .get(project_idx)
-                .and_then(|p| p.worktrees.get(worktree_idx))
-                .map(|w| w.sessions.clone())
-                .unwrap_or_default();
-            for id in session_ids {
-                state.sessions.remove(&id);
-                cmds.push(Command::KillSession(id));
-            }
+            // Sessions were already killed at confirm time (see
+            // `PendingConfirm::RemoveWorktree` handler) so the worktree's
+            // `sessions` vec is empty by the time we get here.
             if let Some(p) = state.projects.get_mut(project_idx)
                 && worktree_idx < p.worktrees.len()
             {
@@ -1061,6 +1053,22 @@ fn handle_pending_confirm_key(state: &mut AppState, k: KeyEvent, cmds: &mut Comm
                     dest_path,
                     branch,
                 } => {
+                    // Kill sessions *before* the git op so shells aren't
+                    // holding the worktree's CWD/files open while git is
+                    // trying to delete them. KillSession is fire-and-forget
+                    // (SIGKILL via the supervisor); the git remove can race
+                    // with reaping safely.
+                    if let Some(w) = state
+                        .projects
+                        .get_mut(project_idx)
+                        .and_then(|p| p.worktrees.get_mut(worktree_idx))
+                    {
+                        for id in w.sessions.drain(..) {
+                            state.sessions.remove(&id);
+                            cmds.push(Command::KillSession(id));
+                        }
+                        w.active_tab = None;
+                    }
                     state.pending_op = Some(format!("Removing worktree '{name}'…"));
                     cmds.push(Command::RemoveWorktree {
                         project_idx,
