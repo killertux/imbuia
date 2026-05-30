@@ -16,8 +16,9 @@ pub trait Session: Send + Sync {
     fn id(&self) -> SessionId;
     fn write_key(&self, key: KeyEvent) -> io::Result<()>;
     fn write_mouse(&self, ev: MouseEvent) -> io::Result<()>;
-    /// Forward a paste payload to the PTY, wrapped in bracketed-paste escapes.
-    /// Sent as a single transport frame regardless of payload size.
+    /// Forward a paste payload to the PTY. The transport chunks it and wraps it
+    /// in bracketed-paste escapes only when the inner app enabled bracketed
+    /// paste (DECSET 2004).
     fn write_paste(&self, text: &str) -> io::Result<()>;
     fn resize(&self, rows: u16, cols: u16) -> Result<()>;
     fn parser(&self) -> &Mutex<vt100::Parser>;

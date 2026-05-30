@@ -80,38 +80,41 @@ impl Session for ProxySession {
     }
 
     fn write_paste(&self, text: &str) -> io::Result<()> {
+        // Wrap in bracketed-paste markers only when the *inner* app has them
+        // enabled (DECSET 2004); otherwise dumb apps would see literal
+        // `\x1b[200~` garbage. crossterm already stripped the outer terminal's
+        // markers, so this is purely the forward decision.
+        let bracketed = {
+            let p = self.parser.lock().expect("parser poisoned");
+            p.screen().bracketed_paste()
+        };
+
         // Split into chunks so neither (a) any single WriteBytes frame is huge
         // (the supervisor processes them on its command loop) nor (b) any
         // single PTY `write_all` parks the supervisor on kernel-buffer
-        // back-pressure. The bracketed-paste markers wrap the *whole* sequence,
-        // so the receiving shell still sees one paste.
+        // back-pressure. The markers (if any) wrap the *whole* sequence, so the
+        // receiving app still sees one paste.
         const CHUNK: usize = 16 * 1024;
         let body = text.as_bytes();
-        let mut first = Vec::with_capacity(body.len().min(CHUNK) + 6);
-        first.extend_from_slice(b"\x1b[200~");
-        let first_end = body.len().min(CHUNK);
-        first.extend_from_slice(&body[..first_end]);
-        if body.len() <= CHUNK {
-            first.extend_from_slice(b"\x1b[201~");
-            return self.send(ClientMsg::WriteBytes {
-                id: self.id,
-                bytes: first,
-            });
-        }
-        self.send(ClientMsg::WriteBytes {
-            id: self.id,
-            bytes: first,
-        })?;
-        let mut off = first_end;
-        while off < body.len() {
+        let mut off = 0;
+        let mut first = true;
+        loop {
             let end = (off + CHUNK).min(body.len());
-            let mut bytes = Vec::with_capacity(end - off + 6);
+            let is_last = end >= body.len();
+            let mut bytes = Vec::with_capacity((end - off) + 6);
+            if first && bracketed {
+                bytes.extend_from_slice(b"\x1b[200~");
+            }
             bytes.extend_from_slice(&body[off..end]);
-            if end == body.len() {
+            if is_last && bracketed {
                 bytes.extend_from_slice(b"\x1b[201~");
             }
             self.send(ClientMsg::WriteBytes { id: self.id, bytes })?;
+            first = false;
             off = end;
+            if is_last {
+                break;
+            }
         }
         Ok(())
     }
