@@ -607,8 +607,9 @@ impl std::fmt::Debug for Action {
 pub enum Command {
     WriteKey(SessionId, KeyEvent),
     WriteMouse(SessionId, MouseEvent),
-    /// Forward a paste payload to the PTY wrapped in bracketed-paste
-    /// escapes (`\x1b[200~ … \x1b[201~`). A single frame regardless of size.
+    /// Forward a paste payload to the PTY. The transport chunks it and wraps it
+    /// in bracketed-paste escapes (`\x1b[200~ … \x1b[201~`) only when the inner
+    /// app enabled bracketed paste.
     WritePaste(SessionId, String),
     ResizePty(SessionId, u16, u16),
     /// Ask the runtime to spawn a PTY for the given destination worktree.

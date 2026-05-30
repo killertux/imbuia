@@ -282,15 +282,18 @@ fn serve_client(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
                     }
                 }
                 ClientMsg::WriteBytes { id, bytes } => {
-                    if let Some(sess) = shared.registry.lock().unwrap().sessions.get(&id).cloned() {
-                        // try_send so the command loop is never parked by a
-                        // wedged PTY (e.g. shell readline grinding on a huge
-                        // paste). Backpressure: if the per-session queue is
-                        // full, drop the chunk and warn — clients should be
-                        // chunking large pastes so this stays a soft signal.
-                        if let Err(e) = sess.write_tx.try_send(bytes) {
-                            tracing::warn!(session = id, "PTY write queue full: {e}");
-                        }
+                    let sess = shared.registry.lock().unwrap().sessions.get(&id).cloned();
+                    if let Some(sess) = sess {
+                        // Blocking send: when the PTY back-pressures (shell
+                        // readline grinding on a huge paste), this paces *this
+                        // client's* command intake, which transitively
+                        // back-pressures the socket → the client's writer.
+                        // That's the kernel flow-control we want, and it never
+                        // drops bytes. We do NOT hold the registry lock here
+                        // (sess is a cloned Arc), and the PTY writer thread is
+                        // decoupled from the active-writer slot, so a slow PTY
+                        // can't re-wedge the supervisor or block steal-on-attach.
+                        let _ = sess.write_tx.send(bytes);
                     }
                 }
                 ClientMsg::Resize { id, rows, cols } => {
@@ -422,9 +425,10 @@ fn spawn_session(
     }
 
     // Per-session writer thread. Bounded queue so a runaway producer can't
-    // grow memory unboundedly; the command loop uses `try_send` and drops
-    // chunks if this fills (clients should chunk large pastes).
-    let (write_tx, write_rx) = sync_channel::<Vec<u8>>(64);
+    // grow memory unboundedly; the command loop uses a *blocking* `send`, so a
+    // full queue back-pressures that client's command loop rather than dropping
+    // bytes. Sized to buffer a handful of 16KB paste chunks before throttling.
+    let (write_tx, write_rx) = sync_channel::<Vec<u8>>(256);
     thread::spawn(move || {
         while let Ok(bytes) = write_rx.recv() {
             if writer.write_all(&bytes).is_err() {
