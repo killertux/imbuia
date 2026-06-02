@@ -28,6 +28,10 @@ use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 pub(crate) struct ProxySession {
     id: SessionId,
     parser: Arc<Mutex<vt100::Parser>>,
+    /// Inner app's keyboard-input protocol, inferred from its PTY output (vt100
+    /// doesn't track it). Fed by the reader thread, read by `write_key` to pick
+    /// the encoding for modified functional keys (Shift+Enter, …).
+    kbd: Arc<Mutex<input::KbdTracker>>,
     tx: ClientTx,
     notify: Arc<Notify>,
 }
@@ -72,7 +76,8 @@ impl Session for ProxySession {
             let p = self.parser.lock().expect("parser poisoned");
             p.screen().application_cursor()
         };
-        let bytes = input::encode_key(key, app_cursor);
+        let kbd = self.kbd.lock().expect("kbd tracker poisoned").encoding();
+        let bytes = input::encode_key(key, app_cursor, kbd);
         if bytes.is_empty() {
             return Ok(());
         }
@@ -210,6 +215,7 @@ impl SupervisorClient {
         let proxy = Arc::new(ProxySession {
             id: meta.id,
             parser,
+            kbd: Arc::new(Mutex::new(input::KbdTracker::default())),
             tx: self.tx.clone(),
             notify: Arc::clone(&self.notify),
         });
@@ -388,6 +394,7 @@ fn spawn_reader(
                         let proxy = Arc::new(ProxySession {
                             id,
                             parser,
+                            kbd: Arc::new(Mutex::new(input::KbdTracker::default())),
                             tx: client.tx.clone(),
                             notify: Arc::clone(&client.notify),
                         });
@@ -413,6 +420,11 @@ fn spawn_reader(
                     if let Some(sess) = sess {
                         if let Ok(mut p) = sess.parser.lock() {
                             p.process(&bytes);
+                        }
+                        // Sniff the same bytes for keyboard-protocol negotiation
+                        // so write_key knows how to encode modified keys.
+                        if let Ok(mut k) = sess.kbd.lock() {
+                            k.feed(&bytes);
                         }
                         client.notify.notify_one();
                     }
