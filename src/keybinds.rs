@@ -165,10 +165,8 @@ pub struct Chord {
 
 impl Chord {
     pub fn from_event(k: &KeyEvent) -> Self {
-        Chord {
-            mods: normalise_mods(k.modifiers, &k.code),
-            code: k.code,
-        }
+        let (mods, code) = canonical(k.modifiers, k.code);
+        Chord { mods, code }
     }
 }
 
@@ -438,10 +436,8 @@ fn parse_token(t: &str) -> Result<Chord> {
             Some(KeyCode::Char(c))
         })
         .ok_or_else(|| anyhow!("unrecognised key token `{t}`"))?;
-    Ok(Chord {
-        mods: normalise_mods(mods, &code),
-        code,
-    })
+    let (mods, code) = canonical(mods, code);
+    Ok(Chord { mods, code })
 }
 
 fn named_key(s: &str) -> Option<KeyCode> {
@@ -470,7 +466,7 @@ fn named_key(s: &str) -> Option<KeyCode> {
 fn chord_for_char(c: char) -> Chord {
     // SHIFT for an ASCII uppercase char is implied by the character itself;
     // we deliberately leave mods=NONE so this matches a KeyEvent regardless
-    // of whether crossterm reports SHIFT. See `normalise_mods` for the same
+    // of whether crossterm reports SHIFT. See `canonical` for the same
     // rule on the input path.
     Chord {
         mods: KeyModifiers::NONE,
@@ -478,21 +474,35 @@ fn chord_for_char(c: char) -> Chord {
     }
 }
 
-/// crossterm sometimes reports SHIFT alongside an already-uppercase char;
-/// strip irrelevant bits so equality works. We only care about CONTROL,
-/// SHIFT (for non-char codes), and ALT.
-fn normalise_mods(mut m: KeyModifiers, code: &KeyCode) -> KeyModifiers {
-    // Drop anything that's not C/S/A.
+/// Canonicalise a `(mods, code)` pair so equivalent keystrokes compare equal
+/// regardless of how the active keyboard protocol reports them.
+///
+/// Two normalisations, both needed because crossterm's reporting depends on
+/// whether the kitty keyboard protocol is active (see `main.rs`):
+///
+/// 1. **Ctrl + letter is case- and Shift-insensitive.** Every terminal
+///    collapses Ctrl+n, Ctrl+N and Ctrl+Shift+n to the same control byte
+///    (`0x0E`); under the kitty protocol crossterm instead reports them
+///    distinctly (e.g. `Char('N')` + `CONTROL|SHIFT`). Fold the letter to
+///    lowercase and drop Shift so the `<C-\><C-n>`-style chords keep matching.
+///    (Alt is left alone — `M-n` vs `M-N` are traditionally distinct.)
+/// 2. **Uppercase letter without Ctrl implies Shift.** `Shift+A` and `A` both
+///    mean the `A` binding, so drop a redundant Shift there too. Lowercase vs
+///    uppercase letters *without* Ctrl stay distinct (vim `g` vs `G`).
+fn canonical(mut m: KeyModifiers, code: KeyCode) -> (KeyModifiers, KeyCode) {
     m &= KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT;
-    // For ASCII char keys SHIFT is implied by the uppercase letter; drop it
-    // so `Shift+A` and `A` match.
     if let KeyCode::Char(c) = code
         && c.is_ascii_alphabetic()
-        && c.is_ascii_uppercase()
     {
-        m.remove(KeyModifiers::SHIFT);
+        if m.contains(KeyModifiers::CONTROL) {
+            m.remove(KeyModifiers::SHIFT);
+            return (m, KeyCode::Char(c.to_ascii_lowercase()));
+        }
+        if c.is_ascii_uppercase() {
+            m.remove(KeyModifiers::SHIFT);
+        }
     }
-    m
+    (m, code)
 }
 
 /// Format a binding back into vim-style. Round-trips with `parse`.
@@ -584,6 +594,33 @@ mod tests {
         let b = parse("T").unwrap();
         let evt = KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT);
         assert_eq!(b.0[0], Chord::from_event(&evt));
+    }
+
+    #[test]
+    fn ctrl_letter_is_case_and_shift_insensitive() {
+        // The `<C-\><C-n>` leave-terminal chord must keep matching no matter how
+        // the keyboard protocol reports Ctrl+n. Under kitty disambiguate,
+        // Ctrl+Shift+n arrives as Char('N') + CONTROL|SHIFT; legacy gives
+        // Char('n') + CONTROL. Both must canonicalise to the `<C-n>` chord.
+        let want = parse("<C-n>").unwrap().0[0];
+        for (code, mods) in [
+            (KeyCode::Char('n'), KeyModifiers::CONTROL),
+            (
+                KeyCode::Char('N'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            (
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            assert_eq!(Chord::from_event(&KeyEvent::new(code, mods)), want);
+        }
+        // …but Shift still matters for a plain (non-Ctrl) letter: `G` != `g`.
+        assert_ne!(
+            Chord::from_event(&KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE)),
+            Chord::from_event(&KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+        );
     }
 
     #[test]
