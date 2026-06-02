@@ -44,7 +44,7 @@ codebase. Humans should read `README.md` first.
 | `client.rs`       | `ProxySession` (client-side `Session` impl over the socket), `connect_or_spawn`, double-fork helpers, reader task. |
 | `supervisor.rs`   | `imbuia --supervisor` entry: PTY spawn/own (portable-pty + vt100), single-client accept loop, frame dispatcher. |
 | `ipc.rs`          | Shared wire types (`ClientMsg`, `SupervisorMsg`, `Handshake*`), framed bincode read/write, socket path resolution. |
-| `input.rs`        | crossterm `Event` → `Action`; `encode_key` with DECCKM handling.  |
+| `input.rs`        | crossterm `Event` → `Action`; `encode_key` with DECCKM handling + kitty/modifyOtherKeys passthrough; `KbdTracker` infers the inner app's keyboard protocol from its output. |
 | `layout.rs`       | `chrome()` → sidebar/tab_bar/terminal/action_bar rects.          |
 | `render.rs`       | ratatui rendering. Reads from vt100 `Screen` cell-by-cell.       |
 | `theme.rs`        | `ThemeKind` (Dark / Light) + hardcoded palettes ported from rowdy. |
@@ -252,3 +252,13 @@ async ops; the files are the only debug channel.
   client tells the user to run `:rs` and relaunch.
 - Sessions don't survive host reboot (would need a launchd / systemd
   unit). Scrollback older than the screen at attach time isn't replayed.
+- Keyboard-protocol state (kitty / modifyOtherKeys) is tracked
+  supervisor-side by a `input::KbdTracker` fed from PTY output (vt100
+  doesn't model it) and re-emitted in the attach prelude — see
+  `supervisor::send_dump` / `mode_prelude`, alongside the DECSET mode
+  re-sync. A reattaching client's own `KbdTracker` (fed the dump) recovers
+  the state. Caveat: only the active (top-of-stack) kitty flag set is
+  re-emitted, so deeply-nested push/pop sequences whose lower frames
+  scrolled out of `output_log` can drift by a flag bit after a later pop —
+  harmless in practice (any nonzero flags still mean CSI-u for modified
+  keys).

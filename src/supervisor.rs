@@ -73,6 +73,12 @@ struct Supervised {
     /// — `parser.screen().contents_formatted()` only covers the visible grid
     /// and would otherwise discard history across client restarts.
     output_log: Arc<Mutex<OutputLog>>,
+    /// Inferred keyboard-input protocol the inner app negotiated (kitty /
+    /// modifyOtherKeys). vt100 doesn't track it, so we scan PTY output into a
+    /// `KbdTracker` and re-emit it in the attach prelude (see `send_dump`) so a
+    /// reattaching client recovers the state even if the negotiation scrolled
+    /// out of `output_log`.
+    kbd: Arc<Mutex<crate::input::KbdTracker>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
 }
 
@@ -440,6 +446,7 @@ fn spawn_session(
 
     let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
     let output_log = Arc::new(Mutex::new(OutputLog::default()));
+    let kbd = Arc::new(Mutex::new(crate::input::KbdTracker::default()));
 
     // Allocate id & register before we start the reader thread so any early
     // output can find the active client.
@@ -462,6 +469,7 @@ fn spawn_session(
             write_tx,
             parser: Arc::clone(&parser),
             output_log: Arc::clone(&output_log),
+            kbd: Arc::clone(&kbd),
             killer: Mutex::new(killer),
         });
         reg.sessions.insert(id, sess);
@@ -473,6 +481,7 @@ fn spawn_session(
         let shared = Arc::clone(shared);
         let parser = Arc::clone(&parser);
         let output_log = Arc::clone(&output_log);
+        let kbd = Arc::clone(&kbd);
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             // Cached `(active_generation, chan)` so the hot per-byte path
@@ -486,6 +495,9 @@ fn spawn_session(
                     Ok(n) => {
                         if let Ok(mut p) = parser.lock() {
                             p.process(&buf[..n]);
+                        }
+                        if let Ok(mut k) = kbd.lock() {
+                            k.feed(&buf[..n]);
                         }
                         if let Ok(mut log) = output_log.lock() {
                             push_output_log(&mut log, &buf[..n]);
@@ -587,6 +599,9 @@ fn shutdown_all(shared: &Arc<Shared>) {
 /// could land mid-CSI).
 fn send_dump(tx: &SyncSender<SupervisorMsg>, id: SessionId, sess: &Supervised) {
     let mut bytes = mode_prelude(&sess.parser.lock().unwrap());
+    // Keyboard-protocol state lives outside vt100, in our own tracker; re-emit
+    // it alongside the DECSET modes so the client's tracker re-syncs.
+    bytes.extend(sess.kbd.lock().unwrap().prelude());
     {
         let log = sess.output_log.lock().unwrap();
         if log.buf.is_empty() || log.truncated {

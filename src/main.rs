@@ -1,6 +1,7 @@
 use anyhow::Result;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -56,11 +57,21 @@ async fn run_client() -> Result<()> {
         EnableMouseCapture,
         EnableBracketedPaste
     )?;
+    // Ask the host terminal to disambiguate escape codes (kitty keyboard
+    // protocol). Without this, modified functional keys like Shift+Enter
+    // collapse into a bare CR before crossterm ever sees them, so the inner
+    // app can never distinguish them. A no-op on terminals that don't support
+    // it; we Pop it on exit so we don't leave the host in an odd state.
+    let _ = execute!(
+        stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
 
     let result = runtime::run().await;
 
     let _ = execute!(
         stdout(),
+        PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
@@ -74,6 +85,7 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(
             stdout(),
+            PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
