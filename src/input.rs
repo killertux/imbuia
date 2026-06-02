@@ -355,7 +355,11 @@ mod tests {
 
     #[test]
     fn kitty_unmodified_enter_stays_legacy_without_report_all() {
-        let out = encode_key(ev(KeyCode::Enter, KeyModifiers::NONE), false, KbdEncoding::Kitty(1));
+        let out = encode_key(
+            ev(KeyCode::Enter, KeyModifiers::NONE),
+            false,
+            KbdEncoding::Kitty(1),
+        );
         assert_eq!(out, b"\r");
     }
 
@@ -442,11 +446,7 @@ mod tests {
     fn prelude_round_trips_through_a_fresh_tracker() {
         // Whatever state the supervisor's tracker is in, replaying its prelude
         // into a fresh client tracker must reproduce the same encoding.
-        for seq in [
-            &b"\x1b[>5u"[..],
-            &b"\x1b[>4;2m"[..],
-            &b"\x1b[=15;1u"[..],
-        ] {
+        for seq in [&b"\x1b[>5u"[..], &b"\x1b[>4;2m"[..], &b"\x1b[=15;1u"[..]] {
             let mut src = KbdTracker::default();
             src.feed(seq);
             let mut dst = KbdTracker::default();
