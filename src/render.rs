@@ -865,8 +865,14 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
     for (pi, project) in state.projects.iter().enumerate() {
         let marker = if project.expanded { "▼" } else { "▶" };
         let is_selected_header = state.sidebar_selection == Some((pi, None));
+        // Tag projects hosted on a remote supervisor with its name; local
+        // (the default) stays unadorned.
+        let header = match state.supervisors.config_name(project.supervisor) {
+            Some(sup) => format!("{marker} {}  [{sup}]", project.name),
+            None => format!("{marker} {}", project.name),
+        };
         lines.push(styled_line(
-            truncate_to_width(&format!("{marker} {}", project.name), max_w),
+            truncate_to_width(&header, max_w),
             is_selected_header,
             focused,
             true,
