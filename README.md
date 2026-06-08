@@ -232,6 +232,9 @@ imbuia --supervisor --listen 0.0.0.0:7777
   to `supervisor.log` on startup.
 - There's no auto-restart — run it under systemd/launchd, `tmux`, or `nohup`
   if you want it to outlive your shell.
+- The remote link sets `TCP_NODELAY` (so keystrokes aren't delayed by Nagle)
+  and zstd-compresses bulk output (`cat`, build logs, the attach dump); small
+  interactive frames are sent raw. Both are automatic — no configuration.
 
 ### 2. Point the client at it
 

@@ -50,7 +50,7 @@ codebase. Humans should read `README.md` first.
 | `session.rs`      | `Session` trait + `FakeSession` for tests. The real impl is in `client.rs`. |
 | `client.rs`       | `Supervisors` registry (local + N remotes), one `SupervisorClient` per connection; `connect_all` (eager, best-effort); `ProxySession` (client-side `Session` impl) with local↔global session-id remap; double-fork helpers, reader + writer tasks. |
 | `supervisor.rs`   | `imbuia --supervisor` entry: owns a tokio runtime; PTY spawn/own (portable-pty + vt100) on blocking threads; UDS accept loop (always) + optional TCP+TLS acceptor (`--listen`); per-client async `handle_conn`. |
-| `ipc.rs`          | Shared wire types (`ClientMsg`, `SupervisorMsg`, `Handshake*`, `OpRequest`/`OpOk` incl. `ListDir`/`DirListing`), framed bincode read/write (sync twins are test-only; the live transport uses `read_frame_async`/`write_frame_async`), socket path resolution. |
+| `ipc.rs`          | Shared wire types (`ClientMsg`, `SupervisorMsg`, `Handshake*`, `OpRequest`/`OpOk` incl. `ListDir`/`DirListing`), framed read/write (`[u32 len][u8 codec][payload]`; codec 0=raw, 1=zstd — `write_frame_async(.., compress)` gates compression on size + remote-only, reader auto-detects; sync twins are test-only), socket path resolution. `PROTOCOL_VERSION = 2`. |
 | `transport.rs`    | Optional remote transport: Ed25519 identity load/gen, SPKI fingerprints, rustls (ring) client/server configs with pinned-key verifiers. Both sides TOFU: client pins the supervisor in `known_hosts`; supervisor pins the first client into `authorized_keys` when empty. |
 | `input.rs`        | crossterm `Event` → `Action`; `encode_key` with DECCKM handling + kitty/modifyOtherKeys passthrough; `KbdTracker` infers the inner app's keyboard protocol from its output. |
 | `layout.rs`       | `chrome()` → sidebar/tab_bar/terminal/action_bar rects.          |
@@ -130,6 +130,12 @@ crossterm Event ─► input::map ─► Action ─┐
   reader loop are transport-agnostic. The supervisor's PTY/reaper/usage/op
   work stays on blocking `std::thread`s and pushes frames via the tokio
   channel using `blocking_send`/`try_send` (legal off-runtime).
+- **Remote latency/throughput.** On the TCP path both sides set
+  `TCP_NODELAY` (disable Nagle — keystrokes are tiny writes and would
+  otherwise stall ~40ms). The writers for remote connections pass
+  `compress = true`, so large frames (`OutputDump`, bulk `OutputDelta`, big
+  pastes) are zstd-compressed; small/interactive frames stay raw. The local
+  UDS path sets neither (no Nagle on Unix sockets; compression pointless).
 - **Socket layout.** `$XDG_RUNTIME_DIR/imbuia/sock` (preferred on Linux),
   else `$XDG_CACHE_HOME/imbuia/sock`, else `~/.cache/imbuia/sock`.
   Sibling files: `supervisor.pid`, `supervisor.log`. See

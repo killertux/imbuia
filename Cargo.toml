@@ -1,6 +1,6 @@
 [package]
 name = "imbuia"
-version = "0.12.1"
+version = "0.13.0"
 edition = "2024"
 authors = ["Clemente <clemente@brick.so>"]
 description = "Elm-architecture TUI that supervises persistent terminal sessions across project worktrees."
@@ -40,6 +40,7 @@ unicode-width = "0.2.2"
 ureq = { version = "3.3.0", default-features = false, features = ["rustls", "json", "gzip"] }
 vt100 = "0.16.2"
 x509-parser = "0.18.1"
+zstd = "0.13.3"
 
 [profile.release]
 lto = "thin"

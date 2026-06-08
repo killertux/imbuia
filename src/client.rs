@@ -607,6 +607,7 @@ pub async fn connect_all(
         Arc::clone(&global_ids),
         Arc::clone(&notify),
         action_tx.clone(),
+        false, // local UDS: no compression
     )
     .await?;
     let mut entries = vec![SupervisorEntry {
@@ -653,7 +654,8 @@ async fn connect_remote_handshake(
     let (rd, wr) = tokio::time::timeout(Duration::from_secs(5), connect_remote(config_dir, url))
         .await
         .context("remote connect timed out")??;
-    handshake(rd, wr, sup_id, global_ids, notify, action_tx).await
+    // Remote link: compress large outbound frames (big pastes, etc.).
+    handshake(rd, wr, sup_id, global_ids, notify, action_tx, true).await
 }
 
 /// Connect to (or spawn + wait for) the local Unix-socket supervisor.
@@ -685,6 +687,11 @@ async fn connect_remote(config_dir: &Path, url: &str) -> Result<(BoxRead, BoxWri
     let tcp = TcpStream::connect(url)
         .await
         .with_context(|| format!("connecting to remote supervisor {url}"))?;
+    // Disable Nagle: interactive keystrokes are tiny writes, and Nagle would
+    // hold them up to ~40ms waiting to coalesce — the #1 remote typing lag.
+    if let Err(e) = tcp.set_nodelay(true) {
+        tracing::warn!("set_nodelay on remote supervisor socket failed: {e}");
+    }
     let server_name = transport::server_name(host)?;
     let tls = connector
         .connect(server_name, tcp)
@@ -701,6 +708,9 @@ async fn handshake(
     global_ids: Arc<AtomicU64>,
     notify: Arc<Notify>,
     action_tx: mpsc::Sender<Action>,
+    // Compress large outbound frames — `true` for remote (TCP) connections,
+    // `false` for the local UDS (pointless there).
+    compress: bool,
 ) -> Result<Arc<SupervisorClient>> {
     // Bounded handshake: a half-dead supervisor that accepts but never replies
     // must not hang the TUI.
@@ -709,7 +719,7 @@ async fn handshake(
         protocol: PROTOCOL_VERSION,
         client_pid: std::process::id(),
     };
-    tokio::time::timeout(hs, ipc::write_frame_async(&mut wr, &req))
+    tokio::time::timeout(hs, ipc::write_frame_async(&mut wr, &req, false))
         .await
         .context("handshake write timeout")??;
     let resp: HandshakeResp = tokio::time::timeout(hs, ipc::read_frame_async(&mut rd))
@@ -736,7 +746,7 @@ async fn handshake(
     let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if let Err(e) = ipc::write_frame_async(&mut wr, &msg).await {
+            if let Err(e) = ipc::write_frame_async(&mut wr, &msg, compress).await {
                 tracing::warn!("supervisor write loop exiting: {e}");
                 break;
             }
