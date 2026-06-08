@@ -21,6 +21,10 @@ pub trait Session: Send + Sync {
     /// paste (DECSET 2004).
     fn write_paste(&self, text: &str) -> io::Result<()>;
     fn resize(&self, rows: u16, cols: u16) -> Result<()>;
+    /// Ask the owning supervisor to terminate this session. Routing is implicit
+    /// — each session holds its own connection's sender — so the caller doesn't
+    /// need to know which supervisor it lives on.
+    fn kill(&self);
     fn parser(&self) -> &Mutex<vt100::Parser>;
 }
 
@@ -72,6 +76,7 @@ impl Session for FakeSession {
         self.resizes.lock().unwrap().push((rows, cols));
         Ok(())
     }
+    fn kill(&self) {}
     fn parser(&self) -> &Mutex<vt100::Parser> {
         &self.parser
     }

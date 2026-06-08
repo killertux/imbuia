@@ -42,15 +42,15 @@ codebase. Humans should read `README.md` first.
 | `main.rs`         | Entry: dispatch `--supervisor` vs client; raw mode, alt screen, mouse capture, tracing-to-file, panic hook. |
 | `runtime.rs`      | (Client) Tokio event loop; attaches to the supervisor at startup; `execute()` dispatches `Command` → IO + threads. |
 | `reducer.rs`      | Pure `reduce(state, action) -> Commands`. All key/mouse handling. |
-| `app.rs`          | Plain types: `AppState`, `Project`, `Worktree`, `Action`, `Command`, popups. |
+| `app.rs`          | Plain types: `AppState`, `Project`, `Worktree`, `Action`, `Command`, popups. Also `SupervisorId` + `SupervisorDirectory` (id↔name projection of the live registry, snapshotted into `AppState`). |
 | `commands.rs`     | Ex-style `:command` registry (`COMMANDS: &[CmdSpec]`) + handlers. |
-| `config.rs`       | TOML schema, atomic write, slugging, XDG resolution.             |
+| `config.rs`       | TOML schema, atomic write, slugging, XDG resolution. `GlobalConfig.remotes` (named remotes; legacy single `remote` folds in via `effective_remotes`), `ProjectConfig.supervisor` (name; absent = local). |
 | `git.rs`          | `std::process::Command` wrappers (`validate_repo`, `head_branch`, `worktree_add`, `worktree_remove`). **Run inside the supervisor**, not the client (see Disk ops below). |
 | `github.rs`       | `gh` CLI wrapper for PR status. Also **run inside the supervisor**. |
 | `session.rs`      | `Session` trait + `FakeSession` for tests. The real impl is in `client.rs`. |
-| `client.rs`       | `ProxySession` (client-side `Session` impl over the socket), async `connect_or_spawn` (local UDS or remote TCP+TLS), double-fork helpers, reader + writer tasks. |
+| `client.rs`       | `Supervisors` registry (local + N remotes), one `SupervisorClient` per connection; `connect_all` (eager, best-effort); `ProxySession` (client-side `Session` impl) with local↔global session-id remap; double-fork helpers, reader + writer tasks. |
 | `supervisor.rs`   | `imbuia --supervisor` entry: owns a tokio runtime; PTY spawn/own (portable-pty + vt100) on blocking threads; UDS accept loop (always) + optional TCP+TLS acceptor (`--listen`); per-client async `handle_conn`. |
-| `ipc.rs`          | Shared wire types (`ClientMsg`, `SupervisorMsg`, `Handshake*`), framed bincode read/write (sync twins are test-only; the live transport uses `read_frame_async`/`write_frame_async`), socket path resolution. |
+| `ipc.rs`          | Shared wire types (`ClientMsg`, `SupervisorMsg`, `Handshake*`, `OpRequest`/`OpOk` incl. `ListDir`/`DirListing`), framed bincode read/write (sync twins are test-only; the live transport uses `read_frame_async`/`write_frame_async`), socket path resolution. |
 | `transport.rs`    | Optional remote transport: Ed25519 identity load/gen, SPKI fingerprints, rustls (ring) client/server configs with pinned-key verifiers. Both sides TOFU: client pins the supervisor in `known_hosts`; supervisor pins the first client into `authorized_keys` when empty. |
 | `input.rs`        | crossterm `Event` → `Action`; `encode_key` with DECCKM handling + kitty/modifyOtherKeys passthrough; `KbdTracker` infers the inner app's keyboard protocol from its output. |
 | `layout.rs`       | `chrome()` → sidebar/tab_bar/terminal/action_bar rects.          |
@@ -98,6 +98,13 @@ crossterm Event ─► input::map ─► Action ─┐
 - `AppState.projects[*].worktrees[*].sessions: Vec<SessionId>` is the only
   index into `AppState.sessions: HashMap<SessionId, Arc<dyn Session>>`.
   Always update both in lockstep — leaking either causes silent UI bugs.
+  **These `SessionId`s are client-global** (minted by `client::Supervisors`),
+  not the per-supervisor wire ids — each `ProxySession` maps global↔local so
+  ids from different supervisors never collide. `Project.supervisor:
+  SupervisorId` says which connection a project (and its sessions) lives on;
+  session-targeted commands route implicitly via the session's own
+  `ProxySession`, project/spawn/op commands resolve the client from the
+  registry (`execute` in `runtime.rs`).
 - `active_worktree: Option<(pi, wi)>` points at the tab bar's source.
 - `sidebar_selection: Option<(pi, Option<wi>)>` — `None` worktree means the
   cursor is on the project header row. These two can disagree (e.g. the

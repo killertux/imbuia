@@ -150,7 +150,7 @@ pub(crate) fn execute_command(state: &mut AppState, s: &str, cmds: &mut Commands
 }
 
 pub(crate) fn cmd_usage(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
-    state.usage_popup = Some(UsagePopup::new());
+    state.usage_popup = Some(UsagePopup::new(state.supervisors.clone()));
     cmds.push(Command::SubscribeUsage);
 }
 
@@ -194,16 +194,17 @@ fn cmd_help(state: &mut AppState, _args: &[&str], _cmds: &mut Commands) {
 
 pub(crate) fn cmd_open(state: &mut AppState, args: &[&str], cmds: &mut Commands) {
     if let Some(path) = args.first() {
-        let home = current_home();
-        let expanded = expand_user_path(path, home.as_deref());
-        state.pending_op = Some(format!("Opening {}…", expanded.display()));
+        // `:open <path>` is the quick form — always targets the local
+        // supervisor. `~`/relative resolution happens supervisor-side now.
+        state.pending_op = Some(format!("Opening {path}…"));
         cmds.push(Command::OpenProject {
-            path: expanded,
+            supervisor: crate::app::LOCAL,
+            path: PathBuf::from(path),
             setup_script: None,
             import_existing: false,
         });
     } else {
-        use crate::app::{OpenProjectFocus, OpenProjectPopup};
+        use crate::app::{LOCAL, OpenProjectFocus, OpenProjectPopup};
         let mut script = ratatui_textarea::TextArea::default();
         script.set_placeholder_text(
             "optional: bash run in each new worktree on creation (Tab to focus, Ctrl-S to save)",
@@ -213,6 +214,14 @@ pub(crate) fn cmd_open(state: &mut AppState, args: &[&str], cmds: &mut Commands)
             script,
             focus: OpenProjectFocus::default(),
             import_existing: false,
+            supervisor: LOCAL,
+            browser: None,
+        });
+        // Kick off an initial directory listing (the supervisor's home) so the
+        // browser has something to show.
+        cmds.push(Command::ListDir {
+            supervisor: LOCAL,
+            path: None,
         });
     }
 }
@@ -240,30 +249,6 @@ pub(crate) fn cmd_worktree(state: &mut AppState, args: &[&str], cmds: &mut Comma
             action: PopupAction::NewWorktree { project_idx },
         });
     }
-}
-
-/// Expand a leading `~` or `~/` against `home`. Relative paths (`.`, `..`,
-/// bare names) are returned as-is — the runtime canonicalises them against
-/// the process CWD before validation.
-///
-/// Taking `home` as an argument keeps the function pure and side-effect-free
-/// so tests don't need to mutate the process environment.
-pub fn expand_user_path(input: &str, home: Option<&std::path::Path>) -> PathBuf {
-    let trimmed = input.trim();
-    if let Some(home) = home {
-        if trimmed == "~" {
-            return home.to_path_buf();
-        }
-        if let Some(rest) = trimmed.strip_prefix("~/") {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(trimmed)
-}
-
-/// Resolve `$HOME` once per call; cheap, predictable, no globals.
-pub(crate) fn current_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 /// Resolve the project the sidebar is "on". Prefers an explicit selection;

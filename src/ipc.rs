@@ -112,6 +112,19 @@ pub enum OpRequest {
         repo_path: PathBuf,
         worktrees: Vec<(usize, PathBuf)>,
     },
+    /// List a directory for the open-project browser. `path = None` lists the
+    /// supervisor's home; otherwise the (possibly `~`-prefixed) path is
+    /// expanded + canonicalized **supervisor-side**.
+    ListDir { path: Option<PathBuf> },
+}
+
+/// One entry in a [`OpOk::DirListing`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    /// `true` if the entry looks like a git repo (contains a `.git`).
+    pub is_repo: bool,
 }
 
 /// Disk-derived facts the client needs to build a project, computed
@@ -142,6 +155,13 @@ pub enum OpOk {
     WorktreeRemoved,
     /// `(worktree_idx, classification)` — `None` means "no PR / detached".
     PrStatuses(Vec<(usize, Option<PrStatus>)>),
+    /// Directory contents for the open-project browser. `dir` is the
+    /// canonicalized path that was listed; `parent` is its parent (if any).
+    DirListing {
+        dir: PathBuf,
+        parent: Option<PathBuf>,
+        entries: Vec<DirEntry>,
+    },
 }
 
 /// Result of an [`OpRequest`]. `Err` carries a formatted message the client
@@ -439,6 +459,16 @@ mod tests {
                     worktrees: vec![(0, PathBuf::from("/repo")), (1, PathBuf::from("/wt"))],
                 },
             },
+            ClientMsg::Op {
+                request_id: 16,
+                req: OpRequest::ListDir { path: None },
+            },
+            ClientMsg::Op {
+                request_id: 17,
+                req: OpRequest::ListDir {
+                    path: Some(PathBuf::from("~/code")),
+                },
+            },
         ];
         for msg in cases {
             let mut buf = Vec::new();
@@ -530,6 +560,25 @@ mod tests {
             SupervisorMsg::OpResult {
                 request_id: 6,
                 result: Err("boom".into()),
+            },
+            SupervisorMsg::OpResult {
+                request_id: 7,
+                result: Ok(OpOk::DirListing {
+                    dir: PathBuf::from("/home/me/code"),
+                    parent: Some(PathBuf::from("/home/me")),
+                    entries: vec![
+                        DirEntry {
+                            name: "imbuia".into(),
+                            is_dir: true,
+                            is_repo: true,
+                        },
+                        DirEntry {
+                            name: "notes".into(),
+                            is_dir: true,
+                            is_repo: false,
+                        },
+                    ],
+                }),
             },
         ];
         for msg in cases {

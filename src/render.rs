@@ -37,7 +37,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     } else if let Some(popup) = &state.popup {
         render_input_popup(frame, area, popup, theme);
     } else if let Some(open) = &state.open_project_popup {
-        render_open_project_popup(frame, area, open, theme);
+        render_open_project_popup(frame, area, open, &state.supervisors, theme);
     } else if let Some(edit) = &state.edit_popup {
         render_edit_popup(frame, area, edit, theme);
     } else if let Some(usage) = &state.usage_popup {
@@ -206,6 +206,7 @@ fn render_open_project_popup(
     frame: &mut Frame,
     area: Rect,
     popup: &crate::app::OpenProjectPopup,
+    supervisors: &crate::app::SupervisorDirectory,
     theme: &Theme,
 ) {
     use crate::app::OpenProjectFocus;
@@ -234,36 +235,92 @@ fn render_open_project_popup(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // path label + buffer
-            Constraint::Length(1), // hint
+            Constraint::Length(1), // supervisor selector
+            Constraint::Length(1), // current dir
+            Constraint::Min(4),    // directory browser
             Constraint::Length(1), // setup-script label
-            Constraint::Min(3),    // textarea
+            Constraint::Min(2),    // textarea
             Constraint::Length(1), // import toggle
             Constraint::Length(1), // footer
         ])
         .split(inner);
 
-    let path_focused = popup.focus == OpenProjectFocus::Path;
-    let path_style = if path_focused {
+    // Supervisor selector.
+    let sup_focused = popup.focus == OpenProjectFocus::Supervisor;
+    let sup_style = if sup_focused {
         Style::default()
             .fg(theme.header_fg)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme.fg_dim)
     };
-    let path_line = Line::from(vec![
-        Span::styled(" path: ", path_style),
-        Span::styled(popup.path.as_str(), Style::default().fg(theme.fg)),
-    ]);
-    frame.render_widget(Paragraph::new(path_line), chunks[0]);
-
+    let sup_name = supervisors.name_of(popup.supervisor);
+    let sup_hint = if sup_focused {
+        "  (←/→ change)"
+    } else {
+        ""
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            " ~ expands to $HOME",
-            Style::default().fg(theme.fg_dim),
-        ))),
+        Paragraph::new(Line::from(vec![
+            Span::styled(" supervisor: ", sup_style),
+            Span::styled(sup_name.to_string(), Style::default().fg(theme.fg)),
+            Span::styled(sup_hint, Style::default().fg(theme.fg_dim)),
+        ])),
+        chunks[0],
+    );
+
+    // Current directory.
+    let path_focused = popup.focus == OpenProjectFocus::Path;
+    let dir_style = if path_focused {
+        Style::default()
+            .fg(theme.header_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.fg_dim)
+    };
+    let cur_dir = popup
+        .browser
+        .as_ref()
+        .map(|b| b.dir.to_string_lossy().to_string())
+        .unwrap_or_else(|| "(listing…)".into());
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" dir: ", dir_style),
+            Span::styled(cur_dir, Style::default().fg(theme.fg)),
+        ])),
         chunks[1],
     );
+
+    // Directory browser list.
+    let mut rows: Vec<Line> = Vec::new();
+    if let Some(browser) = popup.browser.as_ref() {
+        if browser.parent.is_some() {
+            rows.push(Line::from(Span::styled(
+                "  ../",
+                Style::default().fg(theme.fg_dim),
+            )));
+        }
+        let view_h = chunks[2].height as usize;
+        // Keep the cursor in view with a simple top-anchored window.
+        let start = (browser.cursor as usize).saturating_sub(view_h.saturating_sub(2));
+        for (i, e) in browser.entries.iter().enumerate().skip(start) {
+            let selected = path_focused && i as u16 == browser.cursor;
+            let marker = if e.is_repo { "◆ " } else { "  " };
+            let label = format!("  {marker}{}/", e.name);
+            let style = if selected {
+                Style::default()
+                    .bg(theme.selection_bg)
+                    .fg(theme.selection_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else if e.is_repo {
+                Style::default().fg(theme.fg)
+            } else {
+                Style::default().fg(theme.fg_dim)
+            };
+            rows.push(Line::from(Span::styled(label, style)));
+        }
+    }
+    frame.render_widget(Paragraph::new(rows), chunks[2]);
 
     let script_focused = popup.focus == OpenProjectFocus::Script;
     let script_style = if script_focused {
@@ -278,9 +335,9 @@ fn render_open_project_popup(
             " setup script (optional, runs in each new worktree):",
             script_style,
         ))),
-        chunks[2],
+        chunks[3],
     );
-    frame.render_widget(&popup.script, chunks[3]);
+    frame.render_widget(&popup.script, chunks[4]);
 
     let import_focused = popup.focus == OpenProjectFocus::Import;
     let import_style = if import_focused {
@@ -299,24 +356,16 @@ fn render_open_project_popup(
                 import_style,
             ),
         ])),
-        chunks[4],
+        chunks[5],
     );
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " Tab cycle · Space toggle · Enter or Ctrl-S confirm · Esc cancel",
+            " ↑/↓ move · Enter/→ open repo or descend · ←/Bksp up · Ctrl-S open dir · Tab cycle · Esc",
             Style::default().fg(theme.fg_dim),
         ))),
-        chunks[5],
+        chunks[6],
     );
-
-    if path_focused {
-        let cursor_x = chunks[0].x + 7 + popup.path.chars().count() as u16;
-        let cursor_y = chunks[0].y;
-        if cursor_x < chunks[0].x + chunks[0].width {
-            frame.set_cursor_position((cursor_x, cursor_y));
-        }
-    }
 }
 
 fn render_usage_popup(
@@ -330,9 +379,10 @@ fn render_usage_popup(
     let r = centered_rect(w, h, area);
     frame.render_widget(Clear, r);
 
-    let title = match &popup.report {
-        Some(_) => " Resource usage  (Enter/l expand · h collapse · j/k move · Esc close) ",
-        None => " Resource usage  (waiting for first sample…) ",
+    let title = if popup.reports.is_empty() && popup.client.is_none() {
+        " Resource usage  (waiting for first sample…) "
+    } else {
+        " Resource usage  (Enter/l expand · h collapse · j/k move · Esc close) "
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -351,13 +401,12 @@ fn render_usage_popup(
     frame.render_widget(block, r);
 
     let rows = crate::reducer::usage_visible_rows(popup);
-    let report = match &popup.report {
-        Some(r) => r,
-        None => return,
-    };
+    if rows.is_empty() {
+        return;
+    }
 
     // Header line + data lines + footer.
-    let mut lines = Vec::with_capacity(rows.len() + 3);
+    let mut lines = Vec::with_capacity(rows.len() + 4);
     lines.push(Line::from(vec![Span::styled(
         format!("  {:<48}  {:>10}  {:>8}", "NAME", "RSS", "CPU%"),
         Style::default()
@@ -365,8 +414,12 @@ fn render_usage_popup(
             .add_modifier(Modifier::BOLD),
     )]));
 
-    let mut total_rss: u64 = 0;
-    let mut total_cpu: f32 = 0.0;
+    // Σ sessions across every supervisor; Σ everything also folds in each
+    // supervisor's own process + the client.
+    let mut session_rss: u64 = 0;
+    let mut session_cpu: f32 = 0.0;
+    let mut app_rss: u64 = 0;
+    let mut app_cpu: f32 = 0.0;
     for (i, row) in rows.iter().enumerate() {
         let selected = i as u16 == popup.cursor;
         let style = if selected {
@@ -378,13 +431,21 @@ fn render_usage_popup(
             Style::default().fg(theme.fg)
         };
         let line = match row {
+            crate::reducer::UsageRow::SupervisorHeader { name } => Line::from(vec![Span::styled(
+                format!("▏{name}"),
+                Style::default()
+                    .fg(theme.header_fg)
+                    .add_modifier(Modifier::BOLD),
+            )]),
             crate::reducer::UsageRow::Session {
                 usage, expanded, ..
             } => {
                 let rss = usage.root.total_rss();
                 let cpu = usage.root.total_cpu();
-                total_rss += rss;
-                total_cpu += cpu;
+                session_rss += rss;
+                session_cpu += cpu;
+                app_rss += rss;
+                app_cpu += cpu;
                 let marker = if *expanded { "▾" } else { "▸" };
                 let label = format!(
                     "{} {}/{}  (pid {})",
@@ -397,43 +458,50 @@ fn render_usage_popup(
                 let label = format!("{}└ {}  (pid {})", indent, node.name, node.pid);
                 fmt_row(&label, node.rss_bytes, node.cpu_percent, style)
             }
-            crate::reducer::UsageRow::Supervisor(node) => fmt_row(
-                &format!("◆ imbuia (supervisor pid {})", node.pid),
-                node.rss_bytes,
-                node.cpu_percent,
-                style.fg(theme.fg_dim),
-            ),
-            crate::reducer::UsageRow::Client(node) => fmt_row(
-                &format!("◆ imbuia (client pid {})", node.pid),
-                node.rss_bytes,
-                node.cpu_percent,
-                style.fg(theme.fg_dim),
-            ),
+            crate::reducer::UsageRow::Supervisor(node) => {
+                app_rss += node.rss_bytes;
+                app_cpu += node.cpu_percent;
+                fmt_row(
+                    &format!("  ◆ imbuia (supervisor pid {})", node.pid),
+                    node.rss_bytes,
+                    node.cpu_percent,
+                    style.fg(theme.fg_dim),
+                )
+            }
+            crate::reducer::UsageRow::Client(node) => {
+                app_rss += node.rss_bytes;
+                app_cpu += node.cpu_percent;
+                fmt_row(
+                    &format!("◆ imbuia (client pid {})", node.pid),
+                    node.rss_bytes,
+                    node.cpu_percent,
+                    style.fg(theme.fg_dim),
+                )
+            }
         };
         lines.push(line);
     }
 
-    // Footer totals — sessions only, then everything (incl. imbuia itself).
-    let app_rss = total_rss
-        + report.supervisor.rss_bytes
-        + report.client.as_ref().map(|c| c.rss_bytes).unwrap_or(0);
-    let app_cpu = total_cpu
-        + report.supervisor.cpu_percent
-        + report.client.as_ref().map(|c| c.cpu_percent).unwrap_or(0.0);
+    let cores = popup
+        .reports
+        .values()
+        .map(|r| r.cpu_count)
+        .max()
+        .unwrap_or(0);
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
         format!(
             "  {:<48}  {:>10}  {:>7.1}",
             "Σ sessions",
-            human_bytes(total_rss),
-            total_cpu
+            human_bytes(session_rss),
+            session_cpu
         ),
         Style::default().fg(theme.header_fg),
     )]));
     lines.push(Line::from(vec![Span::styled(
         format!(
             "  {:<48}  {:>10}  {:>7.1}",
-            format!("Σ everything  ({} cores available)", report.cpu_count),
+            format!("Σ everything  ({cores} cores available)"),
             human_bytes(app_rss),
             app_cpu
         ),

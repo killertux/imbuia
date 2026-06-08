@@ -16,9 +16,9 @@
 //! `~/.cache/imbuia/supervisor.log` via `tracing`.
 
 use crate::ipc::{
-    self, ClientMsg, HandshakeReq, HandshakeResp, OpOk, OpRequest, OpResult, PROTOCOL_VERSION,
-    ProcessNode, ProjectInfo, SessionId, SessionMeta, SessionUsage, SupervisorMsg, UsageReport,
-    WorktreeEntry,
+    self, ClientMsg, DirEntry, HandshakeReq, HandshakeResp, OpOk, OpRequest, OpResult,
+    PROTOCOL_VERSION, ProcessNode, ProjectInfo, SessionId, SessionMeta, SessionUsage,
+    SupervisorMsg, UsageReport, WorktreeEntry,
 };
 use crate::{config, git, github, transport};
 use anyhow::{Context, Result};
@@ -754,7 +754,10 @@ impl Drop for OpReplyGuard {
 fn run_git_op(req: OpRequest) -> OpResult {
     match req {
         OpRequest::Validate { repo_path } => {
-            let absolute = std::fs::canonicalize(&repo_path).map_err(|e| format!("{e:#}"))?;
+            // Expand `~` against the *supervisor's* HOME (the client no longer
+            // expands — its home differs from a remote supervisor's).
+            let expanded = expand_user(&repo_path);
+            let absolute = std::fs::canonicalize(&expanded).map_err(|e| format!("{e:#}"))?;
             git::validate_repo(&absolute).map_err(|e| format!("{e:#}"))?;
             let head = git::head_branch(&absolute).map_err(|e| format!("{e:#}"))?;
             let repo_name = absolute
@@ -800,11 +803,65 @@ fn run_git_op(req: OpRequest) -> OpResult {
             tracing::info!(repo = %repo_path.display(), branch = ?branch, "worktree removed");
             Ok(OpOk::WorktreeRemoved)
         }
+        OpRequest::ListDir { path } => list_dir(path),
         OpRequest::FetchPr { .. } => {
             // Routed to the gh worker in the command loop; never reached.
             Err("FetchPr must go through the gh worker".into())
         }
     }
+}
+
+/// The supervisor's home directory (`$HOME`), or `/` as a last resort.
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// Expand a leading `~` / `~/…` against the supervisor's `$HOME`.
+fn expand_user(path: &std::path::Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s == "~" {
+        return home_dir();
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        return home_dir().join(rest);
+    }
+    path.to_path_buf()
+}
+
+/// List a directory for the open-project browser. `None` lists `$HOME`. Returns
+/// canonicalized `dir`, its parent, and child directories (dirs only), each
+/// flagged for whether it looks like a git repo.
+fn list_dir(path: Option<PathBuf>) -> OpResult {
+    let target = path.map(|p| expand_user(&p)).unwrap_or_else(home_dir);
+    let dir = std::fs::canonicalize(&target).map_err(|e| format!("{e:#}"))?;
+    let read = std::fs::read_dir(&dir).map_err(|e| format!("{e:#}"))?;
+    let mut entries: Vec<DirEntry> = Vec::new();
+    for ent in read.flatten() {
+        let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+        let name = ent.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue; // hide dotdirs (incl. nested .git) from the browser
+        }
+        let is_repo = ent.path().join(".git").exists();
+        entries.push(DirEntry {
+            name,
+            is_dir,
+            is_repo,
+        });
+    }
+    entries.sort_by_key(|e| e.name.to_lowercase());
+    let parent = dir.parent().map(|p| p.to_path_buf());
+    tracing::info!(dir = %dir.display(), count = entries.len(), "listed directory");
+    Ok(OpOk::DirListing {
+        dir,
+        parent,
+        entries,
+    })
 }
 
 /// Destination path for a new worktree: `<repo-parent>/<repo>-worktrees/<branch>`.
@@ -1060,7 +1117,7 @@ fn spawn_usage_sampler(shared: Arc<Shared>) {
                     reg.active_client_pid,
                 )
             };
-            let (chan, sessions_snapshot, client_pid) = snapshot;
+            let (chan, sessions_snapshot, _client_pid) = snapshot;
 
             system.refresh_processes_specifics(
                 ProcessesToUpdate::All,
@@ -1159,19 +1216,12 @@ fn spawn_usage_sampler(shared: Arc<Shared>) {
                     children: Vec::new(),
                 });
 
-            let client = client_pid.and_then(|pid| {
-                procs.get(&Pid::from_u32(pid)).map(|p| ProcessNode {
-                    pid,
-                    name: p.name().to_string_lossy().to_string(),
-                    rss_bytes: p.memory(),
-                    cpu_percent: p.cpu_usage(),
-                    children: Vec::new(),
-                })
-            });
             let report = UsageReport {
                 sessions,
                 supervisor,
-                client,
+                // The client process lives on a different host for remote
+                // supervisors; the client samples its own pid locally now.
+                client: None,
                 ts_ms: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -1331,5 +1381,41 @@ mod tests {
     fn mode_prelude_empty_when_no_modes_active() {
         let p = vt100::Parser::new(24, 80, 100);
         assert!(mode_prelude(&p).is_empty());
+    }
+
+    #[test]
+    fn list_dir_lists_subdirs_and_flags_repos() {
+        let base = std::env::temp_dir().join(format!("imbuia-listdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("repo/.git")).unwrap();
+        std::fs::create_dir_all(base.join("plain")).unwrap();
+        std::fs::create_dir_all(base.join(".hidden")).unwrap();
+        std::fs::write(base.join("file.txt"), b"x").unwrap();
+
+        let ok = list_dir(Some(base.clone())).unwrap();
+        let OpOk::DirListing { entries, .. } = ok else {
+            panic!("expected DirListing");
+        };
+        // Dirs only, dotdirs hidden, sorted.
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["plain", "repo"]);
+        let repo = entries.iter().find(|e| e.name == "repo").unwrap();
+        assert!(repo.is_repo);
+        assert!(!entries.iter().find(|e| e.name == "plain").unwrap().is_repo);
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn expand_user_resolves_tilde() {
+        // Uses the process HOME; just assert the prefix is replaced (not literal ~).
+        let expanded = expand_user(std::path::Path::new("~/sub"));
+        assert!(!expanded.to_string_lossy().starts_with('~'));
+        assert!(expanded.ends_with("sub"));
+        // Non-tilde paths pass through unchanged.
+        assert_eq!(
+            expand_user(std::path::Path::new("/abs/x")),
+            std::path::PathBuf::from("/abs/x")
+        );
     }
 }
