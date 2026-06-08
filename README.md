@@ -203,9 +203,13 @@ or `$XDG_CACHE_HOME/imbuia/` / `~/.cache/imbuia/` (macOS):
 ## Remote supervisor
 
 By default the supervisor runs on the same machine as the TUI, over a local
-Unix socket. You can instead run it on a **remote host** and attach to it from
-your laptop over TCP — your sessions then live on (and survive reboots of the
-*client* machine on) the remote.
+Unix socket. You can instead run supervisors on **one or more remote hosts** and
+attach to them from your laptop over TCP — sessions then live on (and survive
+reboots of the *client* machine on) the remote.
+
+The client always keeps its **local** supervisor and connects to every
+configured remote as well. Each **project is pinned to one supervisor** (chosen
+when you open it); all of that project's worktrees and sessions live there.
 
 The link is **encrypted and mutually authenticated** with TLS. Trust is
 SSH-style pinned public keys, not certificate authorities: each side keeps a
@@ -231,23 +235,49 @@ imbuia --supervisor --listen 0.0.0.0:7777
 
 ### 2. Point the client at it
 
-Add a `[remote]` table to the client's `~/.config/imbuia/config.toml`:
+Add a `[remotes.<name>]` table per remote to the client's
+`~/.config/imbuia/config.toml` (the `<name>` is how it shows up in the UI):
 
 ```toml
-[remote]
+[remotes.gpu-box]
 url = "your.remote.host:7777"   # host:port, no scheme
+
+[remotes.ci]
+url = "10.0.0.9:7777"
 ```
 
-Launch `imbuia` as usual. On the first connection:
+Launch `imbuia` as usual. On the first connection to each remote:
 
 - the client generates its identity and **pins the supervisor's key** in
   `~/.config/imbuia/known_hosts`;
 - the supervisor, if its `authorized_keys` is empty, **pins your client** and
   lets it in.
 
-That's the whole setup. While `remote.url` is set the client connects *only*
-to the remote (it won't spawn or fall back to a local supervisor); remove the
-block to go back to local.
+A remote that's unreachable at startup is non-fatal — it's just unavailable
+until you relaunch (projects pinned to it report an error when used).
+
+> Older configs with a single `[remote]` table still work — it's treated as a
+> remote named `remote`.
+
+### 3. Open a project on a supervisor
+
+Run `:open` (no argument) to get the open-project popup:
+
+- **Tab** cycles the fields. The **supervisor** row (←/→) picks which supervisor
+  to create the project on — `local` or any configured remote.
+- The **directory browser** lists the *selected supervisor's* filesystem, so you
+  can navigate to the repo even on a remote whose paths differ from yours.
+  ↑/↓ move, →/Enter descends (or opens a highlighted git repo, marked `◆`),
+  ←/Backspace goes up, **Ctrl-S** opens the current directory as the project.
+
+The project's supervisor is saved to its `projects/<slug>.toml` as
+`supervisor = "<name>"` (absent = local), so it reattaches there next launch.
+
+### Resource usage across supervisors
+
+`:usage` shows one section per supervisor (its sessions + its own process), a
+single **Client** row for the TUI itself (sampled locally), and a grand total.
+A remote dropping out just removes its section — the app keeps running.
 
 ### Trust files & security notes
 

@@ -41,6 +41,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
             remove_session_from_worktrees(state, id);
         }
         Action::ProjectValidated {
+            supervisor,
             canonical_path,
             repo_name,
             head_branch,
@@ -62,6 +63,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
                 slug,
                 name: repo_name,
                 path: canonical_path,
+                supervisor: state.supervisors.config_name(supervisor),
                 expanded: true,
                 setup_script,
                 worktrees: vec![main],
@@ -69,7 +71,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
                 github_enabled: true,
                 gh_poll_interval_secs: None,
             };
-            let project = crate::app::Project::from_config(cfg);
+            let project = crate::app::Project::from_config(cfg, supervisor);
             let repo_path = project.repo_path.clone();
             state.projects.push(project);
             let new_idx = state.projects.len() - 1;
@@ -124,6 +126,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
                 let cwd = worktree.path.clone();
                 let script = p.setup_script.clone();
                 let slug = p.slug.clone();
+                let supervisor = p.supervisor;
                 let wt_name = worktree.name.clone();
                 p.worktrees.push(worktree);
                 let wi = p.worktrees.len() - 1;
@@ -142,6 +145,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
                     ensure_selection_visible(state, row_idx as u16);
                 }
                 cmds.push(Command::SpawnInWorktree {
+                    supervisor,
                     rows: term.height,
                     cols: term.width,
                     cwd,
@@ -227,26 +231,70 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
             state.pending_op = None;
             state.command_status = Some(msg);
         }
-        Action::SupervisorLost(reason) => {
-            // Drop every session ref — the supervisor's gone, the PTYs are
-            // gone, any future write would be a silent no-op.
-            state.sessions.clear();
-            for p in &mut state.projects {
-                for w in &mut p.worktrees {
-                    w.sessions.clear();
-                    w.active_tab = None;
+        Action::SupervisorLost(sup, reason) => {
+            if sup == crate::app::LOCAL {
+                // The local supervisor's PTYs are gone — nothing to attach to;
+                // wipe everything and exit, as before.
+                state.sessions.clear();
+                for p in &mut state.projects {
+                    for w in &mut p.worktrees {
+                        w.sessions.clear();
+                        w.active_tab = None;
+                    }
                 }
+                state.pending_op = None;
+                state.mode = Mode::Normal;
+                state.command_status = Some(format!("supervisor lost: {reason}"));
+                state.running = false;
+            } else {
+                // A remote dropped — drop only its sessions, keep running.
+                let name = state.supervisors.name_of(sup).to_string();
+                for p in &mut state.projects {
+                    if p.supervisor != sup {
+                        continue;
+                    }
+                    for w in &mut p.worktrees {
+                        for id in w.sessions.drain(..) {
+                            state.sessions.remove(&id);
+                        }
+                        w.active_tab = None;
+                    }
+                }
+                if let Some((pi, _)) = state.active_worktree
+                    && state.projects.get(pi).map(|p| p.supervisor) == Some(sup)
+                {
+                    state.active_worktree = None;
+                }
+                state.command_status = Some(format!("remote supervisor '{name}' disconnected"));
             }
-            state.pending_op = None;
-            state.mode = Mode::Normal;
-            state.command_status = Some(format!("supervisor lost: {reason}"));
-            state.running = false;
         }
-        Action::UsageReceived(report) => {
+        Action::UsageReceived(sup, report) => {
             if let Some(popup) = state.usage_popup.as_mut() {
-                popup.report = Some(report);
+                popup.reports.insert(sup, report);
                 let max_row = usage_visible_row_count(popup).saturating_sub(1) as u16;
                 popup.cursor = popup.cursor.min(max_row);
+            }
+        }
+        Action::LocalUsageSampled(node) => {
+            if let Some(popup) = state.usage_popup.as_mut() {
+                popup.client = Some(node);
+                let max_row = usage_visible_row_count(popup).saturating_sub(1) as u16;
+                popup.cursor = popup.cursor.min(max_row);
+            }
+        }
+        Action::DirListed {
+            dir,
+            parent,
+            entries,
+        } => {
+            if let Some(popup) = state.open_project_popup.as_mut() {
+                popup.path = dir.to_string_lossy().to_string();
+                popup.browser = Some(crate::app::DirBrowser {
+                    dir,
+                    parent,
+                    entries,
+                    cursor: 0,
+                });
             }
         }
         Action::UpdateChecked(Ok(Some(info))) => {
@@ -564,6 +612,8 @@ fn switch_tab(state: &mut AppState, delta: i32) {
 /// One row in the usage popup's flattened view.
 #[derive(Debug, Clone)]
 pub enum UsageRow<'a> {
+    /// Section header naming a supervisor (`local` or a remote's name).
+    SupervisorHeader { name: String },
     Session {
         session_id: SessionId,
         usage: &'a crate::ipc::SessionUsage,
@@ -573,31 +623,37 @@ pub enum UsageRow<'a> {
         depth: u16,
         node: &'a crate::ipc::ProcessNode,
     },
+    /// A supervisor's own process (labelled by the preceding header).
     Supervisor(&'a crate::ipc::ProcessNode),
+    /// This client process (one row, after all supervisor sections).
     Client(&'a crate::ipc::ProcessNode),
 }
 
-/// Flatten the popup state into the rows currently visible to the user.
+/// Flatten the popup state into the rows currently visible to the user. One
+/// section per supervisor (its sessions + its own process), then a single
+/// `Client` row sampled locally.
 pub fn usage_visible_rows<'a>(popup: &'a crate::app::UsagePopup) -> Vec<UsageRow<'a>> {
     let mut rows = Vec::new();
-    let Some(report) = popup.report.as_ref() else {
-        return rows;
-    };
-    for su in &report.sessions {
-        let expanded = popup.expanded.contains(&su.session_id);
-        rows.push(UsageRow::Session {
-            session_id: su.session_id,
-            usage: su,
-            expanded,
+    for (id, report) in &popup.reports {
+        rows.push(UsageRow::SupervisorHeader {
+            name: popup.supervisors.name_of(*id).to_string(),
         });
-        if expanded {
-            for child in &su.root.children {
-                push_process_rows(&mut rows, child, 1);
+        for su in &report.sessions {
+            let expanded = popup.expanded.contains(&su.session_id);
+            rows.push(UsageRow::Session {
+                session_id: su.session_id,
+                usage: su,
+                expanded,
+            });
+            if expanded {
+                for child in &su.root.children {
+                    push_process_rows(&mut rows, child, 1);
+                }
             }
         }
+        rows.push(UsageRow::Supervisor(&report.supervisor));
     }
-    rows.push(UsageRow::Supervisor(&report.supervisor));
-    if let Some(client) = report.client.as_ref() {
+    if let Some(client) = popup.client.as_ref() {
         rows.push(UsageRow::Client(client));
     }
     rows
@@ -682,15 +738,16 @@ pub(crate) fn launch_in_worktree(
     cmds: &mut Commands,
 ) {
     let term = chrome(state.term_size.as_rect(), state.sidebar_width).terminal;
-    let (cwd, slug, wt_name) = match state
+    let (cwd, slug, wt_name, supervisor) = match state
         .projects
         .get(pi)
         .and_then(|p| p.worktrees.get(wi).map(|w| (p, w)))
     {
-        Some((p, w)) => (w.path.clone(), p.slug.clone(), w.name.clone()),
+        Some((p, w)) => (w.path.clone(), p.slug.clone(), w.name.clone(), p.supervisor),
         None => return,
     };
     cmds.push(Command::SpawnInWorktree {
+        supervisor,
         rows: term.height,
         cols: term.width,
         cwd,
@@ -706,15 +763,16 @@ pub(crate) fn open_new_tab_in_active(state: &mut AppState, cmds: &mut Commands) 
         return;
     };
     let term = chrome(state.term_size.as_rect(), state.sidebar_width).terminal;
-    let (cwd, slug, wt_name) = match state
+    let (cwd, slug, wt_name, supervisor) = match state
         .projects
         .get(pi)
         .and_then(|p| p.worktrees.get(wi).map(|w| (p, w)))
     {
-        Some((p, w)) => (w.path.clone(), p.slug.clone(), w.name.clone()),
+        Some((p, w)) => (w.path.clone(), p.slug.clone(), w.name.clone(), p.supervisor),
         None => return,
     };
     cmds.push(Command::SpawnInWorktree {
+        supervisor,
         rows: term.height,
         cols: term.width,
         cwd,
@@ -1377,86 +1435,157 @@ fn handle_open_project_popup_key(state: &mut AppState, k: KeyEvent, cmds: &mut C
         state.open_project_popup = None;
         return;
     }
-    // Ctrl-S submits from any focus.
+    let Some(focus) = state.open_project_popup.as_ref().map(|p| p.focus) else {
+        return;
+    };
+
+    // Ctrl-S submits the browser's current directory as the repo from any focus.
     let ctrl_s = k.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(k.code, KeyCode::Char('s') | KeyCode::Char('S'));
-    // Enter submits when on Path; on Import it toggles the flag (so the
-    // user can both navigate to + check it with one Enter). On Script it
-    // still inserts a newline via the textarea path below.
-    let on_path = state
-        .open_project_popup
-        .as_ref()
-        .is_some_and(|p| p.focus == OpenProjectFocus::Path);
-    let on_import = state
-        .open_project_popup
-        .as_ref()
-        .is_some_and(|p| p.focus == OpenProjectFocus::Import);
-    let enter_submit = matches!(k.code, KeyCode::Enter) && on_path;
-    if ctrl_s || enter_submit {
-        if let Some(popup) = state.open_project_popup.take() {
-            let path = popup.path.trim().to_string();
-            if path.is_empty() {
-                state.open_project_popup = Some(popup);
-                state.command_status = Some("path required".into());
-                return;
-            }
-            let home = crate::commands::current_home();
-            let expanded = crate::commands::expand_user_path(&path, home.as_deref());
-            let script_text = popup.script.lines().join("\n");
-            let trimmed = script_text.trim_end_matches('\n').trim().to_string();
-            let setup_script = if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            };
-            state.pending_op = Some(format!("Opening {}…", expanded.display()));
-            cmds.push(Command::OpenProject {
-                path: expanded,
-                setup_script,
-                import_existing: popup.import_existing,
-            });
-        }
+    if ctrl_s {
+        submit_open_project(state, cmds, None);
         return;
     }
-    // Tab cycles Path → Script → Import → Path.
+
+    // Tab cycles Path → Supervisor → Script → Import → Path.
     if matches!(k.code, KeyCode::Tab) {
         if let Some(popup) = state.open_project_popup.as_mut() {
             popup.focus = match popup.focus {
-                OpenProjectFocus::Path => OpenProjectFocus::Script,
+                OpenProjectFocus::Path => OpenProjectFocus::Supervisor,
+                OpenProjectFocus::Supervisor => OpenProjectFocus::Script,
                 OpenProjectFocus::Script => OpenProjectFocus::Import,
                 OpenProjectFocus::Import => OpenProjectFocus::Path,
             };
         }
         return;
     }
-    // Space (or Enter) on the Import row toggles the flag.
-    if on_import && matches!(k.code, KeyCode::Char(' ') | KeyCode::Enter) {
-        if let Some(popup) = state.open_project_popup.as_mut() {
-            popup.import_existing = !popup.import_existing;
+
+    match focus {
+        OpenProjectFocus::Path => handle_browser_key(state, k, cmds),
+        OpenProjectFocus::Supervisor => {
+            // Left/Right/Space/Enter cycle the target supervisor; switching
+            // re-lists from the new supervisor's home.
+            if matches!(
+                k.code,
+                KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Char(' ')
+                    | KeyCode::Char('h')
+                    | KeyCode::Char('l')
+                    | KeyCode::Enter
+            ) {
+                let next = {
+                    let dir = &state.supervisors;
+                    state
+                        .open_project_popup
+                        .as_ref()
+                        .map(|p| dir.next_after(p.supervisor))
+                };
+                if let (Some(next), Some(popup)) = (next, state.open_project_popup.as_mut()) {
+                    popup.supervisor = next;
+                    popup.browser = None;
+                    cmds.push(Command::ListDir {
+                        supervisor: next,
+                        path: None,
+                    });
+                }
+            }
         }
-        return;
-    }
-    // Route to the focused field.
-    if let Some(popup) = state.open_project_popup.as_mut() {
-        match popup.focus {
-            OpenProjectFocus::Path => match k.code {
-                KeyCode::Backspace => {
-                    popup.path.pop();
-                }
-                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    popup.path.push(c);
-                }
-                _ => {}
-            },
-            OpenProjectFocus::Script => {
+        OpenProjectFocus::Script => {
+            if let Some(popup) = state.open_project_popup.as_mut() {
                 popup.script.input(crossterm_key_to_input(k));
             }
-            OpenProjectFocus::Import => {
-                // No other keys do anything when the Import row is focused;
-                // ignore so a stray keystroke doesn't fall through.
+        }
+        OpenProjectFocus::Import => {
+            if matches!(k.code, KeyCode::Char(' ') | KeyCode::Enter)
+                && let Some(popup) = state.open_project_popup.as_mut()
+            {
+                popup.import_existing = !popup.import_existing;
             }
         }
     }
+}
+
+/// Key handling for the directory browser (Path focus).
+fn handle_browser_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
+    let Some(popup) = state.open_project_popup.as_mut() else {
+        return;
+    };
+    let supervisor = popup.supervisor;
+    let Some(browser) = popup.browser.as_mut() else {
+        return; // listing not arrived yet
+    };
+    let n = browser.entries.len() as u16;
+    match k.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            browser.cursor = browser.cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') if n > 0 => {
+            browser.cursor = (browser.cursor + 1).min(n - 1);
+        }
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
+            if let Some(parent) = browser.parent.clone() {
+                cmds.push(Command::ListDir {
+                    supervisor,
+                    path: Some(parent),
+                });
+            }
+        }
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            if let Some(entry) = browser.entries.get(browser.cursor as usize) {
+                let path = browser.dir.join(&entry.name);
+                if entry.is_repo {
+                    // Open this repo directly.
+                    submit_open_project(state, cmds, Some(path));
+                } else {
+                    // Descend.
+                    cmds.push(Command::ListDir {
+                        supervisor,
+                        path: Some(path),
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Build + dispatch the `OpenProject` command. `explicit` overrides the path
+/// (e.g. a highlighted repo dir); otherwise the browser's current dir is used.
+fn submit_open_project(
+    state: &mut AppState,
+    cmds: &mut Commands,
+    explicit: Option<std::path::PathBuf>,
+) {
+    let Some(popup) = state.open_project_popup.take() else {
+        return;
+    };
+    let path = explicit.unwrap_or_else(|| {
+        popup
+            .browser
+            .as_ref()
+            .map(|b| b.dir.clone())
+            .unwrap_or_else(|| std::path::PathBuf::from(popup.path.trim()))
+    });
+    if path.as_os_str().is_empty() {
+        state.command_status = Some("path required".into());
+        state.open_project_popup = Some(popup);
+        return;
+    }
+    let script_text = popup.script.lines().join("\n");
+    let trimmed = script_text.trim_end_matches('\n').trim().to_string();
+    let setup_script = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    };
+    state.pending_op = Some(format!("Opening {}…", path.display()));
+    cmds.push(Command::OpenProject {
+        supervisor: popup.supervisor,
+        path,
+        setup_script,
+        import_existing: popup.import_existing,
+    });
 }
 
 fn handle_edit_popup_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {

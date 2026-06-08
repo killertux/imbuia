@@ -30,10 +30,14 @@ pub struct GlobalConfig {
     /// default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub keybinds: BTreeMap<String, String>,
-    /// When set, the client connects to this remote supervisor over TCP+TLS
-    /// instead of spawning/attaching the local Unix-socket supervisor. The
-    /// supervisor's public key is pinned on first connect (TOFU) in
-    /// `known_hosts`, not stored here.
+    /// Named remote supervisors (TOML `[remotes.<name>]`). The client connects
+    /// to all of them (best-effort) at startup in addition to the local
+    /// supervisor; each project picks one. Pinned TOFU in `known_hosts`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub remotes: BTreeMap<String, RemoteConfig>,
+    /// Legacy single-remote field (pre-multi-supervisor). Still read for
+    /// back-compat and folded into [`Self::effective_remotes`] under the name
+    /// `"remote"`; new configs use `[remotes.<name>]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteConfig>,
 }
@@ -42,6 +46,20 @@ pub struct GlobalConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteConfig {
     pub url: String,
+}
+
+impl GlobalConfig {
+    /// Resolved remotes by name: the `remotes` table, plus the legacy single
+    /// `remote` folded in as `"remote"` when `remotes` doesn't already define
+    /// that name.
+    pub fn effective_remotes(&self) -> BTreeMap<String, RemoteConfig> {
+        let mut out = self.remotes.clone();
+        if let Some(legacy) = &self.remote {
+            out.entry("remote".to_string())
+                .or_insert_with(|| legacy.clone());
+        }
+        out
+    }
 }
 
 impl Default for GlobalConfig {
@@ -53,6 +71,7 @@ impl Default for GlobalConfig {
             launchers: Vec::new(),
             gh_poll_interval_secs: None,
             keybinds: BTreeMap::new(),
+            remotes: BTreeMap::new(),
             remote: None,
         }
     }
@@ -70,6 +89,10 @@ pub struct ProjectConfig {
     pub slug: String,
     pub name: String,
     pub path: PathBuf,
+    /// Name of the supervisor hosting this project (a key in
+    /// `GlobalConfig.remotes`). `None`/absent = the local supervisor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor: Option<String>,
     #[serde(default = "default_expanded")]
     pub expanded: bool,
     /// Multi-line bash script run inside each new worktree on creation.
@@ -378,6 +401,7 @@ mod tests {
             launchers: Vec::new(),
             gh_poll_interval_secs: None,
             keybinds: BTreeMap::new(),
+            remotes: BTreeMap::new(),
             remote: None,
         };
         save_global(&dir, &global).unwrap();
@@ -385,6 +409,7 @@ mod tests {
             slug: "ok".into(),
             name: "Ok".into(),
             path: PathBuf::from("/tmp"),
+            supervisor: None,
             expanded: true,
             setup_script: None,
             worktrees: vec![],
@@ -412,6 +437,7 @@ mod tests {
             launchers: Vec::new(),
             gh_poll_interval_secs: None,
             keybinds: BTreeMap::new(),
+            remotes: BTreeMap::new(),
             remote: None,
         };
         save_global(&dir, &global).unwrap();
@@ -424,6 +450,7 @@ mod tests {
             slug: "foo".into(),
             name: "Foo".into(),
             path: PathBuf::from("/tmp/foo"),
+            supervisor: None,
             expanded: false,
             setup_script: Some("echo hi".into()),
             worktrees: vec![WorktreeConfig {
@@ -472,6 +499,72 @@ mod tests {
         let plain = GlobalConfig::default();
         save_global(&dir, &plain).unwrap();
         assert!(load_global(&dir).unwrap().remote.is_none());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn effective_remotes_folds_legacy_single_remote() {
+        // Legacy single `remote` with no `remotes` table → exposed as "remote".
+        let legacy = GlobalConfig {
+            remote: Some(RemoteConfig {
+                url: "old:7777".into(),
+            }),
+            ..GlobalConfig::default()
+        };
+        let eff = legacy.effective_remotes();
+        assert_eq!(eff.get("remote").unwrap().url, "old:7777");
+        assert_eq!(eff.len(), 1);
+
+        // A `remotes` table is used as-is; legacy folds in only if absent.
+        let mut remotes = BTreeMap::new();
+        remotes.insert(
+            "prod".to_string(),
+            RemoteConfig {
+                url: "prod:1".into(),
+            },
+        );
+        let both = GlobalConfig {
+            remotes,
+            remote: Some(RemoteConfig {
+                url: "old:7777".into(),
+            }),
+            ..GlobalConfig::default()
+        };
+        let eff = both.effective_remotes();
+        assert_eq!(eff.get("prod").unwrap().url, "prod:1");
+        assert_eq!(eff.get("remote").unwrap().url, "old:7777");
+        assert_eq!(eff.len(), 2);
+    }
+
+    #[test]
+    fn project_supervisor_round_trips() {
+        let dir = std::env::temp_dir().join(format!("imbuia-cfg-sup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("projects")).unwrap();
+        let proj = ProjectConfig {
+            slug: "p".into(),
+            name: "P".into(),
+            path: PathBuf::from("/tmp/p"),
+            supervisor: Some("prod".into()),
+            expanded: true,
+            setup_script: None,
+            worktrees: vec![],
+            launchers: Vec::new(),
+            github_enabled: false,
+            gh_poll_interval_secs: None,
+        };
+        save_project(&dir, &proj).unwrap();
+        assert_eq!(
+            load_project(&dir, "p").unwrap().supervisor.as_deref(),
+            Some("prod")
+        );
+        // Absent supervisor stays None (local).
+        let local = ProjectConfig {
+            supervisor: None,
+            ..proj
+        };
+        save_project(&dir, &local).unwrap();
+        assert!(load_project(&dir, "p").unwrap().supervisor.is_none());
         fs::remove_dir_all(&dir).unwrap();
     }
 

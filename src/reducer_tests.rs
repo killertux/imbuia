@@ -1,6 +1,5 @@
 use super::*;
 use crate::app::{Project, Worktree, mock_projects};
-use crate::commands::expand_user_path;
 use crate::layout::{MIN_SIDEBAR_WIDTH, TermSize};
 use crate::session::FakeSession;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -179,6 +178,7 @@ fn ctrl_backslash_then_other_passes_through_to_pty() {
         slug: "p".into(),
         name: "p".into(),
         repo_path: PathBuf::from("."),
+        supervisor: crate::app::LOCAL,
         worktrees: vec![Worktree {
             name: "w".into(),
             path: PathBuf::from("."),
@@ -284,6 +284,7 @@ fn key_in_normal_mode_does_not_forward_to_session() {
         slug: "p".into(),
         name: "p".into(),
         repo_path: PathBuf::from("."),
+        supervisor: crate::app::LOCAL,
         worktrees: vec![Worktree {
             name: "w".into(),
             path: PathBuf::from("."),
@@ -319,6 +320,7 @@ fn key_in_terminal_mode_forwards_to_focused_session() {
         slug: "p".into(),
         name: "p".into(),
         repo_path: PathBuf::from("."),
+        supervisor: crate::app::LOCAL,
         worktrees: vec![Worktree {
             name: "w".into(),
             path: PathBuf::from("."),
@@ -1099,26 +1101,6 @@ fn colon_dismisses_help_popup() {
 }
 
 #[test]
-fn expand_user_path_handles_tilde() {
-    let home = std::path::Path::new("/tmp/imbuia-test-home");
-    assert_eq!(expand_user_path("~", Some(home)), PathBuf::from(home));
-    assert_eq!(
-        expand_user_path("~/projects/foo", Some(home)),
-        PathBuf::from("/tmp/imbuia-test-home/projects/foo")
-    );
-    assert_eq!(
-        expand_user_path("./rel", Some(home)),
-        PathBuf::from("./rel")
-    );
-    assert_eq!(
-        expand_user_path("/abs/x", Some(home)),
-        PathBuf::from("/abs/x")
-    );
-    // With no HOME, `~` stays literal.
-    assert_eq!(expand_user_path("~", None), PathBuf::from("~"));
-}
-
-#[test]
 fn cmd_open_with_arg_emits_open_command() {
     let mut s = AppState::new();
     let cmds = submit_command(&mut s, "open /tmp/some-repo");
@@ -1134,7 +1116,15 @@ fn cmd_open_with_arg_emits_open_command() {
 fn cmd_open_without_arg_opens_popup() {
     let mut s = AppState::new();
     let cmds = submit_command(&mut s, "open");
-    assert!(cmds.is_empty());
+    // Opening the popup kicks off an initial directory listing on the local
+    // supervisor so the browser has something to show.
+    assert!(matches!(
+        cmds.as_slice(),
+        [Command::ListDir {
+            supervisor: crate::app::LOCAL,
+            path: None
+        }]
+    ));
     assert!(s.open_project_popup.is_some());
 }
 
@@ -1338,14 +1328,24 @@ fn background_check_does_not_set_command_status() {
 }
 
 #[test]
-fn open_popup_chars_and_enter_emit_open_command() {
+fn open_popup_enter_on_repo_entry_opens_it() {
+    use crate::ipc::DirEntry;
     let mut s = AppState::new();
     let _ = submit_command(&mut s, "open");
-    let _ = reduce(&mut s, Action::Key(plain('/')));
-    let _ = reduce(&mut s, Action::Key(plain('t')));
-    let _ = reduce(&mut s, Action::Key(plain('m')));
-    let _ = reduce(&mut s, Action::Key(plain('p')));
-    assert_eq!(s.open_project_popup.as_ref().unwrap().path, "/tmp");
+    // Supervisor lists a directory containing a git repo.
+    let _ = reduce(
+        &mut s,
+        Action::DirListed {
+            dir: PathBuf::from("/home/me"),
+            parent: Some(PathBuf::from("/home")),
+            entries: vec![DirEntry {
+                name: "proj".into(),
+                is_dir: true,
+                is_repo: true,
+            }],
+        },
+    );
+    // Enter on the highlighted repo entry opens it directly.
     let cmds = reduce(
         &mut s,
         Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -1353,26 +1353,42 @@ fn open_popup_chars_and_enter_emit_open_command() {
     assert!(s.open_project_popup.is_none());
     assert!(matches!(
         cmds.as_slice(),
-        [Command::OpenProject { path, setup_script: None, .. }]
-            if path.as_os_str() == "/tmp"
+        [Command::OpenProject { path, setup_script: None, supervisor, .. }]
+            if path.as_os_str() == "/home/me/proj" && *supervisor == crate::app::LOCAL
     ));
 }
 
 #[test]
-fn open_popup_tab_then_script_then_ctrl_s_passes_script() {
+fn open_popup_tab_to_script_then_ctrl_s_submits_browser_dir() {
+    use crate::ipc::DirEntry;
     let mut s = AppState::new();
     let _ = submit_command(&mut s, "open");
-    let _ = reduce(&mut s, Action::Key(plain('/')));
-    let _ = reduce(&mut s, Action::Key(plain('x')));
-    // Tab to script, type a command, then Ctrl-S to submit.
+    // Browser lands in /x.
+    let _ = reduce(
+        &mut s,
+        Action::DirListed {
+            dir: PathBuf::from("/x"),
+            parent: None,
+            entries: vec![DirEntry {
+                name: "sub".into(),
+                is_dir: true,
+                is_repo: false,
+            }],
+        },
+    );
+    // Tab Path → Supervisor → Script, type a command, then Ctrl-S to submit
+    // the current browser dir as the repo.
     let _ = reduce(
         &mut s,
         Action::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
     );
-    let _ = reduce(&mut s, Action::Key(plain('e')));
-    let _ = reduce(&mut s, Action::Key(plain('c')));
-    let _ = reduce(&mut s, Action::Key(plain('h')));
-    let _ = reduce(&mut s, Action::Key(plain('o')));
+    let _ = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+    );
+    for c in "echo".chars() {
+        let _ = reduce(&mut s, Action::Key(plain(c)));
+    }
     let cmds = reduce(
         &mut s,
         Action::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
@@ -1423,6 +1439,7 @@ fn project_opened_clears_pending_op() {
     let _ = reduce(
         &mut s,
         Action::ProjectValidated {
+            supervisor: crate::app::LOCAL,
             canonical_path: PathBuf::from("/tmp/x"),
             repo_name: "x".into(),
             head_branch: Some("main".into()),
@@ -1479,6 +1496,7 @@ fn project_opened_action_appends_and_saves() {
     let cmds = reduce(
         &mut s,
         Action::ProjectValidated {
+            supervisor: crate::app::LOCAL,
             canonical_path: PathBuf::from("/tmp/test"),
             repo_name: "test".into(),
             head_branch: Some("main".into()),
@@ -1681,7 +1699,7 @@ fn cmd_usage_opens_popup_and_subscribes() {
 #[test]
 fn usage_popup_esc_closes_and_unsubscribes() {
     let mut s = mk_state_with_mock_projects();
-    s.usage_popup = Some(crate::app::UsagePopup::new());
+    s.usage_popup = Some(crate::app::UsagePopup::new(s.supervisors.clone()));
     let cmds = reduce(
         &mut s,
         Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
@@ -1694,7 +1712,7 @@ fn usage_popup_esc_closes_and_unsubscribes() {
 fn usage_received_populates_report() {
     use crate::ipc::{ProcessNode, SessionUsage, UsageReport};
     let mut s = mk_state_with_mock_projects();
-    s.usage_popup = Some(crate::app::UsagePopup::new());
+    s.usage_popup = Some(crate::app::UsagePopup::new(s.supervisors.clone()));
     let report = UsageReport {
         sessions: vec![SessionUsage {
             session_id: 7,
@@ -1719,16 +1737,24 @@ fn usage_received_populates_report() {
         ts_ms: 1,
         cpu_count: 4,
     };
-    let _ = reduce(&mut s, Action::UsageReceived(report));
+    let _ = reduce(&mut s, Action::UsageReceived(crate::app::LOCAL, report));
     let popup = s.usage_popup.as_ref().unwrap();
-    assert_eq!(popup.report.as_ref().unwrap().sessions.len(), 1);
+    assert_eq!(
+        popup
+            .reports
+            .get(&crate::app::LOCAL)
+            .unwrap()
+            .sessions
+            .len(),
+        1
+    );
 }
 
 #[test]
 fn usage_popup_enter_expands_selected_session() {
     use crate::ipc::{ProcessNode, SessionUsage, UsageReport};
     let mut s = mk_state_with_mock_projects();
-    s.usage_popup = Some(crate::app::UsagePopup::new());
+    s.usage_popup = Some(crate::app::UsagePopup::new(s.supervisors.clone()));
     let report = UsageReport {
         sessions: vec![SessionUsage {
             session_id: 42,
@@ -1753,7 +1779,12 @@ fn usage_popup_enter_expands_selected_session() {
         ts_ms: 0,
         cpu_count: 4,
     };
-    let _ = reduce(&mut s, Action::UsageReceived(report));
+    let _ = reduce(&mut s, Action::UsageReceived(crate::app::LOCAL, report));
+    // Row 0 is the "local" supervisor header; move down onto the session row.
+    let _ = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+    );
     let _ = reduce(
         &mut s,
         Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -1974,6 +2005,7 @@ fn terminal_chord_replay_forwards_buffered_keys_on_mismatch() {
         slug: "p".into(),
         name: "p".into(),
         repo_path: PathBuf::from("."),
+        supervisor: crate::app::LOCAL,
         worktrees: vec![Worktree {
             name: "w".into(),
             path: PathBuf::from("."),

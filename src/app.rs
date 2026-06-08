@@ -32,6 +32,74 @@ pub enum SidebarRow {
     Worktree(usize, usize),
 }
 
+/// Identifies one supervisor connection. `LOCAL` is always present; remotes are
+/// numbered in config order. Stable for a process lifetime. The actual
+/// connection lives in `client::Supervisors`; this is just the handle that the
+/// pure reducer / `AppState` carry around.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SupervisorId(pub u32);
+
+/// The reserved id for the always-present local supervisor.
+pub const LOCAL: SupervisorId = SupervisorId(0);
+
+/// Read-only id↔name projection of the live supervisor registry, snapshotted
+/// into `AppState` so the pure reducer can resolve names for config/display and
+/// drive the open-project supervisor selector.
+#[derive(Clone, Debug, Default)]
+pub struct SupervisorDirectory {
+    /// `(id, name)` in display order — `LOCAL` first, then remotes by name.
+    pub entries: Vec<(SupervisorId, String)>,
+}
+
+impl SupervisorDirectory {
+    pub fn local_only() -> Self {
+        Self {
+            entries: vec![(LOCAL, "local".to_string())],
+        }
+    }
+
+    pub fn name_of(&self, id: SupervisorId) -> &str {
+        self.entries
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, n)| n.as_str())
+            .unwrap_or("local")
+    }
+
+    /// `None` (= local / default) when the name is unknown or "local".
+    pub fn config_name(&self, id: SupervisorId) -> Option<String> {
+        if id == LOCAL {
+            return None;
+        }
+        Some(self.name_of(id).to_string())
+    }
+
+    pub fn id_of(&self, name: &str) -> Option<SupervisorId> {
+        self.entries
+            .iter()
+            .find(|(_, n)| n == name)
+            .map(|(i, _)| *i)
+    }
+
+    /// Resolve a persisted project supervisor name (`None` = local). Falls back
+    /// to `LOCAL` for an unknown name (e.g. a remote dropped from config).
+    pub fn resolve(&self, name: Option<&str>) -> SupervisorId {
+        match name {
+            None => LOCAL,
+            Some(n) => self.id_of(n).unwrap_or(LOCAL),
+        }
+    }
+
+    /// Next id when cycling the selector (wraps). Used by the open popup.
+    pub fn next_after(&self, id: SupervisorId) -> SupervisorId {
+        if self.entries.is_empty() {
+            return LOCAL;
+        }
+        let pos = self.entries.iter().position(|(i, _)| *i == id).unwrap_or(0);
+        self.entries[(pos + 1) % self.entries.len()].0
+    }
+}
+
 pub struct Worktree {
     pub name: String,
     pub path: PathBuf,
@@ -44,6 +112,9 @@ pub struct Project {
     pub slug: String,
     pub name: String,
     pub repo_path: PathBuf,
+    /// Which supervisor hosts this project's repo + worktrees + sessions.
+    /// Resolved from the persisted name at load time (`LOCAL` by default).
+    pub supervisor: SupervisorId,
     pub worktrees: Vec<Worktree>,
     pub expanded: bool,
     /// Optional bash script executed in each new worktree on creation.
@@ -135,12 +206,29 @@ pub struct OpenProjectPopup {
     /// repo's existing git worktrees and adds any not already in the
     /// project. Toggled with Space / Enter while the Import row has focus.
     pub import_existing: bool,
+    /// Which supervisor the project will be created on. Cycled with the
+    /// Supervisor row; re-issues a `ListDir` against the new target.
+    pub supervisor: SupervisorId,
+    /// Filesystem browser state for the selected supervisor. Populated by
+    /// `Action::DirListed`. `None` until the first listing arrives.
+    pub browser: Option<DirBrowser>,
+}
+
+/// Directory-browser state inside the open-project popup. Entries are listed by
+/// the *selected supervisor* so remote paths are discoverable.
+#[derive(Clone, Debug)]
+pub struct DirBrowser {
+    pub dir: PathBuf,
+    pub parent: Option<PathBuf>,
+    pub entries: Vec<crate::ipc::DirEntry>,
+    pub cursor: u16,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum OpenProjectFocus {
     #[default]
     Path,
+    Supervisor,
     Script,
     Import,
 }
@@ -189,7 +277,15 @@ pub enum UpdateStatus {
 /// supervisor while open.
 #[derive(Debug, Clone)]
 pub struct UsagePopup {
-    pub report: Option<UsageReport>,
+    /// Latest report per supervisor, keyed by id. The popup renders one section
+    /// per entry (local first, then remotes).
+    pub reports: BTreeMap<SupervisorId, UsageReport>,
+    /// This client process's own usage, sampled locally (supervisors no longer
+    /// report the client pid — meaningless across hosts).
+    pub client: Option<crate::ipc::ProcessNode>,
+    /// id→name snapshot so the flat-row builder can label section headers
+    /// without the reducer/render passing the directory around.
+    pub supervisors: SupervisorDirectory,
     /// SessionIds whose subtree is expanded.
     pub expanded: std::collections::HashSet<SessionId>,
     /// Cursor row (index into the currently-visible flat row list).
@@ -197,9 +293,11 @@ pub struct UsagePopup {
 }
 
 impl UsagePopup {
-    pub fn new() -> Self {
+    pub fn new(supervisors: SupervisorDirectory) -> Self {
         Self {
-            report: None,
+            reports: BTreeMap::new(),
+            client: None,
+            supervisors,
             expanded: std::collections::HashSet::new(),
             cursor: 0,
         }
@@ -221,6 +319,10 @@ pub struct AppState {
     pub running: bool,
     pub sessions: HashMap<SessionId, Arc<dyn Session>>,
     pub projects: Vec<Project>,
+    /// id↔name projection of the live supervisor registry (local + remotes).
+    /// Snapshotted at startup; used to resolve project supervisor names for
+    /// config/display and to drive the open-project selector.
+    pub supervisors: SupervisorDirectory,
     /// Cursor in the sidebar: (project_idx, Some(worktree_idx)) on a worktree,
     /// or (project_idx, None) on a project header.
     pub sidebar_selection: Option<(usize, Option<usize>)>,
@@ -318,6 +420,7 @@ impl AppState {
             running: true,
             sessions: HashMap::new(),
             projects: Vec::new(),
+            supervisors: SupervisorDirectory::local_only(),
             sidebar_selection: None,
             active_worktree: None,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
@@ -381,6 +484,7 @@ pub fn mock_projects() -> Vec<Project> {
             slug: slug.into(),
             name: name.into(),
             repo_path: PathBuf::from("."),
+            supervisor: LOCAL,
             worktrees,
             expanded,
             setup_script: None,
@@ -397,7 +501,9 @@ pub fn mock_projects() -> Vec<Project> {
 }
 
 impl Project {
-    pub fn from_config(cfg: crate::config::ProjectConfig) -> Self {
+    /// Build from persisted config. `supervisor` is resolved by the caller
+    /// (which holds the [`SupervisorDirectory`]) from `cfg.supervisor`.
+    pub fn from_config(cfg: crate::config::ProjectConfig, supervisor: SupervisorId) -> Self {
         let worktrees = cfg
             .worktrees
             .into_iter()
@@ -413,6 +519,7 @@ impl Project {
             slug: cfg.slug,
             name: cfg.name,
             repo_path: cfg.path,
+            supervisor,
             worktrees,
             expanded: cfg.expanded,
             setup_script: cfg.setup_script,
@@ -429,11 +536,14 @@ impl Project {
         }
     }
 
-    pub fn to_config(&self) -> crate::config::ProjectConfig {
+    /// Serialize to persisted config. `supervisor_name` is `None` for the local
+    /// supervisor (omitted from the toml) or the remote's configured name.
+    pub fn to_config(&self, supervisor_name: Option<String>) -> crate::config::ProjectConfig {
         crate::config::ProjectConfig {
             slug: self.slug.clone(),
             name: self.name.clone(),
             path: self.repo_path.clone(),
+            supervisor: supervisor_name,
             expanded: self.expanded,
             setup_script: self.setup_script.clone(),
             worktrees: self
@@ -477,6 +587,8 @@ pub enum Action {
     /// — when `true`, the reducer fires an `ImportWorktrees` command once
     /// the project is in `state.projects`.
     ProjectValidated {
+        /// Supervisor the project was validated on / will be hosted by.
+        supervisor: SupervisorId,
         canonical_path: PathBuf,
         repo_name: String,
         head_branch: Option<String>,
@@ -501,13 +613,22 @@ pub enum Action {
     },
     /// Runtime → reducer: an async operation failed; show the message.
     OperationFailed(String),
-    /// Supervisor connection ended (steal-on-attach, socket EOF, read error).
-    /// The reducer wipes the session map and exits — the local PTY state is
-    /// gone, and any further writes would silently no-op. Relaunch to attach
-    /// to a fresh supervisor.
-    SupervisorLost(String),
-    /// Supervisor → reducer: a fresh resource-usage snapshot arrived.
-    UsageReceived(UsageReport),
+    /// A supervisor connection ended (steal-on-attach, socket EOF, read error).
+    /// Losing the **local** supervisor wipes the session map and exits; losing a
+    /// **remote** just drops that supervisor's sessions and shows a message —
+    /// the rest of the app keeps running.
+    SupervisorLost(SupervisorId, String),
+    /// Supervisor → reducer: a fresh resource-usage snapshot from one
+    /// supervisor (tagged so the popup can segregate per-supervisor).
+    UsageReceived(SupervisorId, UsageReport),
+    /// Local self-sampler tick: this client process's own usage node.
+    LocalUsageSampled(crate::ipc::ProcessNode),
+    /// Supervisor → reducer: directory listing for the open-project browser.
+    DirListed {
+        dir: PathBuf,
+        parent: Option<PathBuf>,
+        entries: Vec<crate::ipc::DirEntry>,
+    },
     /// Background updater finished a check. `Ok(None)` means "up to date".
     UpdateChecked(Result<Option<crate::updater::UpdateInfo>, String>),
     /// Updater thread finished an install attempt.
@@ -583,8 +704,19 @@ impl std::fmt::Debug for Action {
                 .field("count", &entries.len())
                 .finish(),
             Action::OperationFailed(s) => f.debug_tuple("OperationFailed").field(s).finish(),
-            Action::SupervisorLost(s) => f.debug_tuple("SupervisorLost").field(s).finish(),
-            Action::UsageReceived(_) => write!(f, "UsageReceived(..)"),
+            Action::SupervisorLost(sup, s) => {
+                f.debug_tuple("SupervisorLost").field(sup).field(s).finish()
+            }
+            Action::UsageReceived(sup, _) => f
+                .debug_struct("UsageReceived")
+                .field("supervisor", sup)
+                .finish(),
+            Action::LocalUsageSampled(_) => write!(f, "LocalUsageSampled(..)"),
+            Action::DirListed { dir, entries, .. } => f
+                .debug_struct("DirListed")
+                .field("dir", dir)
+                .field("count", &entries.len())
+                .finish(),
             Action::UpdateChecked(r) => f.debug_tuple("UpdateChecked").field(r).finish(),
             Action::UpdateInstalled(r) => f.debug_tuple("UpdateInstalled").field(r).finish(),
             Action::PeriodicUpdateCheck => write!(f, "PeriodicUpdateCheck"),
@@ -624,6 +756,8 @@ pub enum Command {
     /// `initial_command`, when set, is written verbatim to the PTY immediately
     /// after spawn (followed by a newline) so the shell executes it.
     SpawnInWorktree {
+        /// Which supervisor hosts the destination project.
+        supervisor: SupervisorId,
         rows: u16,
         cols: u16,
         cwd: PathBuf,
@@ -649,12 +783,21 @@ pub enum Command {
     /// (client-side). Asynchronous: the supervisor replies and the client
     /// reader posts `Action::ProjectValidated` or `Action::OperationFailed`.
     OpenProject {
+        /// Supervisor to validate against + host the new project.
+        supervisor: SupervisorId,
         path: PathBuf,
         setup_script: Option<String>,
         /// If `true`, the reducer auto-dispatches `ImportWorktrees` once the
         /// project lands. Set by the `[x] Import existing worktrees` toggle
         /// in the open-project popup.
         import_existing: bool,
+    },
+    /// Ask a supervisor to list a directory (for the open-project browser).
+    /// Replies via `Action::DirListed` / `Action::OperationFailed`.
+    ListDir {
+        supervisor: SupervisorId,
+        /// `None` = the supervisor's home directory.
+        path: Option<PathBuf>,
     },
     /// Run `git worktree list --porcelain` and append every entry not
     /// already in the project. Asynchronous.

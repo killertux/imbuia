@@ -34,7 +34,12 @@ type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 /// frames arriving from the supervisor (Dump on attach, Delta as live PTY
 /// output flows).
 pub(crate) struct ProxySession {
-    id: SessionId,
+    /// Client-global id (unique across all supervisors); the key in
+    /// `AppState.sessions` and `Worktree.sessions`. Returned by `Session::id`.
+    global_id: SessionId,
+    /// Per-supervisor wire id (what the owning supervisor knows this session
+    /// as). Used on every outbound `ClientMsg`.
+    local_id: SessionId,
     parser: Arc<Mutex<vt100::Parser>>,
     /// Inner app's keyboard-input protocol, inferred from its PTY output (vt100
     /// doesn't track it). Fed by the reader thread, read by `write_key` to pick
@@ -63,6 +68,7 @@ struct PendingSpawn {
 /// the reducer is unchanged.
 enum PendingOp {
     OpenProject {
+        supervisor: crate::app::SupervisorId,
         setup_script: Option<String>,
         import_existing: bool,
     },
@@ -79,6 +85,8 @@ enum PendingOp {
     FetchPr {
         project_idx: usize,
     },
+    /// Open-project directory browser listing.
+    ListDir,
 }
 
 /// Build a local `Worktree` from a wire entry, mirroring the name-fallback the
@@ -114,20 +122,35 @@ fn op_result_to_action(pending: PendingOp, result: OpResult) -> Option<Action> {
                 project_idx,
                 message: e,
             },
+            PendingOp::ListDir => Action::OperationFailed(format!("list dir: {e}")),
         }),
         Ok(ok) => match (pending, ok) {
             (
                 PendingOp::OpenProject {
+                    supervisor,
                     setup_script,
                     import_existing,
                 },
                 OpOk::Validated(info),
             ) => Some(Action::ProjectValidated {
+                supervisor,
                 canonical_path: info.canonical_path,
                 repo_name: info.repo_name,
                 head_branch: info.head_branch,
                 setup_script,
                 import_existing,
+            }),
+            (
+                PendingOp::ListDir,
+                OpOk::DirListing {
+                    dir,
+                    parent,
+                    entries,
+                },
+            ) => Some(Action::DirListed {
+                dir,
+                parent,
+                entries,
             }),
             (PendingOp::ImportWorktrees { project_idx }, OpOk::Worktrees(entries)) => {
                 Some(Action::WorktreesImported {
@@ -184,7 +207,7 @@ impl ProxySession {
 
 impl Session for ProxySession {
     fn id(&self) -> SessionId {
-        self.id
+        self.global_id
     }
 
     fn write_key(&self, key: KeyEvent) -> io::Result<()> {
@@ -197,7 +220,10 @@ impl Session for ProxySession {
         if bytes.is_empty() {
             return Ok(());
         }
-        self.send(ClientMsg::WriteBytes { id: self.id, bytes })
+        self.send(ClientMsg::WriteBytes {
+            id: self.local_id,
+            bytes,
+        })
     }
 
     fn write_paste(&self, text: &str) -> io::Result<()> {
@@ -230,7 +256,10 @@ impl Session for ProxySession {
             if is_last && bracketed {
                 bytes.extend_from_slice(b"\x1b[201~");
             }
-            self.send(ClientMsg::WriteBytes { id: self.id, bytes })?;
+            self.send(ClientMsg::WriteBytes {
+                id: self.local_id,
+                bytes,
+            })?;
             first = false;
             off = end;
             if is_last {
@@ -260,14 +289,17 @@ impl Session for ProxySession {
         if !shift_bypass {
             let bytes = encode_mouse(ev, mode, enc);
             if !bytes.is_empty() {
-                return self.send(ClientMsg::WriteBytes { id: self.id, bytes });
+                return self.send(ClientMsg::WriteBytes {
+                    id: self.local_id,
+                    bytes,
+                });
             }
         }
         if !shift_bypass && alt_screen && is_scroll {
             let arrow_bytes = scroll_as_arrows(ev.kind, app_cursor, 3);
             if !arrow_bytes.is_empty() {
                 return self.send(ClientMsg::WriteBytes {
-                    id: self.id,
+                    id: self.local_id,
                     bytes: arrow_bytes,
                 });
             }
@@ -292,11 +324,15 @@ impl Session for ProxySession {
         p.screen_mut().set_size(rows, cols);
         drop(p);
         self.send(ClientMsg::Resize {
-            id: self.id,
+            id: self.local_id,
             rows,
             cols,
         })?;
         Ok(())
+    }
+
+    fn kill(&self) {
+        let _ = self.send(ClientMsg::Kill { id: self.local_id });
     }
 
     fn parser(&self) -> &Mutex<vt100::Parser> {
@@ -304,11 +340,19 @@ impl Session for ProxySession {
     }
 }
 
-/// The client end of the supervisor connection. Owns the writer side of the
-/// socket and a registry of [`ProxySession`]s for incoming frame routing.
+/// The client end of one supervisor connection. Owns the writer side of the
+/// socket and a registry of [`ProxySession`]s (keyed by per-supervisor wire id)
+/// for incoming frame routing.
 pub struct SupervisorClient {
+    /// Which supervisor this connection talks to (for tagging Actions so the
+    /// reducer/usage popup can attribute output to the right host).
+    sup_id: crate::app::SupervisorId,
     tx: ClientTx,
+    /// Keyed by per-supervisor wire id (what frames carry).
     sessions: Arc<Mutex<HashMap<SessionId, Arc<ProxySession>>>>,
+    /// Mints client-global session ids, shared across all supervisor
+    /// connections so ids never collide between hosts.
+    global_ids: Arc<AtomicU64>,
     pending_spawns: Arc<Mutex<HashMap<u64, PendingSpawn>>>,
     /// In-flight `Op` continuations, keyed by `request_id` (shares the
     /// `next_request` counter with `pending_spawns`).
@@ -331,8 +375,10 @@ impl SupervisorClient {
     /// session — used on attach to re-bind resumed sessions to local tabs.
     pub fn adopt(&self, meta: &SessionMeta) -> Arc<ProxySession> {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(meta.rows, meta.cols, 10_000)));
+        let global_id = self.global_ids.fetch_add(1, Ordering::Relaxed);
         let proxy = Arc::new(ProxySession {
-            id: meta.id,
+            global_id,
+            local_id: meta.id,
             parser,
             kbd: Arc::new(Mutex::new(input::KbdTracker::default())),
             tx: self.tx.clone(),
@@ -344,6 +390,11 @@ impl SupervisorClient {
             .insert(meta.id, Arc::clone(&proxy));
         let _ = self.tx.send(ClientMsg::Attach { id: meta.id });
         proxy
+    }
+
+    /// This connection's supervisor id (for tagging Actions client-side).
+    pub fn supervisor_id(&self) -> crate::app::SupervisorId {
+        self.sup_id
     }
 
     /// Queue a spawn request. The reader task will post
@@ -411,17 +462,24 @@ impl SupervisorClient {
     /// persists the project (config logic stays client-side).
     pub fn request_open_project(
         &self,
+        supervisor: crate::app::SupervisorId,
         repo_path: PathBuf,
         setup_script: Option<String>,
         import_existing: bool,
     ) -> Result<()> {
         self.send_op(
             PendingOp::OpenProject {
+                supervisor,
                 setup_script,
                 import_existing,
             },
             OpRequest::Validate { repo_path },
         )
+    }
+
+    /// List a directory on this supervisor for the open-project browser.
+    pub fn request_list_dir(&self, path: Option<PathBuf>) -> Result<()> {
+        self.send_op(PendingOp::ListDir, OpRequest::ListDir { path })
     }
 
     pub fn request_import_worktrees(&self, project_idx: usize, repo_path: PathBuf) -> Result<()> {
@@ -480,20 +538,122 @@ impl SupervisorClient {
     }
 }
 
-/// Attach to a supervisor and handshake. With `remote` set, connects to the
-/// remote supervisor over TCP+TLS (no local spawn). Otherwise probes the local
-/// Unix socket, spawning a supervisor if none is alive.
-pub async fn connect_or_spawn(
+/// All live supervisor connections: the always-present local one plus every
+/// configured remote (each `Some` when reachable, `None` when it failed to
+/// connect at startup). The reducer-facing [`SupervisorDirectory`] is derived
+/// from this.
+pub struct Supervisors {
+    entries: Vec<SupervisorEntry>,
+}
+
+struct SupervisorEntry {
+    id: crate::app::SupervisorId,
+    name: String,
+    client: Option<Arc<SupervisorClient>>,
+}
+
+impl Supervisors {
+    /// The connected client for `id`, or `None` if unconfigured/unreachable.
+    pub fn get(&self, id: crate::app::SupervisorId) -> Option<&Arc<SupervisorClient>> {
+        self.entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.client.as_ref())
+    }
+
+    pub fn name_of(&self, id: crate::app::SupervisorId) -> &str {
+        self.entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.name.as_str())
+            .unwrap_or("local")
+    }
+
+    /// Iterate every currently-connected client (for usage fan-out, rebind).
+    pub fn connected(&self) -> impl Iterator<Item = &Arc<SupervisorClient>> {
+        self.entries.iter().filter_map(|e| e.client.as_ref())
+    }
+
+    /// id↔name projection for `AppState`.
+    pub fn directory(&self) -> crate::app::SupervisorDirectory {
+        crate::app::SupervisorDirectory {
+            entries: self
+                .entries
+                .iter()
+                .map(|e| (e.id, e.name.clone()))
+                .collect(),
+        }
+    }
+}
+
+/// Connect the local supervisor (auto-spawning if needed) plus every configured
+/// remote, best-effort. The local connection is required; a remote that fails
+/// to connect is logged and left `None` (its projects surface an error on use).
+pub async fn connect_all(
     config_dir: &Path,
-    remote: Option<config::RemoteConfig>,
+    global: &config::GlobalConfig,
+    notify: Arc<Notify>,
+    action_tx: mpsc::Sender<Action>,
+) -> Result<Supervisors> {
+    use crate::app::{LOCAL, SupervisorId};
+    let global_ids = Arc::new(AtomicU64::new(1));
+
+    // Local (required).
+    let (rd, wr) = connect_local().await?;
+    let local = handshake(
+        rd,
+        wr,
+        LOCAL,
+        Arc::clone(&global_ids),
+        Arc::clone(&notify),
+        action_tx.clone(),
+    )
+    .await?;
+    let mut entries = vec![SupervisorEntry {
+        id: LOCAL,
+        name: "local".into(),
+        client: Some(local),
+    }];
+
+    // Remotes (best-effort), numbered in config order.
+    for (i, (name, cfg)) in global.effective_remotes().into_iter().enumerate() {
+        let id = SupervisorId(i as u32 + 1);
+        let client = match connect_remote_handshake(
+            config_dir,
+            &cfg.url,
+            id,
+            Arc::clone(&global_ids),
+            Arc::clone(&notify),
+            action_tx.clone(),
+        )
+        .await
+        {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(name = %name, url = %cfg.url, "remote supervisor unavailable: {e:#}");
+                None
+            }
+        };
+        entries.push(SupervisorEntry { id, name, client });
+    }
+
+    Ok(Supervisors { entries })
+}
+
+/// Connect + handshake one remote, with an overall timeout so a dead host
+/// doesn't stall startup.
+async fn connect_remote_handshake(
+    config_dir: &Path,
+    url: &str,
+    sup_id: crate::app::SupervisorId,
+    global_ids: Arc<AtomicU64>,
     notify: Arc<Notify>,
     action_tx: mpsc::Sender<Action>,
 ) -> Result<Arc<SupervisorClient>> {
-    let (rd, wr) = match remote {
-        Some(cfg) => connect_remote(config_dir, &cfg.url).await?,
-        None => connect_local().await?,
-    };
-    handshake(rd, wr, notify, action_tx).await
+    let (rd, wr) = tokio::time::timeout(Duration::from_secs(5), connect_remote(config_dir, url))
+        .await
+        .context("remote connect timed out")??;
+    handshake(rd, wr, sup_id, global_ids, notify, action_tx).await
 }
 
 /// Connect to (or spawn + wait for) the local Unix-socket supervisor.
@@ -537,6 +697,8 @@ async fn connect_remote(config_dir: &Path, url: &str) -> Result<(BoxRead, BoxWri
 async fn handshake(
     mut rd: BoxRead,
     mut wr: BoxWrite,
+    sup_id: crate::app::SupervisorId,
+    global_ids: Arc<AtomicU64>,
     notify: Arc<Notify>,
     action_tx: mpsc::Sender<Action>,
 ) -> Result<Arc<SupervisorClient>> {
@@ -582,8 +744,10 @@ async fn handshake(
     });
 
     let client = Arc::new(SupervisorClient {
+        sup_id,
         tx,
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        global_ids,
         pending_spawns: Arc::new(Mutex::new(HashMap::new())),
         pending_ops: Arc::new(Mutex::new(HashMap::new())),
         notify,
@@ -602,7 +766,9 @@ fn spawn_reader(client: Arc<SupervisorClient>, mut rd: BoxRead, action_tx: mpsc:
                 Ok(m) => m,
                 Err(e) => {
                     tracing::warn!("supervisor read ended: {e}");
-                    let _ = action_tx.send(Action::SupervisorLost(format!("{e}"))).await;
+                    let _ = action_tx
+                        .send(Action::SupervisorLost(client.sup_id, format!("{e}")))
+                        .await;
                     return;
                 }
             };
@@ -617,8 +783,12 @@ fn spawn_reader(client: Arc<SupervisorClient>, mut rd: BoxRead, action_tx: mpsc:
                             pending.cols,
                             10_000,
                         )));
+                        // Mint a client-global id so this session never collides
+                        // with another supervisor's id space.
+                        let global_id = client.global_ids.fetch_add(1, Ordering::Relaxed);
                         let proxy = Arc::new(ProxySession {
-                            id,
+                            global_id,
+                            local_id: id,
                             parser,
                             kbd: Arc::new(Mutex::new(input::KbdTracker::default())),
                             tx: client.tx.clone(),
@@ -645,6 +815,7 @@ fn spawn_reader(client: Arc<SupervisorClient>, mut rd: BoxRead, action_tx: mpsc:
                 }
                 SupervisorMsg::OutputDump { id, bytes }
                 | SupervisorMsg::OutputDelta { id, bytes } => {
+                    // Routed by per-supervisor wire id (the map's key).
                     let sess = client.sessions.lock().unwrap().get(&id).cloned();
                     if let Some(sess) = sess {
                         if let Ok(mut p) = sess.parser.lock() {
@@ -659,15 +830,27 @@ fn spawn_reader(client: Arc<SupervisorClient>, mut rd: BoxRead, action_tx: mpsc:
                     }
                 }
                 SupervisorMsg::Exited { id } => {
-                    client.sessions.lock().unwrap().remove(&id);
-                    let _ = action_tx.send(Action::SessionExited(id)).await;
+                    // Translate wire id → client-global id for AppState.
+                    let global = client
+                        .sessions
+                        .lock()
+                        .unwrap()
+                        .remove(&id)
+                        .map(|p| p.global_id);
+                    if let Some(global) = global {
+                        let _ = action_tx.send(Action::SessionExited(global)).await;
+                    }
                 }
                 SupervisorMsg::Detached { reason } => {
-                    let _ = action_tx.send(Action::SupervisorLost(reason)).await;
+                    let _ = action_tx
+                        .send(Action::SupervisorLost(client.sup_id, reason))
+                        .await;
                     return;
                 }
                 SupervisorMsg::Usage(report) => {
-                    let _ = action_tx.send(Action::UsageReceived(report)).await;
+                    let _ = action_tx
+                        .send(Action::UsageReceived(client.sup_id, report))
+                        .await;
                 }
                 SupervisorMsg::OpResult { request_id, result } => {
                     let pending = client.pending_ops.lock().unwrap().remove(&request_id);
