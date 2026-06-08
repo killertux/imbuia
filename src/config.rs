@@ -320,6 +320,24 @@ pub fn load_authorized_fingerprints(dir: &Path) -> std::collections::HashSet<Str
         .collect()
 }
 
+/// Append a client `fingerprint` to authorized_keys with a `comment` (used by
+/// the supervisor's trust-on-first-connect to pin the first client).
+pub fn append_authorized_key(dir: &Path, fingerprint: &str, comment: &str) -> Result<()> {
+    use std::io::Write;
+    let path = authorized_keys_path(dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    writeln!(f, "{fingerprint}  # {comment}")
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

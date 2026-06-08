@@ -20,7 +20,7 @@ use anyhow::{Context, Result, anyhow};
 use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{
@@ -154,6 +154,7 @@ pub fn server_config(id: &Identity, dir: &Path) -> Result<Arc<ServerConfig>> {
     let verifier = Arc::new(AuthorizedKeysVerifier {
         dir: dir.to_path_buf(),
         algs,
+        tofu_lock: Mutex::new(()),
     });
     let cfg = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -250,11 +251,17 @@ impl ServerCertVerifier for TofuServerVerifier {
     }
 }
 
-/// Supervisor-side: admit only client fingerprints in `authorized_keys`.
+/// Supervisor-side: admit client fingerprints in `authorized_keys`. When that
+/// file is empty (fresh install), the first client to connect is trusted and
+/// pinned — the supervisor-side analog of the client's `known_hosts` TOFU, so
+/// remote setup needs no manual key exchange.
 #[derive(Debug)]
 struct AuthorizedKeysVerifier {
     dir: PathBuf,
     algs: WebPkiSupportedAlgorithms,
+    /// Serializes the empty-check + first-pin so two simultaneous first
+    /// connections can't both get pinned.
+    tofu_lock: Mutex<()>,
 }
 
 impl ClientCertVerifier for AuthorizedKeysVerifier {
@@ -278,7 +285,16 @@ impl ClientCertVerifier for AuthorizedKeysVerifier {
     ) -> Result<ClientCertVerified, TlsError> {
         let fp = fingerprint_of_cert(end_entity)
             .map_err(|e| TlsError::General(format!("fingerprint: {e}")))?;
-        if config::load_authorized_fingerprints(&self.dir).contains(&fp) {
+        // Serialize so concurrent first-connections can't both pin.
+        let _guard = self.tofu_lock.lock().unwrap();
+        let authorized = config::load_authorized_fingerprints(&self.dir);
+        if authorized.is_empty() {
+            // Trust-on-first-connect: pin this client and admit it.
+            config::append_authorized_key(&self.dir, &fp, "pinned on first connect")
+                .map_err(|e| TlsError::General(format!("persisting authorized_key: {e}")))?;
+            tracing::warn!(fingerprint = %fp, "TOFU: pinned first client in authorized_keys");
+            Ok(ClientCertVerified::assertion())
+        } else if authorized.contains(&fp) {
             tracing::info!(fingerprint = %fp, "client authorized");
             Ok(ClientCertVerified::assertion())
         } else {
@@ -452,7 +468,9 @@ mod tests {
         let sdir = tmpdir("s-no");
         let cid = load_or_create_identity(&cdir).unwrap();
         let sid = load_or_create_identity(&sdir).unwrap();
-        // Intentionally do NOT add cid to the server's authorized_keys.
+        // Non-empty authorized_keys (some *other* client) so TOFU is closed and
+        // our unknown client is genuinely rejected.
+        config::append_authorized_key(&sdir, &"b".repeat(64), "someone else").unwrap();
 
         let (addr, server) = echo_server(server_config(&sid, &sdir).unwrap()).await;
 
@@ -480,6 +498,41 @@ mod tests {
             "unauthorized client must not complete a round-trip"
         );
         assert!(!server.await.unwrap(), "server must reject the handshake");
+
+        std::fs::remove_dir_all(&cdir).unwrap();
+        std::fs::remove_dir_all(&sdir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_authorized_keys_pins_first_client() {
+        init();
+        let cdir = tmpdir("c-first");
+        let sdir = tmpdir("s-first");
+        let cid = load_or_create_identity(&cdir).unwrap();
+        let sid = load_or_create_identity(&sdir).unwrap();
+        // authorized_keys does not exist yet → trust-on-first-connect.
+        assert!(config::load_authorized_fingerprints(&sdir).is_empty());
+
+        let (addr, server) = echo_server(server_config(&sid, &sdir).unwrap()).await;
+        let connector =
+            tokio_rustls::TlsConnector::from(client_config(&cid, "localhost", &cdir).unwrap());
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut tls = connector
+            .connect(server_name("localhost").unwrap(), tcp)
+            .await
+            .expect("first client should be trusted");
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tls.write_all(&[9]).await.unwrap();
+        tls.flush().await.unwrap();
+        let mut b = [0u8; 1];
+        tls.read_exact(&mut b).await.unwrap();
+        assert_eq!(b[0], 9);
+        assert!(server.await.unwrap());
+
+        // The first client's key is now pinned, so the file is no longer empty.
+        let pinned = config::load_authorized_fingerprints(&sdir);
+        assert!(pinned.contains(&cid.fingerprint));
+        assert_eq!(pinned.len(), 1);
 
         std::fs::remove_dir_all(&cdir).unwrap();
         std::fs::remove_dir_all(&sdir).unwrap();

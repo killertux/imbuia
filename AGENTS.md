@@ -51,7 +51,7 @@ codebase. Humans should read `README.md` first.
 | `client.rs`       | `ProxySession` (client-side `Session` impl over the socket), async `connect_or_spawn` (local UDS or remote TCP+TLS), double-fork helpers, reader + writer tasks. |
 | `supervisor.rs`   | `imbuia --supervisor` entry: owns a tokio runtime; PTY spawn/own (portable-pty + vt100) on blocking threads; UDS accept loop (always) + optional TCP+TLS acceptor (`--listen`); per-client async `handle_conn`. |
 | `ipc.rs`          | Shared wire types (`ClientMsg`, `SupervisorMsg`, `Handshake*`), framed bincode read/write (sync twins are test-only; the live transport uses `read_frame_async`/`write_frame_async`), socket path resolution. |
-| `transport.rs`    | Optional remote transport: Ed25519 identity load/gen, SPKI fingerprints, rustls (ring) client/server configs with pinned-key verifiers (TOFU `known_hosts` client-side, `authorized_keys` supervisor-side). |
+| `transport.rs`    | Optional remote transport: Ed25519 identity load/gen, SPKI fingerprints, rustls (ring) client/server configs with pinned-key verifiers. Both sides TOFU: client pins the supervisor in `known_hosts`; supervisor pins the first client into `authorized_keys` when empty. |
 | `input.rs`        | crossterm `Event` → `Action`; `encode_key` with DECCKM handling + kitty/modifyOtherKeys passthrough; `KbdTracker` infers the inner app's keyboard protocol from its output. |
 | `layout.rs`       | `chrome()` → sidebar/tab_bar/terminal/action_bar rects.          |
 | `render.rs`       | ratatui rendering. Reads from vt100 `Screen` cell-by-cell.       |
@@ -137,10 +137,13 @@ crossterm Event ─► input::map ─► Action ─┐
   UDS. Start the remote daemon with `imbuia --supervisor --listen host:port`
   (it still binds its local UDS too). Trust is SSH-style pinned keys, not
   CA/PKI: each side has an Ed25519 `identity.key` in its config dir; the
-  fingerprint is `sha256(SPKI)` (stable across cert regen). The client pins
-  the supervisor's key **TOFU** in `known_hosts`; the supervisor admits only
-  client fingerprints in `authorized_keys`. All in `transport.rs`. The local
-  UDS path is unauthenticated (filesystem perms are the boundary).
+  fingerprint is `sha256(SPKI)` (stable across cert regen). Both directions
+  are **TOFU**: the client pins the supervisor's key in `known_hosts` on first
+  connect; the supervisor, when `authorized_keys` is empty, pins the *first*
+  client that connects and admits only listed fingerprints thereafter (so a
+  fresh remote needs no manual key exchange — add more clients by hand). All
+  in `transport.rs`. The local UDS path is unauthenticated (filesystem perms
+  are the boundary).
 - **Single client at a time.** The supervisor's accept loop hands the new
   client an exclusive slot. The old client (if any) gets
   `SupervisorMsg::Detached`, then its `CancellationToken` is fired to tear
