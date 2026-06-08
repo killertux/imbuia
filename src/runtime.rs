@@ -32,7 +32,13 @@ pub async fn run() -> Result<()> {
     // Attach to (or spawn) the supervisor before we start polling input —
     // resumed sessions need to be wired into AppState first so output frames
     // arriving immediately after handshake can find their parsers.
-    let supervisor = client::connect_or_spawn(Arc::clone(&notify), action_tx.clone())?;
+    let supervisor = client::connect_or_spawn(
+        &config_dir,
+        global.remote.clone(),
+        Arc::clone(&notify),
+        action_tx.clone(),
+    )
+    .await?;
 
     spawn_input_thread(action_tx.clone());
 
@@ -301,6 +307,11 @@ fn execute(
                     .collect(),
                 gh_poll_interval_secs: state.gh_poll_interval_secs,
                 keybinds: state.keybinds_config.clone(),
+                // `remote` is hand-edited config the UI never owns; preserve
+                // whatever is on disk so a save doesn't wipe it.
+                remote: config::load_global(&state.config_dir)
+                    .ok()
+                    .and_then(|g| g.remote),
             };
             if let Err(e) = config::save_global(&state.config_dir, &global) {
                 tracing::warn!("save_global failed: {e}");

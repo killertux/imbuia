@@ -11,11 +11,11 @@ codebase. Humans should read `README.md` first.
   reducer. New side effects are new `Command` variants executed by
   `src/runtime.rs::execute`.
 - **Do not block the main task.** Tokio's main task in `runtime.rs` only
-  orchestrates the event loop. Client-side blocking IO (IPC frame write,
-  config write) happens on `std::thread::spawn`; results come back as
-  `Action`s via `mpsc::Sender<Action>`. **Git/`gh` no longer run client-side
-  at all** — they're shipped to the supervisor as `ClientMsg::Op` (see Async
-  ops contract).
+  orchestrates the event loop. IPC framing runs on dedicated tokio reader +
+  writer tasks (`client.rs`); inbound frames come back as `Action`s via
+  `mpsc::Sender<Action>`. Config writes are quick synchronous calls in
+  `runtime::execute`. **Git/`gh` no longer run client-side at all** — they're
+  shipped to the supervisor as `ClientMsg::Op` (see Async ops contract).
 - **Disk/process work belongs in the supervisor.** Git and `gh` run inside
   the supervisor process so it can one day run remotely; the client keeps
   only config + rendering. Don't add `Command::new("git")`/`gh` calls to the
@@ -25,7 +25,7 @@ codebase. Humans should read `README.md` first.
   owned by a long-lived sibling process started via `imbuia --supervisor`.
   Sessions survive client restarts. See **Supervisor split** below.
 - **The supervisor → screen path bypasses the reducer.** The client's
-  reader thread (`client::spawn_reader`) reads `SupervisorMsg::OutputDump`/
+  reader task (`client::spawn_reader`) reads `SupervisorMsg::OutputDump`/
   `OutputDelta` frames, feeds bytes into the matching session's local
   vt100 `Parser`, then calls `notify_one()` on a `tokio::sync::Notify` so
   the render loop wakes up. Keep it that way — routing through the
@@ -48,9 +48,10 @@ codebase. Humans should read `README.md` first.
 | `git.rs`          | `std::process::Command` wrappers (`validate_repo`, `head_branch`, `worktree_add`, `worktree_remove`). **Run inside the supervisor**, not the client (see Disk ops below). |
 | `github.rs`       | `gh` CLI wrapper for PR status. Also **run inside the supervisor**. |
 | `session.rs`      | `Session` trait + `FakeSession` for tests. The real impl is in `client.rs`. |
-| `client.rs`       | `ProxySession` (client-side `Session` impl over the socket), `connect_or_spawn`, double-fork helpers, reader task. |
-| `supervisor.rs`   | `imbuia --supervisor` entry: PTY spawn/own (portable-pty + vt100), single-client accept loop, frame dispatcher. |
-| `ipc.rs`          | Shared wire types (`ClientMsg`, `SupervisorMsg`, `Handshake*`), framed bincode read/write, socket path resolution. |
+| `client.rs`       | `ProxySession` (client-side `Session` impl over the socket), async `connect_or_spawn` (local UDS or remote TCP+TLS), double-fork helpers, reader + writer tasks. |
+| `supervisor.rs`   | `imbuia --supervisor` entry: owns a tokio runtime; PTY spawn/own (portable-pty + vt100) on blocking threads; UDS accept loop (always) + optional TCP+TLS acceptor (`--listen`); per-client async `handle_conn`. |
+| `ipc.rs`          | Shared wire types (`ClientMsg`, `SupervisorMsg`, `Handshake*`), framed bincode read/write (sync twins are test-only; the live transport uses `read_frame_async`/`write_frame_async`), socket path resolution. |
+| `transport.rs`    | Optional remote transport: Ed25519 identity load/gen, SPKI fingerprints, rustls (ring) client/server configs with pinned-key verifiers (TOFU `known_hosts` client-side, `authorized_keys` supervisor-side). |
 | `input.rs`        | crossterm `Event` → `Action`; `encode_key` with DECCKM handling + kitty/modifyOtherKeys passthrough; `KbdTracker` infers the inner app's keyboard protocol from its output. |
 | `layout.rs`       | `chrome()` → sidebar/tab_bar/terminal/action_bar rects.          |
 | `render.rs`       | ratatui rendering. Reads from vt100 `Screen` cell-by-cell.       |
@@ -112,19 +113,40 @@ crossterm Event ─► input::map ─► Action ─┐
 
 - **Single binary, two roles.** `imbuia` (no args) is the client; `imbuia
   --supervisor` is the daemon. `main.rs` branches on the flag before any
-  TTY setup so the supervisor never touches raw mode.
+  TTY setup so the supervisor never touches raw mode. Both roles call
+  `transport::init()` to install the ring rustls provider.
+- **Async transport, two backends.** Both the client and supervisor speak
+  the framed protocol over a tokio `AsyncRead + AsyncWrite` stream, split
+  with `tokio::io::split` into a reader task + a writer task. The backend is
+  either a local `UnixStream` (default) or a `tokio_rustls` TLS stream over
+  TCP (remote). The framing (`*_async`) and the per-client `handle_conn` /
+  reader loop are transport-agnostic. The supervisor's PTY/reaper/usage/op
+  work stays on blocking `std::thread`s and pushes frames via the tokio
+  channel using `blocking_send`/`try_send` (legal off-runtime).
 - **Socket layout.** `$XDG_RUNTIME_DIR/imbuia/sock` (preferred on Linux),
   else `$XDG_CACHE_HOME/imbuia/sock`, else `~/.cache/imbuia/sock`.
   Sibling files: `supervisor.pid`, `supervisor.log`. See
   `ipc::resolve_socket_path`.
-- **Auto-spawn.** `client::connect_or_spawn` probes the socket; if absent
-  it `fork()`s twice (daemon trick), `setsid()`s, redirects stdin/stdout/
-  stderr to `/dev/null` + `supervisor.log`, then `execv`s itself with
-  `--supervisor`. The parent waitpid()s the intermediate, then connects.
+- **Auto-spawn (local only).** `client::connect_or_spawn` probes the socket;
+  if absent it `fork()`s twice (daemon trick), `setsid()`s, redirects
+  stdin/stdout/stderr to `/dev/null` + `supervisor.log`, then `execv`s
+  itself with `--supervisor`. The parent waitpid()s the intermediate, then
+  connects. A configured *remote* never auto-spawns — it's a hard connect.
+- **Remote supervisor (opt-in).** Set `remote.url = "host:port"` in the
+  global config to make the client connect over TCP+TLS instead of the local
+  UDS. Start the remote daemon with `imbuia --supervisor --listen host:port`
+  (it still binds its local UDS too). Trust is SSH-style pinned keys, not
+  CA/PKI: each side has an Ed25519 `identity.key` in its config dir; the
+  fingerprint is `sha256(SPKI)` (stable across cert regen). The client pins
+  the supervisor's key **TOFU** in `known_hosts`; the supervisor admits only
+  client fingerprints in `authorized_keys`. All in `transport.rs`. The local
+  UDS path is unauthenticated (filesystem perms are the boundary).
 - **Single client at a time.** The supervisor's accept loop hands the new
   client an exclusive slot. The old client (if any) gets
-  `SupervisorMsg::Detached` followed by `shutdown()` of its socket end.
-  The TUI handles `Detached` by posting `OperationFailed` and exiting.
+  `SupervisorMsg::Detached`, then its `CancellationToken` is fired to tear
+  down its reader + writer tasks (dropping both stream halves closes the
+  socket). The TUI handles `Detached` by posting `OperationFailed` and
+  exiting.
 - **State sync = "dump on attach + raw byte forward".** On attach the
   supervisor sends `OutputDump { bytes: parser.screen().contents_formatted() }`
   per session — escape sequences that restore the visible screen and
@@ -223,6 +245,11 @@ rest of the `ClientMsg`s are fire-and-forget.
 - Mutations that should persist push `Command::SaveGlobalConfig` and/or
   `Command::SaveProjectConfig(idx)` from the reducer. **Never write files
   from the reducer directly.**
+- Remote-transport trust files live in the same dir (`config.rs` helpers):
+  `identity.key` (this host's Ed25519 key, mode 0600, auto-generated),
+  `known_hosts` (client TOFU pins), `authorized_keys` (supervisor allow-list).
+  `GlobalConfig.remote` is hand-edited and never owned by the UI, so
+  `SaveGlobalConfig` preserves it by re-reading the on-disk value.
 
 ## Adding an ex-command
 
