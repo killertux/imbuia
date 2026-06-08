@@ -177,7 +177,8 @@ async fn serve(listen: Option<String>) -> Result<()> {
                         let (rd, wr) = tokio::io::split(stream);
                         let sh = Arc::clone(&shared);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_conn(sh, rd, wr).await {
+                            // Local UDS: no compression.
+                            if let Err(e) = handle_conn(sh, rd, wr, false).await {
                                 tracing::warn!("uds client session ended: {e}");
                             }
                         });
@@ -208,6 +209,11 @@ async fn serve(listen: Option<String>) -> Result<()> {
                 loop {
                     match tcp.accept().await {
                         Ok((stream, peer)) => {
+                            // Disable Nagle so the supervisor's small writes
+                            // (and the client's keystrokes) aren't held ~40ms.
+                            if let Err(e) = stream.set_nodelay(true) {
+                                tracing::warn!(%peer, "set_nodelay failed: {e}");
+                            }
                             let acceptor = acceptor.clone();
                             let sh = Arc::clone(&shared);
                             tokio::spawn(async move {
@@ -217,7 +223,8 @@ async fn serve(listen: Option<String>) -> Result<()> {
                                 match acceptor.accept(stream).await {
                                     Ok(tls) => {
                                         let (rd, wr) = tokio::io::split(tls);
-                                        if let Err(e) = handle_conn(sh, rd, wr).await {
+                                        // Remote link: compress large frames.
+                                        if let Err(e) = handle_conn(sh, rd, wr, true).await {
                                             tracing::warn!("tcp client session ended: {e}");
                                         }
                                     }
@@ -253,7 +260,7 @@ async fn flatten(handle: tokio::task::JoinHandle<()>) -> Result<()> {
 
 /// Serve one attached client over the given async read/write halves (a UDS
 /// stream or a TLS-over-TCP stream — `handle_conn` is transport-agnostic).
-async fn handle_conn<R, W>(shared: Arc<Shared>, mut rd: R, mut wr: W) -> Result<()>
+async fn handle_conn<R, W>(shared: Arc<Shared>, mut rd: R, mut wr: W, compress: bool) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -264,7 +271,7 @@ where
         let resp = HandshakeResp::VersionMismatch {
             supervisor_protocol: PROTOCOL_VERSION,
         };
-        let _ = ipc::write_frame_async(&mut wr, &resp).await;
+        let _ = ipc::write_frame_async(&mut wr, &resp, false).await;
         return Ok(());
     }
 
@@ -283,7 +290,7 @@ where
         supervisor_pid: std::process::id(),
         sessions: sessions_snapshot.clone(),
     };
-    ipc::write_frame_async(&mut wr, &resp).await?;
+    ipc::write_frame_async(&mut wr, &resp, false).await?;
 
     // From here on every outgoing frame goes through `tx`, drained by the
     // writer task. `cancel` tears both tasks down on steal-on-attach.
@@ -305,7 +312,7 @@ where
                         let wrote = tokio::select! {
                             biased;
                             _ = cancel.cancelled() => break,
-                            res = ipc::write_frame_async(&mut wr, &msg) => res,
+                            res = ipc::write_frame_async(&mut wr, &msg, compress) => res,
                         };
                         if wrote.is_err() || is_detached {
                             break;

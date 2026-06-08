@@ -1,18 +1,32 @@
 //! Shared wire types + framed transport for the imbuia client/supervisor split.
 //!
-//! Framing is a 4-byte big-endian length followed by a bincode-serialized
-//! payload. Bincode v2 with the `serde` feature is used so the wire types can
-//! piggy-back on existing `Serialize` derives.
+//! Framing is a 4-byte big-endian length, a 1-byte codec tag (`0` = raw,
+//! `1` = zstd), then the (possibly compressed) bincode payload. Bincode v2 with
+//! the `serde` feature is used so the wire types can piggy-back on existing
+//! `Serialize` derives. Compression is opt-in per writer (remote links only)
+//! and size-gated, so interactive frames stay raw; the reader auto-detects.
 
 use crate::app::PrStatus;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Bumped to 2 when the frame layout gained the 1-byte codec tag (see
+/// `write_frame_async`). The handshake refuses version mismatches.
+pub const PROTOCOL_VERSION: u32 = 2;
 const MAX_FRAME: u32 = 8 * 1024 * 1024;
+
+/// Per-frame codec tag (the byte after the length prefix).
+const CODEC_RAW: u8 = 0;
+const CODEC_ZSTD: u8 = 1;
+/// Only compress payloads at least this big — keystrokes and small output
+/// deltas stay raw so interactive frames pay zero compression cost.
+const COMPRESS_THRESHOLD: usize = 512;
+/// zstd level: low, for fast compression (decompression speed is level-
+/// independent and very high — it's on the client's render path).
+const ZSTD_LEVEL: i32 = 3;
 
 pub type SessionId = u64;
 
@@ -259,20 +273,52 @@ fn config() -> bincode::config::Configuration {
     bincode::config::standard()
 }
 
+/// Encode `value` to `(codec, body)`. When `compress` and the bincode payload is
+/// at least [`COMPRESS_THRESHOLD`], the body is zstd-compressed (`CODEC_ZSTD`);
+/// otherwise it's the raw bincode (`CODEC_RAW`). Small/interactive frames thus
+/// stay raw even on a compression-enabled connection.
+fn encode_frame_body<T: Serialize>(value: &T, compress: bool) -> Result<(u8, Vec<u8>)> {
+    let raw = bincode::serde::encode_to_vec(value, config())?;
+    if compress && raw.len() >= COMPRESS_THRESHOLD {
+        let packed = zstd::encode_all(raw.as_slice(), ZSTD_LEVEL).context("zstd compress")?;
+        // Only keep it if it actually shrank (tiny/incompressible payloads can
+        // grow); otherwise fall back to raw.
+        if packed.len() < raw.len() {
+            return Ok((CODEC_ZSTD, packed));
+        }
+    }
+    Ok((CODEC_RAW, raw))
+}
+
+/// Inverse of [`encode_frame_body`]: decompress if needed, then bincode-decode.
+fn decode_frame_body<T: for<'de> Deserialize<'de>>(codec: u8, body: &[u8]) -> Result<T> {
+    let raw;
+    let bytes = match codec {
+        CODEC_RAW => body,
+        CODEC_ZSTD => {
+            raw = zstd::decode_all(body).context("zstd decompress")?;
+            raw.as_slice()
+        }
+        other => bail!("unknown frame codec {other}"),
+    };
+    let (value, _) = bincode::serde::decode_from_slice(bytes, config())?;
+    Ok(value)
+}
+
 /// Serialize and write one length-delimited message. The live transport is
 /// async ([`write_frame_async`]); this sync twin backs the round-trip tests.
 #[cfg(test)]
 pub fn write_frame<W: Write, T: Serialize>(w: &mut W, value: &T) -> Result<()> {
-    let bytes = bincode::serde::encode_to_vec(value, config())?;
-    let len: u32 = bytes
-        .len()
+    let (codec, body) = encode_frame_body(value, false)?;
+    let len: u32 = (body.len() + 1)
         .try_into()
         .map_err(|_| anyhow::anyhow!("frame too large"))?;
     if len > MAX_FRAME {
         bail!("frame too large: {len} bytes");
     }
     w.write_all(&len.to_be_bytes())?;
-    w.write_all(&bytes)?;
+    w.write_all(&[codec])?;
+    w.write_all(&body)?;
     w.flush()?;
     Ok(())
 }
@@ -284,37 +330,40 @@ pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> Result<T>
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf);
-    if len > MAX_FRAME {
-        bail!("frame too large: {len} bytes");
+    if len == 0 || len > MAX_FRAME {
+        bail!("bad frame length: {len}");
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf)?;
-    let (value, _) = bincode::serde::decode_from_slice(&buf, config())?;
-    Ok(value)
+    decode_frame_body(buf[0], &buf[1..])
 }
 
-/// Async twin of [`write_frame`] for tokio streams (UDS or TLS-over-TCP).
-pub async fn write_frame_async<W, T>(w: &mut W, value: &T) -> Result<()>
+/// Async twin of [`write_frame`] for tokio streams (UDS or TLS-over-TCP). When
+/// `compress` (remote links only), large payloads are zstd-compressed; the
+/// frame's codec byte tells the reader. The reader auto-detects, so `compress`
+/// can differ per direction/connection without negotiation.
+pub async fn write_frame_async<W, T>(w: &mut W, value: &T, compress: bool) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
     T: Serialize,
 {
     use tokio::io::AsyncWriteExt;
-    let bytes = bincode::serde::encode_to_vec(value, config())?;
-    let len: u32 = bytes
-        .len()
+    let (codec, body) = encode_frame_body(value, compress)?;
+    let len: u32 = (body.len() + 1)
         .try_into()
         .map_err(|_| anyhow::anyhow!("frame too large"))?;
     if len > MAX_FRAME {
         bail!("frame too large: {len} bytes");
     }
     w.write_all(&len.to_be_bytes()).await?;
-    w.write_all(&bytes).await?;
+    w.write_all(&[codec]).await?;
+    w.write_all(&body).await?;
     w.flush().await?;
     Ok(())
 }
 
-/// Async twin of [`read_frame`]; awaits a full length-delimited frame.
+/// Async twin of [`read_frame`]; awaits a full length-delimited frame and
+/// transparently decompresses zstd frames.
 pub async fn read_frame_async<R, T>(r: &mut R) -> Result<T>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -324,13 +373,12 @@ where
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf);
-    if len > MAX_FRAME {
-        bail!("frame too large: {len} bytes");
+    if len == 0 || len > MAX_FRAME {
+        bail!("bad frame length: {len}");
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf).await?;
-    let (value, _) = bincode::serde::decode_from_slice(&buf, config())?;
-    Ok(value)
+    decode_frame_body(buf[0], &buf[1..])
 }
 
 /// Resolve the Unix-domain-socket path used by the supervisor.
@@ -386,7 +434,7 @@ mod tests {
             ClientMsg::Shutdown,
         ];
         for m in &sent {
-            write_frame_async(&mut a, m).await.unwrap();
+            write_frame_async(&mut a, m, false).await.unwrap();
         }
         drop(a);
         for expected in &sent {
@@ -397,6 +445,34 @@ mod tests {
                 bincode::serde::encode_to_vec(expected, config()).unwrap(),
             );
         }
+    }
+
+    #[test]
+    fn compression_round_trips_and_gates_on_size() {
+        // A large, compressible OutputDelta with compress=true → zstd, smaller,
+        // and decodes back to the same bytes.
+        let big = SupervisorMsg::OutputDelta {
+            id: 1,
+            bytes: vec![b'x'; 8192],
+        };
+        let raw = bincode::serde::encode_to_vec(&big, config()).unwrap();
+        let (codec, body) = encode_frame_body(&big, true).unwrap();
+        assert_eq!(codec, CODEC_ZSTD);
+        assert!(body.len() < raw.len(), "compressed body should be smaller");
+        let back: SupervisorMsg = decode_frame_body(codec, &body).unwrap();
+        assert_eq!(bincode::serde::encode_to_vec(&back, config()).unwrap(), raw);
+
+        // Sub-threshold payload stays raw even with compress=true.
+        let small = SupervisorMsg::OutputDelta {
+            id: 1,
+            bytes: vec![b'y'; 16],
+        };
+        let (codec, _) = encode_frame_body(&small, true).unwrap();
+        assert_eq!(codec, CODEC_RAW);
+
+        // compress=false is always raw.
+        let (codec, _) = encode_frame_body(&big, false).unwrap();
+        assert_eq!(codec, CODEC_RAW);
     }
 
     #[test]
