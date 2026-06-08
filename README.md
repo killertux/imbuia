@@ -200,6 +200,80 @@ or `$XDG_CACHE_HOME/imbuia/` / `~/.cache/imbuia/` (macOS):
 └── imbuia.log        # client tracing log
 ```
 
+## Remote supervisor
+
+By default the supervisor runs on the same machine as the TUI, over a local
+Unix socket. You can instead run it on a **remote host** and attach to it from
+your laptop over TCP — your sessions then live on (and survive reboots of the
+*client* machine on) the remote.
+
+The link is **encrypted and mutually authenticated** with TLS. Trust is
+SSH-style pinned public keys, not certificate authorities: each side keeps a
+long-lived Ed25519 identity (`identity.key`, auto-generated on first use) and
+recognises the other by its fingerprint (`sha256` of the public key). No manual
+key exchange is needed for the common single-client case — both sides
+**trust-on-first-connect** (TOFU).
+
+### 1. Start the supervisor on the remote host
+
+Install `imbuia` there and run it with `--listen`:
+
+```sh
+imbuia --supervisor --listen 0.0.0.0:7777
+```
+
+- Use `0.0.0.0:7777` for any interface, or `127.0.0.1:7777` to expose it only
+  to loopback (e.g. when reaching it through an SSH tunnel).
+- It still serves its local Unix socket too, and logs its own key fingerprint
+  to `supervisor.log` on startup.
+- There's no auto-restart — run it under systemd/launchd, `tmux`, or `nohup`
+  if you want it to outlive your shell.
+
+### 2. Point the client at it
+
+Add a `[remote]` table to the client's `~/.config/imbuia/config.toml`:
+
+```toml
+[remote]
+url = "your.remote.host:7777"   # host:port, no scheme
+```
+
+Launch `imbuia` as usual. On the first connection:
+
+- the client generates its identity and **pins the supervisor's key** in
+  `~/.config/imbuia/known_hosts`;
+- the supervisor, if its `authorized_keys` is empty, **pins your client** and
+  lets it in.
+
+That's the whole setup. While `remote.url` is set the client connects *only*
+to the remote (it won't spawn or fall back to a local supervisor); remove the
+block to go back to local.
+
+### Trust files & security notes
+
+Three files in each side's config dir (`~/.config/imbuia/`) govern trust:
+
+| File              | Side       | Contents                                            |
+|-------------------|------------|-----------------------------------------------------|
+| `identity.key`    | both       | this host's Ed25519 private key (mode `0600`)       |
+| `known_hosts`     | client     | `host:port <fingerprint>` pins (TOFU)               |
+| `authorized_keys` | supervisor | allowed client `<fingerprint>` lines                |
+
+- **The first connection is the trust moment.** Only bootstrap on a network
+  where nobody can race you to the port. To avoid TOFU entirely, exchange
+  fingerprints by hand first: add `host:port <fp>` to the client's
+  `known_hosts`, and the client's fingerprint to the remote's
+  `authorized_keys`. Each process logs its own fingerprint at startup
+  (`supervisor.log` / `imbuia.log`).
+- **More than one client:** the supervisor only auto-pins while
+  `authorized_keys` is empty. Add further clients by appending their
+  fingerprints (one per line) by hand.
+- **Key changed?** If you regenerate the supervisor's `identity.key`, the
+  client refuses to connect (host-key-changed) — delete the stale line from
+  `known_hosts` to re-trust.
+- The local Unix-socket path is unauthenticated; filesystem permissions are
+  the boundary there.
+
 ## License
 
 [MIT](LICENSE)

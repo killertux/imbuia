@@ -30,6 +30,18 @@ pub struct GlobalConfig {
     /// default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub keybinds: BTreeMap<String, String>,
+    /// When set, the client connects to this remote supervisor over TCP+TLS
+    /// instead of spawning/attaching the local Unix-socket supervisor. The
+    /// supervisor's public key is pinned on first connect (TOFU) in
+    /// `known_hosts`, not stored here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteConfig>,
+}
+
+/// Address of a remote supervisor. `url` is a plain `host:port` (no scheme).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    pub url: String,
 }
 
 impl Default for GlobalConfig {
@@ -41,6 +53,7 @@ impl Default for GlobalConfig {
             launchers: Vec::new(),
             gh_poll_interval_secs: None,
             keybinds: BTreeMap::new(),
+            remote: None,
         }
     }
 }
@@ -236,6 +249,95 @@ pub fn compute_slug(name: &str, existing: &[String]) -> String {
     unreachable!()
 }
 
+// ---------------------------------------------------------------------------
+// Remote-transport trust files (live alongside config.toml in the config dir).
+// ---------------------------------------------------------------------------
+
+/// PKCS#8 private key for this host's long-lived TLS identity (mode 0600).
+/// The same file is used whether the process acts as a client or supervisor.
+pub fn identity_path(dir: &Path) -> PathBuf {
+    dir.join("identity.key")
+}
+
+/// Client-side TOFU store: `host:port <sha256-fingerprint>` per line.
+pub fn known_hosts_path(dir: &Path) -> PathBuf {
+    dir.join("known_hosts")
+}
+
+/// Supervisor-side allow-list: `<sha256-fingerprint>  # optional comment`.
+pub fn authorized_keys_path(dir: &Path) -> PathBuf {
+    dir.join("authorized_keys")
+}
+
+/// Parse a trust file, yielding the first two whitespace tokens of each
+/// non-empty, non-`#` line. Missing file → empty. Used for both known_hosts
+/// (host, fp) and authorized_keys (fp, _comment).
+fn read_trust_lines(path: &Path) -> Vec<(String, Option<String>)> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let first = it.next()?.to_string();
+            let second = it.next().map(str::to_string);
+            Some((first, second))
+        })
+        .collect()
+}
+
+/// Look up the pinned fingerprint for `host` in the client's known_hosts.
+pub fn known_host_fingerprint(dir: &Path, host: &str) -> Option<String> {
+    read_trust_lines(&known_hosts_path(dir))
+        .into_iter()
+        .find(|(h, _)| h == host)
+        .and_then(|(_, fp)| fp)
+}
+
+/// Append a freshly-trusted `host -> fingerprint` to known_hosts (TOFU).
+pub fn append_known_host(dir: &Path, host: &str, fingerprint: &str) -> Result<()> {
+    use std::io::Write;
+    let path = known_hosts_path(dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    writeln!(f, "{host} {fingerprint}").with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// The set of client fingerprints the supervisor will admit.
+pub fn load_authorized_fingerprints(dir: &Path) -> std::collections::HashSet<String> {
+    read_trust_lines(&authorized_keys_path(dir))
+        .into_iter()
+        .map(|(fp, _)| fp)
+        .collect()
+}
+
+/// Append a client `fingerprint` to authorized_keys with a `comment` (used by
+/// the supervisor's trust-on-first-connect to pin the first client).
+pub fn append_authorized_key(dir: &Path, fingerprint: &str, comment: &str) -> Result<()> {
+    use std::io::Write;
+    let path = authorized_keys_path(dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    writeln!(f, "{fingerprint}  # {comment}")
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +378,7 @@ mod tests {
             launchers: Vec::new(),
             gh_poll_interval_secs: None,
             keybinds: BTreeMap::new(),
+            remote: None,
         };
         save_global(&dir, &global).unwrap();
         let proj = ProjectConfig {
@@ -309,6 +412,7 @@ mod tests {
             launchers: Vec::new(),
             gh_poll_interval_secs: None,
             keybinds: BTreeMap::new(),
+            remote: None,
         };
         save_global(&dir, &global).unwrap();
         let loaded = load_global(&dir).unwrap();
@@ -346,6 +450,62 @@ mod tests {
         assert_eq!(loaded.launchers.len(), 1);
         assert_eq!(loaded.launchers[0].name, "claude");
         assert_eq!(loaded.launchers[0].command, "claude");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn remote_config_round_trips_in_global() {
+        let dir = std::env::temp_dir().join(format!("imbuia-cfg-remote-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let global = GlobalConfig {
+            remote: Some(RemoteConfig {
+                url: "example.com:7777".into(),
+            }),
+            ..GlobalConfig::default()
+        };
+        save_global(&dir, &global).unwrap();
+        let loaded = load_global(&dir).unwrap();
+        assert_eq!(loaded.remote.unwrap().url, "example.com:7777");
+        // Absence stays absent (skip_serializing_if).
+        let plain = GlobalConfig::default();
+        save_global(&dir, &plain).unwrap();
+        assert!(load_global(&dir).unwrap().remote.is_none());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn known_hosts_tofu_and_authorized_keys() {
+        let dir = std::env::temp_dir().join(format!("imbuia-cfg-trust-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Unknown host before any append.
+        assert_eq!(known_host_fingerprint(&dir, "h:1"), None);
+        append_known_host(&dir, "h:1", "abc123").unwrap();
+        append_known_host(&dir, "other:2", "def456").unwrap();
+        assert_eq!(
+            known_host_fingerprint(&dir, "h:1").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            known_host_fingerprint(&dir, "other:2").as_deref(),
+            Some("def456")
+        );
+        assert_eq!(known_host_fingerprint(&dir, "missing:3"), None);
+
+        // authorized_keys: comments + blank lines ignored, comment after fp ok.
+        fs::write(
+            authorized_keys_path(&dir),
+            "# allowed clients\nabc123  # laptop\n\ndef456\n",
+        )
+        .unwrap();
+        let set = load_authorized_fingerprints(&dir);
+        assert!(set.contains("abc123"));
+        assert!(set.contains("def456"));
+        assert!(!set.contains("# allowed clients"));
+        assert_eq!(set.len(), 2);
 
         fs::remove_dir_all(&dir).unwrap();
     }

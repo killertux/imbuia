@@ -9,18 +9,26 @@ use crate::ipc::{
     SessionId, SessionMeta, SupervisorMsg, WorktreeEntry,
 };
 use crate::session::Session;
+use crate::{config, transport};
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::event::{KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use std::collections::HashMap;
 use std::io;
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{Notify, mpsc};
+use tokio_rustls::TlsConnector;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+
+/// Boxed read/write halves of whatever transport the client attached over (a
+/// local `UnixStream` or a `TlsStream<TcpStream>`). Both impl `AsyncRead` /
+/// `AsyncWrite`, so the framing + handshake code is transport-agnostic.
+type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
+type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
 /// Per-session local state held client-side. The vt100 parser is fed by
 /// frames arriving from the supervisor (Dump on attach, Delta as live PTY
@@ -37,10 +45,10 @@ pub(crate) struct ProxySession {
 }
 
 /// Channel-backed handle to the supervisor: enqueues `ClientMsg` onto an
-/// unbounded queue drained by a dedicated writer thread. Crucially, sending
-/// never blocks the caller — even if the socket is back-pressured the
-/// runtime task keeps making progress.
-type ClientTx = std::sync::mpsc::Sender<ClientMsg>;
+/// unbounded queue drained by a dedicated async writer task. Crucially,
+/// `UnboundedSender::send` is synchronous and non-blocking, so reducer/runtime
+/// call sites stay unchanged even though the writer is now async.
+type ClientTx = mpsc::UnboundedSender<ClientMsg>;
 
 #[derive(Copy, Clone, Debug)]
 struct PendingSpawn {
@@ -472,54 +480,79 @@ impl SupervisorClient {
     }
 }
 
-/// Attach to a running supervisor, or spawn one if none is alive, then
-/// handshake. Returns the connected client + a handle to its reader thread.
-pub fn connect_or_spawn(
+/// Attach to a supervisor and handshake. With `remote` set, connects to the
+/// remote supervisor over TCP+TLS (no local spawn). Otherwise probes the local
+/// Unix socket, spawning a supervisor if none is alive.
+pub async fn connect_or_spawn(
+    config_dir: &Path,
+    remote: Option<config::RemoteConfig>,
     notify: Arc<Notify>,
     action_tx: mpsc::Sender<Action>,
 ) -> Result<Arc<SupervisorClient>> {
+    let (rd, wr) = match remote {
+        Some(cfg) => connect_remote(config_dir, &cfg.url).await?,
+        None => connect_local().await?,
+    };
+    handshake(rd, wr, notify, action_tx).await
+}
+
+/// Connect to (or spawn + wait for) the local Unix-socket supervisor.
+async fn connect_local() -> Result<(BoxRead, BoxWrite)> {
     let sock = ipc::resolve_socket_path();
-    let stream = match UnixStream::connect(&sock) {
+    let stream = match UnixStream::connect(&sock).await {
         Ok(s) => s,
         Err(e)
             if e.kind() == io::ErrorKind::NotFound
                 || e.kind() == io::ErrorKind::ConnectionRefused =>
         {
             spawn_supervisor()?;
-            wait_for_socket(&sock, Duration::from_secs(2))?
+            wait_for_socket(&sock, Duration::from_secs(2)).await?
         }
         Err(e) => return Err(anyhow!("connect supervisor socket: {e}")),
     };
-    handshake(stream, notify, action_tx)
+    let (rd, wr) = tokio::io::split(stream);
+    Ok((Box::new(rd), Box::new(wr)))
 }
 
-fn handshake(
-    stream: UnixStream,
+/// Connect to a remote supervisor over TCP wrapped in mutually-authenticated
+/// TLS. The supervisor's key is pinned TOFU in `known_hosts`; our identity cert
+/// must be in its `authorized_keys` or the handshake is rejected.
+async fn connect_remote(config_dir: &Path, url: &str) -> Result<(BoxRead, BoxWrite)> {
+    let (host, _port) = transport::split_host_port(url)?;
+    let identity = transport::load_or_create_identity(config_dir)?;
+    tracing::info!(fingerprint = %identity.fingerprint, %url, "client TLS identity");
+    let connector = TlsConnector::from(transport::client_config(&identity, host, config_dir)?);
+    let tcp = TcpStream::connect(url)
+        .await
+        .with_context(|| format!("connecting to remote supervisor {url}"))?;
+    let server_name = transport::server_name(host)?;
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
+        .context("TLS handshake with remote supervisor")?;
+    let (rd, wr) = tokio::io::split(tls);
+    Ok((Box::new(rd), Box::new(wr)))
+}
+
+async fn handshake(
+    mut rd: BoxRead,
+    mut wr: BoxWrite,
     notify: Arc<Notify>,
     action_tx: mpsc::Sender<Action>,
 ) -> Result<Arc<SupervisorClient>> {
-    let mut reader = stream.try_clone().context("clone supervisor socket")?;
-    let mut writer_stream = stream;
-
-    // Bounded handshake: a half-dead supervisor that accepts but never
-    // replies must not hang the TUI. Read/write timeouts are cleared after
-    // the handshake completes — runtime IO is strictly blocking.
-    let hs_timeout = Duration::from_secs(3);
-    reader
-        .set_read_timeout(Some(hs_timeout))
-        .context("set handshake read timeout")?;
-    writer_stream
-        .set_write_timeout(Some(hs_timeout))
-        .context("set handshake write timeout")?;
+    // Bounded handshake: a half-dead supervisor that accepts but never replies
+    // must not hang the TUI.
+    let hs = Duration::from_secs(5);
     let req = HandshakeReq {
         protocol: PROTOCOL_VERSION,
         client_pid: std::process::id(),
     };
-    ipc::write_frame(&mut writer_stream, &req).context("handshake write")?;
-    let resp: HandshakeResp =
-        ipc::read_frame(&mut reader).context("handshake read (supervisor unresponsive?)")?;
-    reader.set_read_timeout(None).ok();
-    writer_stream.set_write_timeout(None).ok();
+    tokio::time::timeout(hs, ipc::write_frame_async(&mut wr, &req))
+        .await
+        .context("handshake write timeout")??;
+    let resp: HandshakeResp = tokio::time::timeout(hs, ipc::read_frame_async(&mut rd))
+        .await
+        .context("handshake read timeout (supervisor unresponsive?)")??;
     let sessions = match resp {
         HandshakeResp::Ok {
             supervisor_pid: _,
@@ -535,14 +568,13 @@ fn handshake(
         }
     };
 
-    // Spawn the writer thread: drains an mpsc queue and writes frames to
-    // the socket. The runtime task only ever does `tx.send(msg)` which is
-    // O(1) and never blocks — paste floods and back-pressured supervisor
-    // writes can no longer freeze the TUI.
-    let (tx, rx) = std::sync::mpsc::channel::<ClientMsg>();
-    thread::spawn(move || {
-        while let Ok(msg) = rx.recv() {
-            if let Err(e) = ipc::write_frame(&mut writer_stream, &msg) {
+    // Writer task: drains an unbounded queue and writes frames. Runtime code
+    // only ever does `tx.send(msg)` (O(1), non-blocking), so paste floods and a
+    // back-pressured supervisor can't freeze the TUI.
+    let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let Err(e) = ipc::write_frame_async(&mut wr, &msg).await {
                 tracing::warn!("supervisor write loop exiting: {e}");
                 break;
             }
@@ -559,29 +591,27 @@ fn handshake(
         initial_sessions: Mutex::new(sessions),
     });
 
-    spawn_reader(Arc::clone(&client), reader, action_tx);
+    spawn_reader(Arc::clone(&client), rd, action_tx);
     Ok(client)
 }
 
-fn spawn_reader(
-    client: Arc<SupervisorClient>,
-    mut reader: UnixStream,
-    action_tx: mpsc::Sender<Action>,
-) {
-    thread::spawn(move || {
+fn spawn_reader(client: Arc<SupervisorClient>, mut rd: BoxRead, action_tx: mpsc::Sender<Action>) {
+    tokio::spawn(async move {
         loop {
-            let msg: SupervisorMsg = match ipc::read_frame(&mut reader) {
+            let msg: SupervisorMsg = match ipc::read_frame_async(&mut rd).await {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::warn!("supervisor read ended: {e}");
-                    let _ = action_tx.blocking_send(Action::SupervisorLost(format!("{e}")));
+                    let _ = action_tx.send(Action::SupervisorLost(format!("{e}"))).await;
                     return;
                 }
             };
             match msg {
                 SupervisorMsg::Spawned { request_id, id } => {
-                    if let Some(pending) = client.pending_spawns.lock().unwrap().remove(&request_id)
-                    {
+                    // Bind in a statement so the MutexGuard drops before the
+                    // later `.await` (a held std guard isn't Send).
+                    let pending = client.pending_spawns.lock().unwrap().remove(&request_id);
+                    if let Some(pending) = pending {
                         let parser = Arc::new(Mutex::new(vt100::Parser::new(
                             pending.rows,
                             pending.cols,
@@ -599,16 +629,19 @@ fn spawn_reader(
                             .lock()
                             .unwrap()
                             .insert(id, Arc::clone(&proxy));
-                        let _ = action_tx.blocking_send(Action::SessionSpawned {
-                            session: proxy as Arc<dyn Session>,
-                            dest: pending.dest,
-                        });
+                        let _ = action_tx
+                            .send(Action::SessionSpawned {
+                                session: proxy as Arc<dyn Session>,
+                                dest: pending.dest,
+                            })
+                            .await;
                     }
                 }
                 SupervisorMsg::SpawnFailed { request_id, error } => {
                     client.pending_spawns.lock().unwrap().remove(&request_id);
-                    let _ =
-                        action_tx.blocking_send(Action::OperationFailed(format!("spawn: {error}")));
+                    let _ = action_tx
+                        .send(Action::OperationFailed(format!("spawn: {error}")))
+                        .await;
                 }
                 SupervisorMsg::OutputDump { id, bytes }
                 | SupervisorMsg::OutputDelta { id, bytes } => {
@@ -627,14 +660,14 @@ fn spawn_reader(
                 }
                 SupervisorMsg::Exited { id } => {
                     client.sessions.lock().unwrap().remove(&id);
-                    let _ = action_tx.blocking_send(Action::SessionExited(id));
+                    let _ = action_tx.send(Action::SessionExited(id)).await;
                 }
                 SupervisorMsg::Detached { reason } => {
-                    let _ = action_tx.blocking_send(Action::SupervisorLost(reason));
+                    let _ = action_tx.send(Action::SupervisorLost(reason)).await;
                     return;
                 }
                 SupervisorMsg::Usage(report) => {
-                    let _ = action_tx.blocking_send(Action::UsageReceived(report));
+                    let _ = action_tx.send(Action::UsageReceived(report)).await;
                 }
                 SupervisorMsg::OpResult { request_id, result } => {
                     let pending = client.pending_ops.lock().unwrap().remove(&request_id);
@@ -643,7 +676,7 @@ fn spawn_reader(
                         continue;
                     };
                     if let Some(action) = op_result_to_action(pending, result) {
-                        let _ = action_tx.blocking_send(action);
+                        let _ = action_tx.send(action).await;
                     }
                 }
             }
@@ -720,16 +753,16 @@ impl CommandExt for std::process::Command {
     }
 }
 
-fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> Result<UnixStream> {
+async fn wait_for_socket(path: &Path, timeout: Duration) -> Result<UnixStream> {
     let start = Instant::now();
     loop {
-        if let Ok(s) = UnixStream::connect(path) {
+        if let Ok(s) = UnixStream::connect(path).await {
             return Ok(s);
         }
         if start.elapsed() > timeout {
             bail!("timeout waiting for supervisor socket {}", path.display());
         }
-        thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

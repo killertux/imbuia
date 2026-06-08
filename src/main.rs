@@ -27,6 +27,7 @@ mod runtime;
 mod session;
 mod supervisor;
 mod theme;
+mod transport;
 
 mod updater;
 
@@ -39,11 +40,25 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if std::env::args().any(|a| a == "--supervisor") {
-        // Supervisor: no TUI, no raw mode, no tokio runtime — just a sync
-        // accept loop on the Unix socket.
-        return supervisor::run();
+        // Supervisor: no TUI, no raw mode. Owns a tokio runtime for the
+        // accept loop (UDS always; TCP+TLS when `--listen host:port` is given).
+        transport::init();
+        return supervisor::run(arg_value("--listen"));
     }
+    transport::init();
     run_client()
+}
+
+/// Read the value following a `--flag` in argv (`--flag val` form). Returns
+/// `None` if the flag is absent or has no following token.
+fn arg_value(flag: &str) -> Option<String> {
+    let mut args = std::env::args();
+    while let Some(a) = args.next() {
+        if a == flag {
+            return args.next();
+        }
+    }
+    None
 }
 
 #[tokio::main(flavor = "multi_thread")]

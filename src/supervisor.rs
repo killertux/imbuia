@@ -20,11 +20,16 @@ use crate::ipc::{
     ProcessNode, ProjectInfo, SessionId, SessionMeta, SessionUsage, SupervisorMsg, UsageReport,
     WorktreeEntry,
 };
-use crate::{git, github};
+use crate::{config, git, github, transport};
 use anyhow::{Context, Result};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, UnixListener};
+use tokio::sync::mpsc;
+use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
 
 /// Per-session cap on the raw-byte replay log. Sized so a packed text dump
 /// of vt100's 10k scrollback fits with headroom for ANSI escapes. Eviction
@@ -41,7 +46,6 @@ struct OutputLog {
     truncated: bool,
 }
 use arc_swap::ArcSwapOption;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
@@ -50,12 +54,18 @@ use std::thread;
 use std::time::Duration;
 
 /// Active-client handle: a bounded queue of outgoing frames drained by a
-/// dedicated writer thread, plus an Arc'd `UnixStream` retained solely so
-/// steal-on-attach can `shutdown()` the fd — that's what unblocks the writer
-/// thread if it's parked in `write_frame` on a back-pressured socket.
+/// dedicated async writer task, plus a [`CancellationToken`] used by
+/// steal-on-attach to tear down the previous client's reader + writer tasks
+/// (which drops both halves of its stream and closes the socket) even if the
+/// writer is parked on a back-pressured socket.
+///
+/// `tx` is a tokio channel: the async command loop sends via `.send().await`,
+/// while the off-runtime PTY/reaper/usage/op threads use
+/// `.blocking_send()` / `.try_send()` (legal because those are plain
+/// `std::thread`s, not runtime workers).
 struct ClientChan {
-    tx: SyncSender<SupervisorMsg>,
-    stream: Arc<UnixStream>,
+    tx: mpsc::Sender<SupervisorMsg>,
+    cancel: CancellationToken,
 }
 
 struct Supervised {
@@ -134,57 +144,133 @@ impl Shared {
     }
 }
 
-/// Entry point. Owns the listener for the process lifetime.
-pub fn run() -> Result<()> {
+/// Entry point. Builds a tokio runtime and runs the accept loop(s) for the
+/// process lifetime. `listen` (from `--listen host:port`) enables the optional
+/// TCP+TLS acceptor in addition to the always-on local Unix socket.
+pub fn run(listen: Option<String>) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building supervisor runtime")?;
+    rt.block_on(serve(listen))
+}
+
+async fn serve(listen: Option<String>) -> Result<()> {
     let sock = ipc::resolve_socket_path();
     init_logging(&sock);
     write_pidfile(&sock)?;
 
     // If a stale socket exists, unlink. We're the sole owner.
     let _ = std::fs::remove_file(&sock);
-    let listener = UnixListener::bind(&sock).context("bind supervisor socket")?;
+    let uds = UnixListener::bind(&sock).context("bind supervisor socket")?;
     tracing::info!(socket = %sock.display(), pid = std::process::id(), "supervisor up");
 
     let shared = Arc::new(Shared::new());
 
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(stream) => {
-                let sh = Arc::clone(&shared);
-                thread::spawn(move || {
-                    if let Err(e) = serve_client(sh, stream) {
-                        tracing::warn!("client session ended: {e}");
+    // Always-on local UDS acceptor.
+    let uds_task = {
+        let shared = Arc::clone(&shared);
+        tokio::spawn(async move {
+            loop {
+                match uds.accept().await {
+                    Ok((stream, _addr)) => {
+                        let (rd, wr) = tokio::io::split(stream);
+                        let sh = Arc::clone(&shared);
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_conn(sh, rd, wr).await {
+                                tracing::warn!("uds client session ended: {e}");
+                            }
+                        });
                     }
-                });
+                    Err(e) => {
+                        tracing::warn!("uds accept error: {e}");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
             }
-            Err(e) => {
-                tracing::warn!("accept error: {e}");
-                thread::sleep(Duration::from_millis(50));
-            }
+        })
+    };
+
+    // Optional TCP + mutually-authenticated TLS acceptor.
+    let tls_task = match listen {
+        None => None,
+        Some(addr) => {
+            let dir = config::resolve_config_dir();
+            let identity = transport::load_or_create_identity(&dir)?;
+            tracing::info!(fingerprint = %identity.fingerprint, "supervisor TLS identity");
+            let acceptor = TlsAcceptor::from(transport::server_config(&identity, &dir)?);
+            let tcp = TcpListener::bind(&addr)
+                .await
+                .with_context(|| format!("binding TCP listener on {addr}"))?;
+            tracing::info!(%addr, "supervisor listening for remote clients");
+            let shared = Arc::clone(&shared);
+            Some(tokio::spawn(async move {
+                loop {
+                    match tcp.accept().await {
+                        Ok((stream, peer)) => {
+                            let acceptor = acceptor.clone();
+                            let sh = Arc::clone(&shared);
+                            tokio::spawn(async move {
+                                // TLS handshake (incl. authorized_keys client
+                                // auth) happens here; a rejected client never
+                                // reaches `handle_conn`.
+                                match acceptor.accept(stream).await {
+                                    Ok(tls) => {
+                                        let (rd, wr) = tokio::io::split(tls);
+                                        if let Err(e) = handle_conn(sh, rd, wr).await {
+                                            tracing::warn!("tcp client session ended: {e}");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(%peer, "TLS handshake failed: {e}")
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!("tcp accept error: {e}");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+            }))
         }
+    };
+
+    // Acceptors loop forever (or until the process exits via `Shutdown`).
+    if let Some(tls_task) = tls_task {
+        let _ = tokio::try_join!(flatten(uds_task), flatten(tls_task));
+    } else {
+        let _ = flatten(uds_task).await;
     }
     Ok(())
 }
 
-fn serve_client(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
-    // Read half for ClientMsg; the write half goes to the writer thread.
-    let mut reader = stream.try_clone()?;
+/// Flatten a `JoinHandle<()>` into a `Result` so it composes with `try_join!`.
+async fn flatten(handle: tokio::task::JoinHandle<()>) -> Result<()> {
+    handle.await.context("acceptor task panicked")
+}
 
-    // Handshake — done synchronously against the bare stream before any
-    // writer thread exists.
-    let req: HandshakeReq = ipc::read_frame(&mut reader)?;
-    let mut handshake_stream = stream;
+/// Serve one attached client over the given async read/write halves (a UDS
+/// stream or a TLS-over-TCP stream — `handle_conn` is transport-agnostic).
+async fn handle_conn<R, W>(shared: Arc<Shared>, mut rd: R, mut wr: W) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    // Handshake against the bare halves before the writer task exists.
+    let req: HandshakeReq = ipc::read_frame_async(&mut rd).await?;
     if req.protocol != PROTOCOL_VERSION {
         let resp = HandshakeResp::VersionMismatch {
             supervisor_protocol: PROTOCOL_VERSION,
         };
-        let _ = ipc::write_frame(&mut handshake_stream, &resp);
+        let _ = ipc::write_frame_async(&mut wr, &resp).await;
         return Ok(());
     }
 
     // Snapshot existing sessions for the handshake reply *before* the steal —
-    // we want the new client to see the session list the supervisor has right
-    // now, not whatever raced in during the swap.
+    // the new client should see the session list as of now, not whatever
+    // raced in during the swap.
     let sessions_snapshot: Vec<SessionMeta> = shared
         .registry
         .lock()
@@ -197,22 +283,46 @@ fn serve_client(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
         supervisor_pid: std::process::id(),
         sessions: sessions_snapshot.clone(),
     };
-    ipc::write_frame(&mut handshake_stream, &resp)?;
-    let stream = handshake_stream;
+    ipc::write_frame_async(&mut wr, &resp).await?;
 
-    // Spin up the per-client writer thread. From here on, *every* outgoing
-    // frame goes through `tx`. `stream_arc` is retained so steal-on-attach
-    // can shutdown() the fd and unblock the writer if needed.
-    let stream_arc = Arc::new(stream);
-    let (tx, rx) = sync_channel::<SupervisorMsg>(512);
-    spawn_socket_writer(Arc::clone(&stream_arc), rx);
+    // From here on every outgoing frame goes through `tx`, drained by the
+    // writer task. `cancel` tears both tasks down on steal-on-attach.
+    let (tx, mut rx) = mpsc::channel::<SupervisorMsg>(512);
+    let cancel = CancellationToken::new();
+    let writer = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    msg = rx.recv() => {
+                        let Some(msg) = msg else { break };
+                        let is_detached = matches!(msg, SupervisorMsg::Detached { .. });
+                        // Race the write against cancel: a steal must not wait
+                        // on a wedged socket. A half-written frame is fine — the
+                        // connection is being abandoned anyway.
+                        let wrote = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break,
+                            res = ipc::write_frame_async(&mut wr, &msg) => res,
+                        };
+                        if wrote.is_err() || is_detached {
+                            break;
+                        }
+                    }
+                }
+            }
+            // `wr` drops here, closing the write half.
+        })
+    };
     let chan = Arc::new(ClientChan {
         tx: tx.clone(),
-        stream: Arc::clone(&stream_arc),
+        cancel: cancel.clone(),
     });
 
-    // Steal active slot. We swap `active` under the registry mutex so cleanup
-    // paths (which also hold the mutex) observe a consistent (chan, pid) pair.
+    // Steal the active slot under the registry mutex so cleanup paths observe a
+    // consistent (chan, pid) pair.
     let (generation, old) = {
         let mut reg = shared.registry.lock().unwrap();
         let old = shared.active.swap(Some(Arc::clone(&chan)));
@@ -224,213 +334,198 @@ fn serve_client(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
         (generation, old)
     };
     if let Some(old) = old {
-        // try_send so we never block on a wedged old client; the shutdown()
-        // below is what actually frees its writer thread if the channel is
-        // full or the socket is jammed.
+        // try_send so we never block on a wedged old client; cancel() is what
+        // actually frees its reader + writer tasks.
         let _ = old.tx.try_send(SupervisorMsg::Detached {
             reason: "new client attached".into(),
         });
-        let _ = old.stream.shutdown(std::net::Shutdown::Both);
+        old.cancel.cancel();
     }
 
-    // Immediately push a dump for every existing session so the client can
-    // restore its rendered view.
+    // Push a dump for every existing session so the client restores its view.
     for meta in &sessions_snapshot {
-        if let Some(sess) = shared
+        let sess = shared
             .registry
             .lock()
             .unwrap()
             .sessions
             .get(&meta.id)
-            .cloned()
-        {
-            send_dump(&tx, meta.id, &sess);
+            .cloned();
+        if let Some(sess) = sess {
+            let _ = tx.send(build_dump(meta.id, &sess)).await;
         }
     }
 
-    // Command loop.
-    let result = (|| -> Result<()> {
-        loop {
-            let msg: ClientMsg = ipc::read_frame(&mut reader)?;
-            match msg {
-                ClientMsg::Spawn {
-                    request_id,
+    let result = command_loop(&shared, &mut rd, &tx, &cancel).await;
+
+    // Clean up if we're still the active client (attach updates `active` under
+    // the registry mutex, so the generation check is consistent).
+    {
+        let mut reg = shared.registry.lock().unwrap();
+        if shared.active_generation.load(Ordering::Acquire) == generation {
+            shared.active.store(None);
+            reg.usage_subscribed = false;
+            reg.active_client_pid = None;
+        }
+    }
+    // Stop the writer task and drop our senders; `rd` drops on return.
+    cancel.cancel();
+    drop(tx);
+    drop(chan);
+    let _ = writer.await;
+    result
+}
+
+/// The per-client command loop: read `ClientMsg`s and dispatch. Returns when
+/// the client disconnects (EOF) or the connection is cancelled (steal).
+async fn command_loop<R>(
+    shared: &Arc<Shared>,
+    rd: &mut R,
+    tx: &mpsc::Sender<SupervisorMsg>,
+    cancel: &CancellationToken,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let msg: ClientMsg = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            r = ipc::read_frame_async(rd) => r?,
+        };
+        match msg {
+            ClientMsg::Spawn {
+                request_id,
+                project_slug,
+                worktree_name,
+                rows,
+                cols,
+                cwd,
+                initial_command,
+            } => {
+                let result = spawn_session(
+                    shared,
                     project_slug,
                     worktree_name,
                     rows,
                     cols,
                     cwd,
                     initial_command,
-                } => {
-                    let result = spawn_session(
-                        &shared,
-                        project_slug,
-                        worktree_name,
+                );
+                match result {
+                    Ok(id) => {
+                        // Wire-protocol invariant: `Spawned` MUST precede
+                        // `OutputDump` for the same id on the same channel. The
+                        // writer drains FIFO, so sending Spawned first preserves
+                        // order.
+                        tx.send(SupervisorMsg::Spawned { request_id, id })
+                            .await
+                            .map_err(|_| anyhow::anyhow!("writer task closed"))?;
+                        let sess = shared.registry.lock().unwrap().sessions.get(&id).cloned();
+                        if let Some(sess) = sess {
+                            let _ = tx.send(build_dump(id, &sess)).await;
+                        }
+                    }
+                    Err(e) => {
+                        tx.send(SupervisorMsg::SpawnFailed {
+                            request_id,
+                            error: format!("{e:#}"),
+                        })
+                        .await
+                        .map_err(|_| anyhow::anyhow!("writer task closed"))?;
+                    }
+                }
+            }
+            ClientMsg::WriteBytes { id, bytes } => {
+                let sess = shared.registry.lock().unwrap().sessions.get(&id).cloned();
+                if let Some(sess) = sess {
+                    // The per-session PTY writer thread has its own bounded
+                    // queue; this `send` is non-blocking unless that queue is
+                    // full, in which case it paces this client's intake.
+                    let _ = sess.write_tx.send(bytes);
+                }
+            }
+            ClientMsg::Resize { id, rows, cols } => {
+                if let Some(sess) = shared.registry.lock().unwrap().sessions.get(&id).cloned() {
+                    let _ = sess.master.lock().unwrap().resize(PtySize {
                         rows,
                         cols,
-                        cwd,
-                        initial_command,
-                    );
-                    match result {
-                        Ok(id) => {
-                            // Wire-protocol invariant: `Spawned` MUST be sent
-                            // before `OutputDump` for the same id, on the same
-                            // channel. The writer thread drains FIFO so as
-                            // long as we push Spawned before the dump, order
-                            // is preserved.
-                            tx.send(SupervisorMsg::Spawned { request_id, id })
-                                .map_err(|_| anyhow::anyhow!("writer thread closed"))?;
-                            if let Some(sess) =
-                                shared.registry.lock().unwrap().sessions.get(&id).cloned()
-                            {
-                                send_dump(&tx, id, &sess);
-                            }
-                        }
-                        Err(e) => {
-                            tx.send(SupervisorMsg::SpawnFailed {
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                    if let Ok(mut p) = sess.parser.lock() {
+                        p.screen_mut().set_size(rows, cols);
+                    }
+                }
+            }
+            ClientMsg::Kill { id } => {
+                kill_session(shared, id);
+            }
+            ClientMsg::Attach { id } => {
+                let sess = shared.registry.lock().unwrap().sessions.get(&id).cloned();
+                if let Some(sess) = sess {
+                    let _ = tx.send(build_dump(id, &sess)).await;
+                }
+            }
+            ClientMsg::SubscribeUsage => {
+                let mut reg = shared.registry.lock().unwrap();
+                reg.usage_subscribed = true;
+                if !reg.usage_thread_alive {
+                    reg.usage_thread_alive = true;
+                    drop(reg);
+                    spawn_usage_sampler(Arc::clone(shared));
+                }
+            }
+            ClientMsg::UnsubscribeUsage => {
+                shared.registry.lock().unwrap().usage_subscribed = false;
+            }
+            ClientMsg::Op { request_id, req } => {
+                // Run off the command loop — `worktree add` can take minutes and
+                // would otherwise freeze WriteBytes/Resize. Reply goes to the
+                // active client's writer.
+                match shared.active.load_full() {
+                    None => {
+                        tracing::warn!(request_id, "Op with no active client; dropping")
+                    }
+                    Some(chan) => match req {
+                        OpRequest::FetchPr {
+                            repo_path,
+                            worktrees,
+                        } => {
+                            if let Err(e) = shared.gh_tx.send(GhJob {
                                 request_id,
-                                error: format!("{e:#}"),
-                            })
-                            .map_err(|_| anyhow::anyhow!("writer thread closed"))?;
-                        }
-                    }
-                }
-                ClientMsg::WriteBytes { id, bytes } => {
-                    let sess = shared.registry.lock().unwrap().sessions.get(&id).cloned();
-                    if let Some(sess) = sess {
-                        // Blocking send: when the PTY back-pressures (shell
-                        // readline grinding on a huge paste), this paces *this
-                        // client's* command intake, which transitively
-                        // back-pressures the socket → the client's writer.
-                        // That's the kernel flow-control we want, and it never
-                        // drops bytes. We do NOT hold the registry lock here
-                        // (sess is a cloned Arc), and the PTY writer thread is
-                        // decoupled from the active-writer slot, so a slow PTY
-                        // can't re-wedge the supervisor or block steal-on-attach.
-                        let _ = sess.write_tx.send(bytes);
-                    }
-                }
-                ClientMsg::Resize { id, rows, cols } => {
-                    if let Some(sess) = shared.registry.lock().unwrap().sessions.get(&id).cloned() {
-                        let _ = sess.master.lock().unwrap().resize(PtySize {
-                            rows,
-                            cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        });
-                        if let Ok(mut p) = sess.parser.lock() {
-                            p.screen_mut().set_size(rows, cols);
-                        }
-                    }
-                }
-                ClientMsg::Kill { id } => {
-                    kill_session(&shared, id);
-                }
-                ClientMsg::Attach { id } => {
-                    if let Some(sess) = shared.registry.lock().unwrap().sessions.get(&id).cloned() {
-                        send_dump(&tx, id, &sess);
-                    }
-                }
-                ClientMsg::SubscribeUsage => {
-                    let mut reg = shared.registry.lock().unwrap();
-                    reg.usage_subscribed = true;
-                    if !reg.usage_thread_alive {
-                        reg.usage_thread_alive = true;
-                        drop(reg);
-                        spawn_usage_sampler(Arc::clone(&shared));
-                    }
-                }
-                ClientMsg::UnsubscribeUsage => {
-                    shared.registry.lock().unwrap().usage_subscribed = false;
-                }
-                ClientMsg::Op { request_id, req } => {
-                    // Run off the command loop — `worktree add` can take
-                    // minutes and would otherwise freeze WriteBytes/Resize for
-                    // this client. Reply goes to the active client's writer.
-                    match shared.active.load_full() {
-                        None => {
-                            tracing::warn!(request_id, "Op with no active client; dropping")
-                        }
-                        Some(chan) => match req {
-                            OpRequest::FetchPr {
                                 repo_path,
                                 worktrees,
-                            } => {
-                                if let Err(e) = shared.gh_tx.send(GhJob {
-                                    request_id,
-                                    repo_path,
-                                    worktrees,
-                                    chan,
-                                }) {
-                                    tracing::warn!("gh worker channel closed: {e}");
-                                }
+                                chan,
+                            }) {
+                                tracing::warn!("gh worker channel closed: {e}");
                             }
-                            git_op => {
-                                thread::spawn(move || {
-                                    // Drop guard: if `run_git_op` panics, the
-                                    // guard's Drop still sends an Err so the
-                                    // client's `pending_op` status never wedges.
-                                    let guard = OpReplyGuard::new(chan, request_id);
-                                    let result = run_git_op(git_op);
-                                    guard.complete(result);
-                                });
-                            }
-                        },
-                    }
-                }
-                ClientMsg::Shutdown => {
-                    tracing::info!("shutdown requested by client");
-                    shutdown_all(&shared);
-                    // Unlink the socket *before* exiting so a racing client
-                    // probe gets ENOENT and respawns instead of attaching to
-                    // a half-dead supervisor.
-                    let sock = ipc::resolve_socket_path();
-                    let _ = std::fs::remove_file(&sock);
-                    std::process::exit(0);
+                        }
+                        git_op => {
+                            thread::spawn(move || {
+                                // Drop guard: a panic in `run_git_op` still
+                                // sends an Err so the client's `pending_op`
+                                // never wedges.
+                                let guard = OpReplyGuard::new(chan, request_id);
+                                let result = run_git_op(git_op);
+                                guard.complete(result);
+                            });
+                        }
+                    },
                 }
             }
+            ClientMsg::Shutdown => {
+                tracing::info!("shutdown requested by client");
+                shutdown_all(shared);
+                // Unlink the socket *before* exiting so a racing client probe
+                // gets ENOENT and respawns instead of attaching to a half-dead
+                // supervisor.
+                let sock = ipc::resolve_socket_path();
+                let _ = std::fs::remove_file(&sock);
+                std::process::exit(0);
+            }
         }
-    })();
-
-    // Clean up if we're still the active client. We synchronize against
-    // attach via the registry mutex — attach updates `active` while holding
-    // this lock, so checking generation here gives a consistent view.
-    let mut reg = shared.registry.lock().unwrap();
-    if shared.active_generation.load(Ordering::Acquire) == generation {
-        shared.active.store(None);
-        reg.usage_subscribed = false;
-        reg.active_client_pid = None;
     }
-    drop(reg);
-    // Dropping `tx` and `chan` here ends the writer thread once any frames
-    // already in flight have been flushed.
-    drop(chan);
-    drop(tx);
-    // Shutdown the read half of the underlying stream too — `ipc::read_frame`
-    // on the client side returns EOF cleanly. The writer thread still owns
-    // its clone for ordered shutdown.
-    let _ = stream_arc.shutdown(std::net::Shutdown::Read);
-    result
-}
-
-/// Drains outgoing frames from `rx` and writes them to `stream` until the
-/// channel disconnects or the socket errors. Shutting down the fd from the
-/// outside (steal-on-attach) makes the next `write_frame` return an error,
-/// which is what lets this thread terminate even when parked on back-pressure.
-fn spawn_socket_writer(stream: Arc<UnixStream>, rx: std::sync::mpsc::Receiver<SupervisorMsg>) {
-    thread::spawn(move || {
-        let mut s: &UnixStream = &stream;
-        while let Ok(msg) = rx.recv() {
-            let is_detached = matches!(msg, SupervisorMsg::Detached { .. });
-            if ipc::write_frame(&mut s, &msg).is_err() {
-                break;
-            }
-            if is_detached {
-                break;
-            }
-        }
-        let _ = stream.shutdown(std::net::Shutdown::Both);
-    });
 }
 
 fn spawn_session(
@@ -550,13 +645,13 @@ fn spawn_session(
                             cached = shared.active.load_full().map(|c| (cur_gen, c));
                         }
                         if let Some((_, chan)) = &cached {
-                            // Bounded send: a slow client back-pressures the
-                            // PTY reader (capacity 512). If the client's
-                            // socket dies, the writer thread bails on EPIPE,
-                            // drops the receiver, and this send returns Err —
-                            // at which point we clear the cache so the next
-                            // iteration sees None (or a new attached client).
-                            let res = chan.tx.send(SupervisorMsg::OutputDelta {
+                            // Bounded blocking_send: a slow client back-pressures
+                            // the PTY reader (capacity 512). If the client's
+                            // socket dies, the writer task drops the receiver and
+                            // this returns Err — we clear the cache so the next
+                            // iteration sees None (or a newly-attached client).
+                            // Legal off-runtime: this is a plain std thread.
+                            let res = chan.tx.blocking_send(SupervisorMsg::OutputDelta {
                                 id,
                                 bytes: buf[..n].to_vec(),
                             });
@@ -590,7 +685,7 @@ fn spawn_session(
                 shared.active.load_full()
             };
             if let Some(chan) = active {
-                let _ = chan.tx.send(SupervisorMsg::Exited { id });
+                let _ = chan.tx.blocking_send(SupervisorMsg::Exited { id });
             }
         });
     }
@@ -633,7 +728,7 @@ impl OpReplyGuard {
     }
 
     fn complete(mut self, result: OpResult) {
-        let _ = self.chan.tx.send(SupervisorMsg::OpResult {
+        let _ = self.chan.tx.blocking_send(SupervisorMsg::OpResult {
             request_id: self.request_id,
             result,
         });
@@ -645,7 +740,7 @@ impl Drop for OpReplyGuard {
     fn drop(&mut self) {
         if self.armed {
             tracing::warn!(self.request_id, "op thread ended without a result");
-            let _ = self.chan.tx.send(SupervisorMsg::OpResult {
+            let _ = self.chan.tx.blocking_send(SupervisorMsg::OpResult {
                 request_id: self.request_id,
                 result: Err("operation ended without a result".into()),
             });
@@ -796,12 +891,14 @@ fn run_fetch_pr(job: GhJob, superseded: Vec<(u64, Arc<ClientChan>)>) {
     };
     // ACK coalesced requests first (cloning the shared result), then the live one.
     for (rid, sc) in superseded {
-        let _ = sc.tx.send(SupervisorMsg::OpResult {
+        let _ = sc.tx.blocking_send(SupervisorMsg::OpResult {
             request_id: rid,
             result: result.clone(),
         });
     }
-    let _ = chan.tx.send(SupervisorMsg::OpResult { request_id, result });
+    let _ = chan
+        .tx
+        .blocking_send(SupervisorMsg::OpResult { request_id, result });
 }
 
 /// Snapshot all sessions, SIGTERM each child's PID group, give the reapers
@@ -840,7 +937,7 @@ fn shutdown_all(shared: &Arc<Shared>) {
 /// Falls back to `contents_formatted()` if the log is empty (fresh session)
 /// or hard-truncated (no newline boundary inside the scan window, so replay
 /// could land mid-CSI).
-fn send_dump(tx: &SyncSender<SupervisorMsg>, id: SessionId, sess: &Supervised) {
+fn build_dump(id: SessionId, sess: &Supervised) -> SupervisorMsg {
     let mut bytes = mode_prelude(&sess.parser.lock().unwrap());
     // Keyboard-protocol state lives outside vt100, in our own tracker; re-emit
     // it alongside the DECSET modes so the client's tracker re-syncs.
@@ -855,7 +952,7 @@ fn send_dump(tx: &SyncSender<SupervisorMsg>, id: SessionId, sess: &Supervised) {
             bytes.extend(log.buf.iter().copied());
         }
     }
-    let _ = tx.send(SupervisorMsg::OutputDump { id, bytes });
+    SupervisorMsg::OutputDump { id, bytes }
 }
 
 /// Escape-sequence prelude that puts the receiving vt100 parser back into

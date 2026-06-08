@@ -7,6 +7,7 @@
 use crate::app::PrStatus;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -238,7 +239,9 @@ fn config() -> bincode::config::Configuration {
     bincode::config::standard()
 }
 
-/// Serialize and write one length-delimited message.
+/// Serialize and write one length-delimited message. The live transport is
+/// async ([`write_frame_async`]); this sync twin backs the round-trip tests.
+#[cfg(test)]
 pub fn write_frame<W: Write, T: Serialize>(w: &mut W, value: &T) -> Result<()> {
     let bytes = bincode::serde::encode_to_vec(value, config())?;
     let len: u32 = bytes
@@ -255,6 +258,8 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, value: &T) -> Result<()> {
 }
 
 /// Read one length-delimited message, blocking until a full frame arrives.
+/// Sync twin of [`read_frame_async`]; used by the round-trip tests.
+#[cfg(test)]
 pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> Result<T> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
@@ -264,6 +269,46 @@ pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> Result<T>
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf)?;
+    let (value, _) = bincode::serde::decode_from_slice(&buf, config())?;
+    Ok(value)
+}
+
+/// Async twin of [`write_frame`] for tokio streams (UDS or TLS-over-TCP).
+pub async fn write_frame_async<W, T>(w: &mut W, value: &T) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: Serialize,
+{
+    use tokio::io::AsyncWriteExt;
+    let bytes = bincode::serde::encode_to_vec(value, config())?;
+    let len: u32 = bytes
+        .len()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("frame too large"))?;
+    if len > MAX_FRAME {
+        bail!("frame too large: {len} bytes");
+    }
+    w.write_all(&len.to_be_bytes()).await?;
+    w.write_all(&bytes).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+/// Async twin of [`read_frame`]; awaits a full length-delimited frame.
+pub async fn read_frame_async<R, T>(r: &mut R) -> Result<T>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
+    use tokio::io::AsyncReadExt;
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf);
+    if len > MAX_FRAME {
+        bail!("frame too large: {len} bytes");
+    }
+    let mut buf = vec![0u8; len as usize];
+    r.read_exact(&mut buf).await?;
     let (value, _) = bincode::serde::decode_from_slice(&buf, config())?;
     Ok(value)
 }
@@ -305,6 +350,34 @@ pub fn supervisor_log_path(sock: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[tokio::test]
+    async fn async_frame_round_trip() {
+        // Write several frames into one half of a duplex pipe, read them back
+        // from the other — exercising the length-prefix + bincode path that the
+        // remote transport relies on.
+        let (mut a, mut b) = tokio::io::duplex(64 * 1024);
+        let sent = vec![
+            ClientMsg::Resize {
+                id: 3,
+                rows: 24,
+                cols: 80,
+            },
+            ClientMsg::Shutdown,
+        ];
+        for m in &sent {
+            write_frame_async(&mut a, m).await.unwrap();
+        }
+        drop(a);
+        for expected in &sent {
+            let got: ClientMsg = read_frame_async(&mut b).await.unwrap();
+            // ClientMsg has no PartialEq; compare via canonical encoding.
+            assert_eq!(
+                bincode::serde::encode_to_vec(&got, config()).unwrap(),
+                bincode::serde::encode_to_vec(expected, config()).unwrap(),
+            );
+        }
+    }
 
     #[test]
     fn roundtrip_client_msgs() {
