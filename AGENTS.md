@@ -11,9 +11,15 @@ codebase. Humans should read `README.md` first.
   reducer. New side effects are new `Command` variants executed by
   `src/runtime.rs::execute`.
 - **Do not block the main task.** Tokio's main task in `runtime.rs` only
-  orchestrates the event loop. Blocking IO (git subprocess, IPC frame
-  write, config write) happens on `std::thread::spawn`. Results come back
-  as `Action`s via `mpsc::Sender<Action>`.
+  orchestrates the event loop. Client-side blocking IO (IPC frame write,
+  config write) happens on `std::thread::spawn`; results come back as
+  `Action`s via `mpsc::Sender<Action>`. **Git/`gh` no longer run client-side
+  at all** — they're shipped to the supervisor as `ClientMsg::Op` (see Async
+  ops contract).
+- **Disk/process work belongs in the supervisor.** Git and `gh` run inside
+  the supervisor process so it can one day run remotely; the client keeps
+  only config + rendering. Don't add `Command::new("git")`/`gh` calls to the
+  client.
 - **PTYs live in the supervisor, not the client.** The TUI process is a
   thin attach-client; PTY masters, vt100 parsers, and child processes are
   owned by a long-lived sibling process started via `imbuia --supervisor`.
@@ -39,7 +45,8 @@ codebase. Humans should read `README.md` first.
 | `app.rs`          | Plain types: `AppState`, `Project`, `Worktree`, `Action`, `Command`, popups. |
 | `commands.rs`     | Ex-style `:command` registry (`COMMANDS: &[CmdSpec]`) + handlers. |
 | `config.rs`       | TOML schema, atomic write, slugging, XDG resolution.             |
-| `git.rs`          | `std::process::Command` wrappers (`validate_repo`, `head_branch`, `worktree_add`, `worktree_remove`). |
+| `git.rs`          | `std::process::Command` wrappers (`validate_repo`, `head_branch`, `worktree_add`, `worktree_remove`). **Run inside the supervisor**, not the client (see Disk ops below). |
+| `github.rs`       | `gh` CLI wrapper for PR status. Also **run inside the supervisor**. |
 | `session.rs`      | `Session` trait + `FakeSession` for tests. The real impl is in `client.rs`. |
 | `client.rs`       | `ProxySession` (client-side `Session` impl over the socket), `connect_or_spawn`, double-fork helpers, reader task. |
 | `supervisor.rs`   | `imbuia --supervisor` entry: PTY spawn/own (portable-pty + vt100), single-client accept loop, frame dispatcher. |
@@ -64,10 +71,11 @@ crossterm Event ─► input::map ─► Action ─┐
               │                                                      ├─► SpawnInWorktree → SupervisorClient::request_spawn┤
               │                                                      │                       (ClientMsg::Spawn) ──────────┤
               │                                                      ├─► KillSession / RestartSupervisor (ClientMsg) ─────┤   UDS frames
-              │                                                      ├─► OpenProject / AddWorktree / RemoveWorktree       │   ◄────────────
-              │                                                      │   (std::thread::spawn, post Action — local git)    │
-              │                                                      └─► SaveGlobalConfig / SaveProjectConfig             │       │
-              │                                                          (sync, atomic write)                              │       ▼
+              │                                                      ├─► OpenProject / AddWorktree / RemoveWorktree /     │   ◄────────────
+              │                                                      │   ImportWorktrees / FetchPrStatuses               │
+              │                                                      │   → SupervisorClient::request_* (ClientMsg::Op) ──┤       │
+              │                                                      └─► SaveGlobalConfig / SaveProjectConfig             │       ▼
+              │                                                          (sync, atomic write — config stays client-side)  │
               ▼                                                                                                            │   ┌─────────────────────┐
          AppState ── render ──► ratatui Frame                                                                              │   │ accept loop         │
               ▲                                                                                                            │   │  - handshake        │
@@ -75,7 +83,7 @@ crossterm Event ─► input::map ─► Action ─┐
               │                                                                                                            │   │  - dispatch ClientMsg
    client::spawn_reader thread                                                                                             │   └─────────────────────┘
         ▲                                                                                                                  │       │
-        │  SupervisorMsg::OutputDump / OutputDelta / Spawned / Exited / Detached                                           │       ▼
+        │  SupervisorMsg::OutputDump / OutputDelta / Spawned / Exited / Detached / OpResult                                │       ▼
         └────────────────────────────────────────────────────────────────────────────────────────────────────────────────►│   per-session reader thread
                                                                                                                             │     PTY → parser.process(bytes)
                                                                                                                             │     bytes → SupervisorMsg::OutputDelta ──► active client writer
@@ -162,25 +170,47 @@ crossterm Event ─► input::map ─► Action ─┐
 
 ## Async ops contract
 
-For long-running **local** side effects (`OpenProject`, `AddWorktree`,
-`RemoveWorktree` — anything that shells out to `git`), the convention is:
+**Anything that touches the supervisor's disk or shells out (git, `gh`) runs
+in the supervisor**, never the client. The client only ever does config
+(load/save TOML, slug computation) and rendering. This is the boundary that
+lets the supervisor one day run on a remote host. Git ops (`OpenProject`,
+`ImportWorktrees`, `AddWorktree`, `RemoveWorktree`) and the PR fetch
+(`FetchPrStatuses`) all go over the socket; the convention is:
 
 1. Reducer pushes the `Command` and sets `state.pending_op = Some("…")`.
-2. `runtime::execute` spawns a `std::thread::spawn` that runs the blocking
-   work.
-3. On success the thread posts e.g. `Action::WorktreeAdded { … }`.
-4. On failure it posts `Action::OperationFailed(msg)` → reducer clears
-   `pending_op` and sets `command_status`.
+2. `runtime::execute` calls `SupervisorClient::request_*`, which allocates a
+   `request_id`, records a `PendingOp` continuation, and ships a
+   `ClientMsg::Op { request_id, req: OpRequest }`. (`next_request` is shared
+   with `pending_spawns` — one id space, two maps.)
+3. The supervisor runs the op **off its command loop** (a throwaway thread per
+   git op; a singleton serial `gh` worker for `FetchPr` — `worktree add` can
+   take minutes and must not freeze WriteBytes/Resize). It replies with
+   `SupervisorMsg::OpResult { request_id, result }`. An `OpReplyGuard`
+   guarantees a reply even on panic, so `pending_op` never wedges.
+4. `client::spawn_reader` matches `OpResult` to its `PendingOp` and posts the
+   *same* `Action` the old local threads posted (`WorktreeAdded`,
+   `ProjectValidated`, `PrStatusesFetched`, …) — so the **reducer is
+   unchanged**. Errors become `OperationFailed` (or `PrFetchFailed`), clearing
+   `pending_op`.
 
-When adding a new async op, follow that pattern. Don't `await` in
-`execute` and don't add new tokio tasks — pure thread spawn is cheaper and
-matches existing code.
+The supervisor stays **stateless about projects**: every `OpRequest` carries
+the `repo_path` (like `Spawn` carries `cwd`). It never resolves slugs or holds
+a project model — that's all client/config side.
 
-For **PTY-side** async ops, the pattern is different: the request goes
-out over the socket as a `ClientMsg`, and the response arrives as a
-`SupervisorMsg` handled by `client::spawn_reader`. `Spawn` is the only
-request/response variant (correlated via `request_id` against
-`pending_spawns`); the rest are fire-and-forget.
+`OpenProject` splits: the supervisor validates + canonicalizes + reads HEAD
+(`OpRequest::Validate` → `ProjectInfo`); the reducer's `ProjectValidated` arm
+then computes the slug (needs the other projects' slugs) and builds + persists
+the `Project`. Slug/save are config logic and stay client-side.
+
+When adding a new disk/process op: add an `OpRequest`/`OpOk` variant, a
+`PendingOp` continuation + `request_*` method in `client.rs`, a supervisor
+handler (thread or worker — never inline on the command loop), and map the
+`OpResult` back to an existing `Action` in `spawn_reader`. Don't run git/`gh`
+in `runtime.rs` and don't add tokio tasks there.
+
+`Spawn`/`Spawned` and `Op`/`OpResult` are the only request/response pairs
+(correlated via `request_id` against `pending_spawns` / `pending_ops`); the
+rest of the `ClientMsg`s are fire-and-forget.
 
 ## Persistence
 

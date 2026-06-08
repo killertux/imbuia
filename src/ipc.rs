@@ -4,6 +4,7 @@
 //! payload. Bincode v2 with the `serde` feature is used so the wire types can
 //! piggy-back on existing `Serialize` derives.
 
+use crate::app::PrStatus;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -75,7 +76,76 @@ pub enum ClientMsg {
     SubscribeUsage,
     /// Stop emitting `Usage` frames.
     UnsubscribeUsage,
+    /// A disk/process-touching operation the supervisor runs on the client's
+    /// behalf (git, `gh`). Asynchronous request/response correlated by
+    /// `request_id` — the supervisor replies with [`SupervisorMsg::OpResult`].
+    /// Moving these supervisor-side keeps all filesystem access on the host
+    /// that owns the repos (so the supervisor can one day run remotely while
+    /// the client only keeps config).
+    Op {
+        request_id: u64,
+        req: OpRequest,
+    },
 }
+
+/// A repo-touching operation. Every variant carries the `repo_path` (the
+/// supervisor is stateless about projects — just like `Spawn` carries `cwd`).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum OpRequest {
+    /// Canonicalize + verify the path is a git work tree, read HEAD branch.
+    Validate { repo_path: PathBuf },
+    /// `git worktree list --porcelain`.
+    ListWorktrees { repo_path: PathBuf },
+    /// `git worktree add` (computing the destination path supervisor-side).
+    WorktreeAdd { repo_path: PathBuf, branch: String },
+    /// `git worktree remove --force` + optional `git branch -D`.
+    WorktreeRemove {
+        repo_path: PathBuf,
+        dest_path: PathBuf,
+        branch: Option<String>,
+    },
+    /// Per-worktree live HEAD resolution + `gh pr list`. `worktrees` is
+    /// `(worktree_idx, worktree_cwd)`; the supervisor resolves each branch
+    /// live so a `git switch` inside a worktree is picked up.
+    FetchPr {
+        repo_path: PathBuf,
+        worktrees: Vec<(usize, PathBuf)>,
+    },
+}
+
+/// Disk-derived facts the client needs to build a project, computed
+/// supervisor-side. The slug is NOT here — it's derived client-side from the
+/// other projects' slugs (config logic stays on the client).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProjectInfo {
+    pub canonical_path: PathBuf,
+    pub repo_name: String,
+    pub head_branch: Option<String>,
+}
+
+/// Wire mirror of `git::WorktreeListEntry` (kept separate so `git.rs` stays
+/// serde-free).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorktreeEntry {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+}
+
+/// Successful payload of an [`OpRequest`], matched against the pending
+/// request's kind client-side.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum OpOk {
+    Validated(ProjectInfo),
+    Worktrees(Vec<WorktreeEntry>),
+    WorktreeAdded(WorktreeEntry),
+    WorktreeRemoved,
+    /// `(worktree_idx, classification)` — `None` means "no PR / detached".
+    PrStatuses(Vec<(usize, Option<PrStatus>)>),
+}
+
+/// Result of an [`OpRequest`]. `Err` carries a formatted message the client
+/// surfaces via `OperationFailed` (or `PrFetchFailed` for a fetch).
+pub type OpResult = std::result::Result<OpOk, String>;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SupervisorMsg {
@@ -110,6 +180,11 @@ pub enum SupervisorMsg {
     /// Periodic snapshot of resource usage for every supervised session +
     /// the supervisor's own process. Emitted while subscribed.
     Usage(UsageReport),
+    /// Reply to [`ClientMsg::Op`], correlated by `request_id`.
+    OpResult {
+        request_id: u64,
+        result: OpResult,
+    },
 }
 
 /// Snapshot of process resource usage across all supervised sessions.
@@ -257,6 +332,40 @@ mod tests {
             ClientMsg::Shutdown,
             ClientMsg::SubscribeUsage,
             ClientMsg::UnsubscribeUsage,
+            ClientMsg::Op {
+                request_id: 11,
+                req: OpRequest::Validate {
+                    repo_path: PathBuf::from("/repo"),
+                },
+            },
+            ClientMsg::Op {
+                request_id: 12,
+                req: OpRequest::ListWorktrees {
+                    repo_path: PathBuf::from("/repo"),
+                },
+            },
+            ClientMsg::Op {
+                request_id: 13,
+                req: OpRequest::WorktreeAdd {
+                    repo_path: PathBuf::from("/repo"),
+                    branch: "feat".into(),
+                },
+            },
+            ClientMsg::Op {
+                request_id: 14,
+                req: OpRequest::WorktreeRemove {
+                    repo_path: PathBuf::from("/repo"),
+                    dest_path: PathBuf::from("/repo-worktrees/feat"),
+                    branch: Some("feat".into()),
+                },
+            },
+            ClientMsg::Op {
+                request_id: 15,
+                req: OpRequest::FetchPr {
+                    repo_path: PathBuf::from("/repo"),
+                    worktrees: vec![(0, PathBuf::from("/repo")), (1, PathBuf::from("/wt"))],
+                },
+            },
         ];
         for msg in cases {
             let mut buf = Vec::new();
@@ -315,6 +424,40 @@ mod tests {
                 ts_ms: 1,
                 cpu_count: 8,
             }),
+            SupervisorMsg::OpResult {
+                request_id: 1,
+                result: Ok(OpOk::Validated(ProjectInfo {
+                    canonical_path: PathBuf::from("/repo"),
+                    repo_name: "repo".into(),
+                    head_branch: Some("main".into()),
+                })),
+            },
+            SupervisorMsg::OpResult {
+                request_id: 2,
+                result: Ok(OpOk::Worktrees(vec![WorktreeEntry {
+                    path: PathBuf::from("/repo"),
+                    branch: Some("main".into()),
+                }])),
+            },
+            SupervisorMsg::OpResult {
+                request_id: 3,
+                result: Ok(OpOk::WorktreeAdded(WorktreeEntry {
+                    path: PathBuf::from("/repo-worktrees/feat"),
+                    branch: Some("feat".into()),
+                })),
+            },
+            SupervisorMsg::OpResult {
+                request_id: 4,
+                result: Ok(OpOk::WorktreeRemoved),
+            },
+            SupervisorMsg::OpResult {
+                request_id: 5,
+                result: Ok(OpOk::PrStatuses(vec![(0, Some(PrStatus::Open)), (1, None)])),
+            },
+            SupervisorMsg::OpResult {
+                request_id: 6,
+                result: Err("boom".into()),
+            },
         ];
         for msg in cases {
             let mut buf = Vec::new();

@@ -40,11 +40,36 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
             state.sessions.remove(&id);
             remove_session_from_worktrees(state, id);
         }
-        Action::ProjectOpened {
-            project,
+        Action::ProjectValidated {
+            canonical_path,
+            repo_name,
+            head_branch,
+            setup_script,
             import_existing,
         } => {
             state.pending_op = None;
+            // Slug computation is config logic — it needs the *other* projects'
+            // slugs, which only the client/reducer knows. The supervisor just
+            // validated the path + read HEAD; we build & persist here.
+            let existing: Vec<String> = state.projects.iter().map(|p| p.slug.clone()).collect();
+            let slug = crate::config::compute_slug(&repo_name, &existing);
+            let main = crate::config::WorktreeConfig {
+                name: head_branch.clone().unwrap_or_else(|| "main".into()),
+                path: canonical_path.clone(),
+                branch: head_branch,
+            };
+            let cfg = crate::config::ProjectConfig {
+                slug,
+                name: repo_name,
+                path: canonical_path,
+                expanded: true,
+                setup_script,
+                worktrees: vec![main],
+                launchers: Vec::new(),
+                github_enabled: true,
+                gh_poll_interval_secs: None,
+            };
+            let project = crate::app::Project::from_config(cfg);
             let repo_path = project.repo_path.clone();
             state.projects.push(project);
             let new_idx = state.projects.len() - 1;

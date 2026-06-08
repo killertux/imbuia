@@ -1420,21 +1420,13 @@ fn cmd_open_sets_pending_op() {
 fn project_opened_clears_pending_op() {
     let mut s = AppState::new();
     s.pending_op = Some("Opening …".into());
-    let project = Project {
-        slug: "x".into(),
-        name: "x".into(),
-        repo_path: PathBuf::from("/tmp/x"),
-        worktrees: vec![],
-        expanded: true,
-        setup_script: None,
-        launchers: Vec::new(),
-        github_enabled: false,
-        gh_poll_interval_secs: None,
-    };
     let _ = reduce(
         &mut s,
-        Action::ProjectOpened {
-            project,
+        Action::ProjectValidated {
+            canonical_path: PathBuf::from("/tmp/x"),
+            repo_name: "x".into(),
+            head_branch: Some("main".into()),
+            setup_script: None,
             import_existing: false,
         },
     );
@@ -1484,21 +1476,13 @@ fn worktree_command_with_arg_emits_add_worktree() {
 #[test]
 fn project_opened_action_appends_and_saves() {
     let mut s = AppState::new();
-    let project = Project {
-        slug: "test".into(),
-        name: "test".into(),
-        repo_path: PathBuf::from("/tmp/test"),
-        worktrees: vec![],
-        expanded: true,
-        setup_script: None,
-        launchers: Vec::new(),
-        github_enabled: false,
-        gh_poll_interval_secs: None,
-    };
     let cmds = reduce(
         &mut s,
-        Action::ProjectOpened {
-            project,
+        Action::ProjectValidated {
+            canonical_path: PathBuf::from("/tmp/test"),
+            repo_name: "test".into(),
+            head_branch: Some("main".into()),
+            setup_script: None,
             import_existing: false,
         },
     );
