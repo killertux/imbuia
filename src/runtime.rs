@@ -1,7 +1,6 @@
-use crate::app::{Action, AppState, Command, Project, Worktree};
+use crate::app::{Action, AppState, Command, Project};
 use crate::client::{self, SupervisorClient};
 use crate::config;
-use crate::git;
 use crate::input;
 use crate::layout::TermSize;
 use crate::reducer::reduce;
@@ -12,7 +11,6 @@ use anyhow::Result;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io::stdout;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
@@ -37,13 +35,6 @@ pub async fn run() -> Result<()> {
     let supervisor = client::connect_or_spawn(Arc::clone(&notify), action_tx.clone())?;
 
     spawn_input_thread(action_tx.clone());
-
-    // Long-lived worker that serialises every `gh` invocation so a 2-min
-    // background poll never races with a foreground `:gh-refresh` (or another
-    // tick that arrived while gh was still chewing). Drops requests that
-    // arrive while one is already in flight for the *same project* — the
-    // newer request would observe the same upstream state anyway.
-    let gh_tx = spawn_gh_worker(action_tx.clone());
 
     let mut state = AppState::new();
     state.term_size = term_size;
@@ -74,7 +65,7 @@ pub async fn run() -> Result<()> {
     if !state.sessions.is_empty() {
         let cmds = reduce(&mut state, Action::Resize(term_size));
         for cmd in cmds {
-            execute(cmd, &state, &action_tx, &notify, &supervisor, &gh_tx);
+            execute(cmd, &state, &action_tx, &notify, &supervisor);
         }
     }
 
@@ -106,9 +97,9 @@ pub async fn run() -> Result<()> {
             biased;
             maybe_action = action_rx.recv() => {
                 let Some(action) = maybe_action else { break };
-                handle_action(&mut state, action, &action_tx, &notify, &supervisor, &gh_tx);
+                handle_action(&mut state, action, &action_tx, &notify, &supervisor);
                 while let Ok(action) = action_rx.try_recv() {
-                    handle_action(&mut state, action, &action_tx, &notify, &supervisor, &gh_tx);
+                    handle_action(&mut state, action, &action_tx, &notify, &supervisor);
                 }
                 redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
             }
@@ -116,12 +107,12 @@ pub async fn run() -> Result<()> {
                 redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
             }
             _ = update_tick.tick() => {
-                handle_action(&mut state, Action::PeriodicUpdateCheck, &action_tx, &notify, &supervisor, &gh_tx);
+                handle_action(&mut state, Action::PeriodicUpdateCheck, &action_tx, &notify, &supervisor);
                 redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
             }
             _ = pr_tick.tick() => {
                 if maybe_emit_pr_poll(&mut state, &mut pr_poll_last) {
-                    handle_action(&mut state, Action::PeriodicPrCheck, &action_tx, &notify, &supervisor, &gh_tx);
+                    handle_action(&mut state, Action::PeriodicPrCheck, &action_tx, &notify, &supervisor);
                     redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
                 }
             }
@@ -178,11 +169,10 @@ fn handle_action(
     action_tx: &mpsc::Sender<Action>,
     notify: &Arc<Notify>,
     supervisor: &Arc<SupervisorClient>,
-    gh_tx: &std::sync::mpsc::Sender<GhRequest>,
 ) {
     let cmds = reduce(state, action);
     for cmd in cmds {
-        execute(cmd, state, action_tx, notify, supervisor, gh_tx);
+        execute(cmd, state, action_tx, notify, supervisor);
     }
 }
 
@@ -192,7 +182,6 @@ fn execute(
     action_tx: &mpsc::Sender<Action>,
     _notify: &Arc<Notify>,
     supervisor: &Arc<SupervisorClient>,
-    gh_tx: &std::sync::mpsc::Sender<GhRequest>,
 ) {
     match cmd {
         Command::WriteKey(id, key) => {
@@ -258,25 +247,26 @@ fn execute(
             setup_script,
             import_existing,
         } => {
-            spawn_open_project(
-                path,
-                setup_script,
-                import_existing,
-                state.config_dir.clone(),
-                state_slugs(state),
-                action_tx,
-            );
+            if let Err(e) = supervisor.request_open_project(path, setup_script, import_existing) {
+                let _ = action_tx.blocking_send(Action::OperationFailed(format!("open: {e}")));
+            }
         }
         Command::ImportWorktrees {
             project_idx,
             repo_path,
-        } => spawn_import_worktrees(project_idx, repo_path, action_tx),
+        } => {
+            if let Err(e) = supervisor.request_import_worktrees(project_idx, repo_path) {
+                let _ = action_tx.blocking_send(Action::OperationFailed(format!("import: {e}")));
+            }
+        }
         Command::AddWorktree {
             project_idx,
             repo_path,
             branch,
         } => {
-            spawn_add_worktree(project_idx, repo_path, branch, action_tx);
+            if let Err(e) = supervisor.request_add_worktree(project_idx, repo_path, branch) {
+                let _ = action_tx.blocking_send(Action::OperationFailed(format!("worktree: {e}")));
+            }
         }
         Command::RemoveWorktree {
             project_idx,
@@ -285,14 +275,16 @@ fn execute(
             dest_path,
             branch,
         } => {
-            spawn_remove_worktree(
+            if let Err(e) = supervisor.request_remove_worktree(
                 project_idx,
                 worktree_idx,
                 repo_path,
                 dest_path,
                 branch,
-                action_tx,
-            );
+            ) {
+                let _ = action_tx
+                    .blocking_send(Action::OperationFailed(format!("remove worktree: {e}")));
+            }
         }
         Command::SaveGlobalConfig => {
             let global = config::GlobalConfig {
@@ -327,14 +319,10 @@ fn execute(
             repo_path,
             worktrees,
         } => {
-            // Fire-and-forget: the worker thread serialises and forwards
-            // results via the same action_tx channel.
-            if let Err(e) = gh_tx.send(GhRequest {
-                project_idx,
-                repo_path,
-                worktrees,
-            }) {
-                tracing::warn!("gh worker channel closed: {e}");
+            // The supervisor's gh worker serialises and coalesces; the reader
+            // posts PrStatusesFetched / PrFetchFailed back.
+            if let Err(e) = supervisor.request_fetch_pr(project_idx, repo_path, worktrees) {
+                tracing::warn!("gh fetch request failed: {e}");
             }
         }
         Command::CheckForUpdate => spawn_update_check(action_tx),
@@ -381,110 +369,6 @@ fn maybe_emit_pr_poll(
     any
 }
 
-/// Message handed to the gh worker. One request = one project's worth of
-/// branch lookups.
-struct GhRequest {
-    project_idx: usize,
-    repo_path: PathBuf,
-    worktrees: Vec<(usize, PathBuf)>,
-}
-
-/// Spawn the singleton worker. Returns its inbox sender.
-///
-/// The thread drains its queue serially: while it's processing project A,
-/// other requests pile up in the channel and run after. Coalescing: before
-/// starting a request, we drain any *additional* pending requests for the
-/// same project and keep only the newest — they'd just observe the same
-/// upstream state anyway.
-fn spawn_gh_worker(action_tx: mpsc::Sender<Action>) -> std::sync::mpsc::Sender<GhRequest> {
-    let (tx, rx) = std::sync::mpsc::channel::<GhRequest>();
-    std::thread::spawn(move || {
-        while let Ok(mut req) = rx.recv() {
-            // Drain anything else already queued; collapse same-project
-            // requests down to the newest one.
-            while let Ok(next) = rx.try_recv() {
-                if next.project_idx == req.project_idx {
-                    req = next;
-                } else {
-                    // Different project — process the current one first, then
-                    // re-queue `next` at the front by handling it after this
-                    // iteration. Simplest: handle req now, then handle next.
-                    do_fetch(req, &action_tx);
-                    req = next;
-                }
-            }
-            do_fetch(req, &action_tx);
-        }
-        tracing::info!("gh worker exiting (channel closed)");
-    });
-    tx
-}
-
-fn do_fetch(req: GhRequest, action_tx: &mpsc::Sender<Action>) {
-    let GhRequest {
-        project_idx,
-        repo_path,
-        worktrees,
-    } = req;
-    let tx = action_tx.clone();
-    // Inline body — the function used to spawn its own thread; now we run
-    // synchronously on the worker so requests are serialised.
-    let work = move || {
-        tracing::info!(
-            project_idx,
-            n = worktrees.len(),
-            repo = %repo_path.display(),
-            "gh: fetching per-worktree PR status"
-        );
-        let mut statuses: Vec<(usize, Option<crate::app::PrStatus>)> =
-            Vec::with_capacity(worktrees.len());
-        let mut last_err: Option<String> = None;
-        let mut any_ok = false;
-        for (wi, wt_path) in worktrees {
-            // Live HEAD resolution — picks up `git switch` inside the worktree.
-            let branch = match crate::git::head_branch(&wt_path) {
-                Ok(Some(b)) => b,
-                Ok(None) => {
-                    tracing::info!(project_idx, wi, path = %wt_path.display(), "gh: detached HEAD, skipping");
-                    statuses.push((wi, None));
-                    any_ok = true;
-                    continue;
-                }
-                Err(e) => {
-                    let msg = format!("git symbolic-ref failed: {e}");
-                    tracing::warn!(project_idx, wi, path = %wt_path.display(), "{msg}");
-                    last_err = Some(msg);
-                    continue;
-                }
-            };
-            match crate::github::fetch_pr_by_branch(&repo_path, &branch) {
-                Ok(s) => {
-                    any_ok = true;
-                    tracing::info!(project_idx, wi, %branch, status = ?s, "gh: branch status");
-                    statuses.push((wi, s));
-                }
-                Err(e) => {
-                    let msg = format!("{e}");
-                    tracing::warn!(project_idx, wi, %branch, "gh: branch fetch failed: {msg}");
-                    last_err = Some(msg);
-                }
-            }
-        }
-        if !any_ok && let Some(msg) = last_err {
-            let _ = tx.blocking_send(Action::PrFetchFailed {
-                project_idx,
-                message: msg,
-            });
-            return;
-        }
-        let _ = tx.blocking_send(Action::PrStatusesFetched {
-            project_idx,
-            statuses,
-        });
-    };
-    work();
-}
-
 fn spawn_update_check(action_tx: &mpsc::Sender<Action>) {
     let tx = action_tx.clone();
     tokio::task::spawn_blocking(move || {
@@ -515,218 +399,6 @@ fn spawn_update_install(tag: String, action_tx: &mpsc::Sender<Action>) {
 
 fn state_slugs(state: &AppState) -> Vec<String> {
     state.projects.iter().map(|p| p.slug.clone()).collect()
-}
-
-/// Drop guard for `state.pending_op`-bearing async ops. The reducer sets
-/// `pending_op = Some(label)` when an op kicks off and clears it only when
-/// it sees a terminal `Action` (`*Added`, `*Removed`, `ProjectOpened`,
-/// `WorktreesImported`, `OperationFailed`). If a blocking task panics or
-/// exits without posting any of those, the status bar would stick on the
-/// "doing X…" message forever. The guard's `Drop` posts an
-/// `OperationFailed` in that case, which clears `pending_op`.
-struct OpGuard {
-    tx: mpsc::Sender<Action>,
-    label: &'static str,
-    armed: bool,
-}
-
-impl OpGuard {
-    fn new(tx: mpsc::Sender<Action>, label: &'static str) -> Self {
-        Self {
-            tx,
-            label,
-            armed: true,
-        }
-    }
-
-    /// Post the terminal action and disarm. Both success and explicit-error
-    /// paths go through here — the `Drop` impl is only the safety net.
-    fn complete(mut self, action: Action) {
-        let _ = self.tx.blocking_send(action);
-        self.armed = false;
-    }
-}
-
-impl Drop for OpGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            let msg = format!("{}: task ended without a result", self.label);
-            tracing::warn!("{msg}");
-            let _ = self.tx.blocking_send(Action::OperationFailed(msg));
-        }
-    }
-}
-
-fn spawn_open_project(
-    path: PathBuf,
-    setup_script: Option<String>,
-    import_existing: bool,
-    config_dir: PathBuf,
-    existing_slugs: Vec<String>,
-    action_tx: &mpsc::Sender<Action>,
-) {
-    let tx = action_tx.clone();
-    tokio::task::spawn_blocking(move || {
-        let guard = OpGuard::new(tx, "open project");
-        let action = match do_open_project(&path, setup_script, &config_dir, &existing_slugs) {
-            Ok(cfg) => {
-                tracing::info!(slug = %cfg.slug, "project opened");
-                Action::ProjectOpened {
-                    project: Project::from_config(cfg),
-                    import_existing,
-                }
-            }
-            Err(e) => Action::OperationFailed(format!("open: {e}")),
-        };
-        guard.complete(action);
-    });
-}
-
-fn spawn_import_worktrees(
-    project_idx: usize,
-    repo_path: PathBuf,
-    action_tx: &mpsc::Sender<Action>,
-) {
-    let tx = action_tx.clone();
-    tokio::task::spawn_blocking(move || {
-        let guard = OpGuard::new(tx, "import worktrees");
-        let action = match git::list_worktrees(&repo_path) {
-            Ok(entries) => {
-                tracing::info!(
-                    project_idx,
-                    count = entries.len(),
-                    "import: git worktree list"
-                );
-                let imported: Vec<crate::app::Worktree> = entries
-                    .into_iter()
-                    .map(|e| crate::app::Worktree {
-                        name: e.branch.clone().unwrap_or_else(|| {
-                            e.path
-                                .file_name()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "worktree".into())
-                        }),
-                        path: e.path,
-                        branch: e.branch,
-                        sessions: Vec::new(),
-                        active_tab: None,
-                    })
-                    .collect();
-                Action::WorktreesImported {
-                    project_idx,
-                    entries: imported,
-                }
-            }
-            Err(e) => {
-                tracing::warn!(project_idx, "git worktree list failed: {e}");
-                Action::OperationFailed(format!("import: {e}"))
-            }
-        };
-        guard.complete(action);
-    });
-}
-
-fn do_open_project(
-    path: &std::path::Path,
-    setup_script: Option<String>,
-    config_dir: &std::path::Path,
-    existing_slugs: &[String],
-) -> Result<config::ProjectConfig> {
-    let absolute = std::fs::canonicalize(path)?;
-    git::validate_repo(&absolute)?;
-    let head = git::head_branch(&absolute)?;
-    let name = absolute
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "project".to_string());
-    let slug = config::compute_slug(&name, existing_slugs);
-    let main = config::WorktreeConfig {
-        name: head.clone().unwrap_or_else(|| "main".into()),
-        path: absolute.clone(),
-        branch: head,
-    };
-    let cfg = config::ProjectConfig {
-        slug,
-        name,
-        path: absolute,
-        expanded: true,
-        setup_script,
-        worktrees: vec![main],
-        launchers: Vec::new(),
-        github_enabled: true,
-        gh_poll_interval_secs: None,
-    };
-    config::save_project(config_dir, &cfg)?;
-    Ok(cfg)
-}
-
-fn spawn_add_worktree(
-    project_idx: usize,
-    repo_path: PathBuf,
-    branch: String,
-    action_tx: &mpsc::Sender<Action>,
-) {
-    let tx = action_tx.clone();
-    tokio::task::spawn_blocking(move || {
-        let guard = OpGuard::new(tx, "add worktree");
-        let action = match do_add_worktree(&repo_path, &branch) {
-            Ok(worktree) => {
-                tracing::info!(branch = %branch, "worktree added");
-                Action::WorktreeAdded {
-                    project_idx,
-                    worktree,
-                }
-            }
-            Err(e) => Action::OperationFailed(format!("worktree: {e}")),
-        };
-        guard.complete(action);
-    });
-}
-
-fn do_add_worktree(repo: &std::path::Path, branch: &str) -> Result<Worktree> {
-    let dest = worktree_dest(repo, branch);
-    git::worktree_add(repo, &dest, branch)?;
-    Ok(Worktree {
-        name: branch.to_string(),
-        path: dest,
-        branch: Some(branch.to_string()),
-        sessions: Vec::new(),
-        active_tab: None,
-    })
-}
-
-fn spawn_remove_worktree(
-    project_idx: usize,
-    worktree_idx: usize,
-    repo_path: PathBuf,
-    dest_path: PathBuf,
-    branch: Option<String>,
-    action_tx: &mpsc::Sender<Action>,
-) {
-    let tx = action_tx.clone();
-    tokio::task::spawn_blocking(move || {
-        let guard = OpGuard::new(tx, "remove worktree");
-        let action = match git::worktree_remove(&repo_path, &dest_path, branch.as_deref()) {
-            Ok(()) => {
-                tracing::info!(branch = ?branch, "worktree removed");
-                Action::WorktreeRemoved {
-                    project_idx,
-                    worktree_idx,
-                }
-            }
-            Err(e) => Action::OperationFailed(format!("remove worktree: {e}")),
-        };
-        guard.complete(action);
-    });
-}
-
-fn worktree_dest(repo: &std::path::Path, branch: &str) -> PathBuf {
-    let parent = repo.parent().unwrap_or(repo);
-    let base = repo
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "repo".into());
-    parent.join(format!("{base}-worktrees")).join(branch)
 }
 
 fn spawn_input_thread(tx: mpsc::Sender<Action>) {

@@ -4,6 +4,7 @@ use crate::layout::{DEFAULT_SIDEBAR_WIDTH, TermSize};
 use crate::session::{Session, SessionId};
 use crate::theme::Theme;
 use crossterm::event::{KeyEvent, MouseEvent};
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -64,7 +65,7 @@ pub struct Project {
 /// Precedence (highest first): `Merged`, `Failed`, `ChangesRequested`,
 /// `Running`, `Approved`, `Open`. "No PR" is the absence of an entry in
 /// `AppState::pr_statuses`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrStatus {
     /// PR is open, CI green (or none), still awaiting review.
     Open,
@@ -469,12 +470,17 @@ pub enum Action {
     Paste(String),
     Resize(TermSize),
     SessionExited(SessionId),
-    /// Runtime → reducer: a new project has finished validating & saving.
+    /// Supervisor → reducer (via the client reader): a path validated as a git
+    /// repo. The reducer derives the slug (config logic — needs the other
+    /// projects' slugs), builds the `Project`, and persists it.
     /// `import_existing` is forwarded from the originating `Command::OpenProject`
     /// — when `true`, the reducer fires an `ImportWorktrees` command once
     /// the project is in `state.projects`.
-    ProjectOpened {
-        project: Project,
+    ProjectValidated {
+        canonical_path: PathBuf,
+        repo_name: String,
+        head_branch: Option<String>,
+        setup_script: Option<String>,
         import_existing: bool,
     },
     /// Runtime → reducer: a worktree finished `git worktree add`.
@@ -543,12 +549,13 @@ impl std::fmt::Debug for Action {
             Action::Paste(s) => f.debug_tuple("Paste").field(&s.len()).finish(),
             Action::Resize(sz) => f.debug_tuple("Resize").field(sz).finish(),
             Action::SessionExited(id) => f.debug_tuple("SessionExited").field(id).finish(),
-            Action::ProjectOpened {
-                project,
+            Action::ProjectValidated {
+                repo_name,
                 import_existing,
+                ..
             } => f
-                .debug_struct("ProjectOpened")
-                .field("slug", &project.slug)
+                .debug_struct("ProjectValidated")
+                .field("repo_name", repo_name)
                 .field("import_existing", import_existing)
                 .finish(),
             Action::WorktreeAdded {
@@ -638,8 +645,9 @@ pub enum Command {
     SubscribeUsage,
     /// Stop receiving usage frames.
     UnsubscribeUsage,
-    /// Validate a path, build a project config, save it. Asynchronous: result
-    /// comes back as `Action::ProjectOpened` or `Action::OperationFailed`.
+    /// Validate a path (supervisor-side), then build + save a project config
+    /// (client-side). Asynchronous: the supervisor replies and the client
+    /// reader posts `Action::ProjectValidated` or `Action::OperationFailed`.
     OpenProject {
         path: PathBuf,
         setup_script: Option<String>,

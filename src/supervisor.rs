@@ -16,9 +16,11 @@
 //! `~/.cache/imbuia/supervisor.log` via `tracing`.
 
 use crate::ipc::{
-    self, ClientMsg, HandshakeReq, HandshakeResp, PROTOCOL_VERSION, ProcessNode, SessionId,
-    SessionMeta, SessionUsage, SupervisorMsg, UsageReport,
+    self, ClientMsg, HandshakeReq, HandshakeResp, OpOk, OpRequest, OpResult, PROTOCOL_VERSION,
+    ProcessNode, ProjectInfo, SessionId, SessionMeta, SessionUsage, SupervisorMsg, UsageReport,
+    WorktreeEntry,
 };
+use crate::{git, github};
 use anyhow::{Context, Result};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::collections::{HashMap, VecDeque};
@@ -108,6 +110,11 @@ struct Shared {
     /// Generation counter; bumped when `active` changes. Per-session reader
     /// threads use it to know if their cached handle is stale.
     active_generation: AtomicU64,
+    /// Inbox for the singleton `gh` worker. Every `FetchPr` op funnels through
+    /// here so at most one `gh` runs at a time (auth-refresh / rate-limit
+    /// races otherwise), with same-repo jobs coalesced to the newest. Unbounded
+    /// so the command loop's `send` never blocks behind a slow `gh`.
+    gh_tx: std::sync::mpsc::Sender<GhJob>,
 }
 
 impl Shared {
@@ -122,6 +129,7 @@ impl Shared {
             }),
             active: ArcSwapOption::empty(),
             active_generation: AtomicU64::new(0),
+            gh_tx: spawn_gh_worker(),
         }
     }
 }
@@ -334,6 +342,41 @@ fn serve_client(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
                 }
                 ClientMsg::UnsubscribeUsage => {
                     shared.registry.lock().unwrap().usage_subscribed = false;
+                }
+                ClientMsg::Op { request_id, req } => {
+                    // Run off the command loop — `worktree add` can take
+                    // minutes and would otherwise freeze WriteBytes/Resize for
+                    // this client. Reply goes to the active client's writer.
+                    match shared.active.load_full() {
+                        None => {
+                            tracing::warn!(request_id, "Op with no active client; dropping")
+                        }
+                        Some(chan) => match req {
+                            OpRequest::FetchPr {
+                                repo_path,
+                                worktrees,
+                            } => {
+                                if let Err(e) = shared.gh_tx.send(GhJob {
+                                    request_id,
+                                    repo_path,
+                                    worktrees,
+                                    chan,
+                                }) {
+                                    tracing::warn!("gh worker channel closed: {e}");
+                                }
+                            }
+                            git_op => {
+                                thread::spawn(move || {
+                                    // Drop guard: if `run_git_op` panics, the
+                                    // guard's Drop still sends an Err so the
+                                    // client's `pending_op` status never wedges.
+                                    let guard = OpReplyGuard::new(chan, request_id);
+                                    let result = run_git_op(git_op);
+                                    guard.complete(result);
+                                });
+                            }
+                        },
+                    }
                 }
                 ClientMsg::Shutdown => {
                     tracing::info!("shutdown requested by client");
@@ -559,6 +602,206 @@ fn kill_session(shared: &Arc<Shared>, id: SessionId) {
     if let Some(sess) = sess {
         let _ = sess.killer.lock().unwrap().kill();
     }
+}
+
+/// One queued PR-status fetch for the singleton gh worker. Carries the
+/// `chan` to reply on so the worker isn't coupled to whichever client is
+/// active when it finishes.
+struct GhJob {
+    request_id: u64,
+    repo_path: PathBuf,
+    worktrees: Vec<(usize, PathBuf)>,
+    chan: Arc<ClientChan>,
+}
+
+/// Drop guard mirroring `runtime::OpGuard`: guarantees the client gets *some*
+/// `OpResult` for `request_id` even if the op thread panics, so the client's
+/// `pending_op` status bar can't stick on "doing X…" forever.
+struct OpReplyGuard {
+    chan: Arc<ClientChan>,
+    request_id: u64,
+    armed: bool,
+}
+
+impl OpReplyGuard {
+    fn new(chan: Arc<ClientChan>, request_id: u64) -> Self {
+        Self {
+            chan,
+            request_id,
+            armed: true,
+        }
+    }
+
+    fn complete(mut self, result: OpResult) {
+        let _ = self.chan.tx.send(SupervisorMsg::OpResult {
+            request_id: self.request_id,
+            result,
+        });
+        self.armed = false;
+    }
+}
+
+impl Drop for OpReplyGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            tracing::warn!(self.request_id, "op thread ended without a result");
+            let _ = self.chan.tx.send(SupervisorMsg::OpResult {
+                request_id: self.request_id,
+                result: Err("operation ended without a result".into()),
+            });
+        }
+    }
+}
+
+/// Run a non-`gh` repo op synchronously. Called on a throwaway thread so the
+/// command loop stays responsive. `FetchPr` is handled by the gh worker, not
+/// here.
+fn run_git_op(req: OpRequest) -> OpResult {
+    match req {
+        OpRequest::Validate { repo_path } => {
+            let absolute = std::fs::canonicalize(&repo_path).map_err(|e| format!("{e:#}"))?;
+            git::validate_repo(&absolute).map_err(|e| format!("{e:#}"))?;
+            let head = git::head_branch(&absolute).map_err(|e| format!("{e:#}"))?;
+            let repo_name = absolute
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".to_string());
+            tracing::info!(repo = %absolute.display(), branch = ?head, "validated project");
+            Ok(OpOk::Validated(ProjectInfo {
+                canonical_path: absolute,
+                repo_name,
+                head_branch: head,
+            }))
+        }
+        OpRequest::ListWorktrees { repo_path } => {
+            let entries = git::list_worktrees(&repo_path).map_err(|e| format!("{e:#}"))?;
+            tracing::info!(repo = %repo_path.display(), count = entries.len(), "listed worktrees");
+            Ok(OpOk::Worktrees(
+                entries
+                    .into_iter()
+                    .map(|e| WorktreeEntry {
+                        path: e.path,
+                        branch: e.branch,
+                    })
+                    .collect(),
+            ))
+        }
+        OpRequest::WorktreeAdd { repo_path, branch } => {
+            let dest = worktree_dest(&repo_path, &branch);
+            git::worktree_add(&repo_path, &dest, &branch).map_err(|e| format!("{e:#}"))?;
+            tracing::info!(repo = %repo_path.display(), %branch, dest = %dest.display(), "worktree added");
+            Ok(OpOk::WorktreeAdded(WorktreeEntry {
+                path: dest,
+                branch: Some(branch),
+            }))
+        }
+        OpRequest::WorktreeRemove {
+            repo_path,
+            dest_path,
+            branch,
+        } => {
+            git::worktree_remove(&repo_path, &dest_path, branch.as_deref())
+                .map_err(|e| format!("{e:#}"))?;
+            tracing::info!(repo = %repo_path.display(), branch = ?branch, "worktree removed");
+            Ok(OpOk::WorktreeRemoved)
+        }
+        OpRequest::FetchPr { .. } => {
+            // Routed to the gh worker in the command loop; never reached.
+            Err("FetchPr must go through the gh worker".into())
+        }
+    }
+}
+
+/// Destination path for a new worktree: `<repo-parent>/<repo>-worktrees/<branch>`.
+/// Computed supervisor-side because it's a path on the supervisor's filesystem.
+fn worktree_dest(repo: &std::path::Path, branch: &str) -> PathBuf {
+    let parent = repo.parent().unwrap_or(repo);
+    let base = repo
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "repo".into());
+    parent.join(format!("{base}-worktrees")).join(branch)
+}
+
+/// Spawn the singleton `gh` worker. Drains its queue serially so only one
+/// `gh` runs at a time; coalesces queued jobs for the *same repo* down to the
+/// newest (an older poll would observe the same upstream state anyway). The
+/// stateless analog of runtime's old per-`project_idx` coalescing.
+fn spawn_gh_worker() -> std::sync::mpsc::Sender<GhJob> {
+    let (tx, rx) = std::sync::mpsc::channel::<GhJob>();
+    thread::spawn(move || {
+        while let Ok(first) = rx.recv() {
+            let mut job = first;
+            // Older same-repo jobs we coalesce away: we still ACK each one
+            // (with the newest job's result) so the client clears its
+            // `pending_ops` entry instead of leaking it.
+            let mut superseded: Vec<(u64, Arc<ClientChan>)> = Vec::new();
+            while let Ok(next) = rx.try_recv() {
+                if next.repo_path == job.repo_path {
+                    superseded.push((job.request_id, Arc::clone(&job.chan)));
+                    job = next;
+                } else {
+                    run_fetch_pr(job, std::mem::take(&mut superseded));
+                    job = next;
+                }
+            }
+            run_fetch_pr(job, superseded);
+        }
+        tracing::info!("gh worker exiting (channel closed)");
+    });
+    tx
+}
+
+/// Resolve each worktree's live HEAD then query `gh pr list`, replying with an
+/// `OpResult` to `job` and to every `superseded` (coalesced) request_id.
+/// Mirrors the old client-side `runtime::do_fetch`: `Ok` if any worktree
+/// resolved, `Err(last_err)` only if every one failed.
+fn run_fetch_pr(job: GhJob, superseded: Vec<(u64, Arc<ClientChan>)>) {
+    let GhJob {
+        request_id,
+        repo_path,
+        worktrees,
+        chan,
+    } = job;
+    tracing::info!(request_id, n = worktrees.len(), repo = %repo_path.display(), "gh: fetching per-worktree PR status");
+    let mut statuses = Vec::with_capacity(worktrees.len());
+    let mut last_err: Option<String> = None;
+    let mut any_ok = false;
+    for (wi, wt_path) in worktrees {
+        // Live HEAD resolution — picks up `git switch` inside the worktree.
+        let branch = match git::head_branch(&wt_path) {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                statuses.push((wi, None));
+                any_ok = true;
+                continue;
+            }
+            Err(e) => {
+                last_err = Some(format!("git symbolic-ref failed: {e}"));
+                continue;
+            }
+        };
+        match github::fetch_pr_by_branch(&repo_path, &branch) {
+            Ok(s) => {
+                any_ok = true;
+                statuses.push((wi, s));
+            }
+            Err(e) => last_err = Some(format!("{e}")),
+        }
+    }
+    let result: OpResult = if !any_ok && let Some(msg) = last_err {
+        Err(msg)
+    } else {
+        Ok(OpOk::PrStatuses(statuses))
+    };
+    // ACK coalesced requests first (cloning the shared result), then the live one.
+    for (rid, sc) in superseded {
+        let _ = sc.tx.send(SupervisorMsg::OpResult {
+            request_id: rid,
+            result: result.clone(),
+        });
+    }
+    let _ = chan.tx.send(SupervisorMsg::OpResult { request_id, result });
 }
 
 /// Snapshot all sessions, SIGTERM each child's PID group, give the reapers

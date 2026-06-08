@@ -5,8 +5,8 @@
 use crate::app::Action;
 use crate::input;
 use crate::ipc::{
-    self, ClientMsg, HandshakeReq, HandshakeResp, PROTOCOL_VERSION, SessionId, SessionMeta,
-    SupervisorMsg,
+    self, ClientMsg, HandshakeReq, HandshakeResp, OpOk, OpRequest, OpResult, PROTOCOL_VERSION,
+    SessionId, SessionMeta, SupervisorMsg, WorktreeEntry,
 };
 use crate::session::Session;
 use anyhow::{Context, Result, anyhow, bail};
@@ -47,6 +47,114 @@ struct PendingSpawn {
     dest: (usize, usize),
     rows: u16,
     cols: u16,
+}
+
+/// Continuation context for an in-flight `Op` request. The supervisor's
+/// `OpResult` is opaque about *why* the op ran; this carries the indices/flags
+/// needed to rebuild the same `Action` the old client-side threads built, so
+/// the reducer is unchanged.
+enum PendingOp {
+    OpenProject {
+        setup_script: Option<String>,
+        import_existing: bool,
+    },
+    ImportWorktrees {
+        project_idx: usize,
+    },
+    AddWorktree {
+        project_idx: usize,
+    },
+    RemoveWorktree {
+        project_idx: usize,
+        worktree_idx: usize,
+    },
+    FetchPr {
+        project_idx: usize,
+    },
+}
+
+/// Build a local `Worktree` from a wire entry, mirroring the name-fallback the
+/// old `runtime` import path used (branch name, else the directory basename).
+fn worktree_from_entry(e: WorktreeEntry) -> crate::app::Worktree {
+    crate::app::Worktree {
+        name: e.branch.clone().unwrap_or_else(|| {
+            e.path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "worktree".into())
+        }),
+        path: e.path,
+        branch: e.branch,
+        sessions: Vec::new(),
+        active_tab: None,
+    }
+}
+
+/// Turn an `OpResult` + its pending continuation into the `Action` to post.
+/// Returns `None` when the response kind doesn't match the request (a bug, but
+/// we log and drop rather than panic the reader thread).
+fn op_result_to_action(pending: PendingOp, result: OpResult) -> Option<Action> {
+    match result {
+        Err(e) => Some(match pending {
+            PendingOp::OpenProject { .. } => Action::OperationFailed(format!("open: {e}")),
+            PendingOp::ImportWorktrees { .. } => Action::OperationFailed(format!("import: {e}")),
+            PendingOp::AddWorktree { .. } => Action::OperationFailed(format!("worktree: {e}")),
+            PendingOp::RemoveWorktree { .. } => {
+                Action::OperationFailed(format!("remove worktree: {e}"))
+            }
+            PendingOp::FetchPr { project_idx } => Action::PrFetchFailed {
+                project_idx,
+                message: e,
+            },
+        }),
+        Ok(ok) => match (pending, ok) {
+            (
+                PendingOp::OpenProject {
+                    setup_script,
+                    import_existing,
+                },
+                OpOk::Validated(info),
+            ) => Some(Action::ProjectValidated {
+                canonical_path: info.canonical_path,
+                repo_name: info.repo_name,
+                head_branch: info.head_branch,
+                setup_script,
+                import_existing,
+            }),
+            (PendingOp::ImportWorktrees { project_idx }, OpOk::Worktrees(entries)) => {
+                Some(Action::WorktreesImported {
+                    project_idx,
+                    entries: entries.into_iter().map(worktree_from_entry).collect(),
+                })
+            }
+            (PendingOp::AddWorktree { project_idx }, OpOk::WorktreeAdded(entry)) => {
+                Some(Action::WorktreeAdded {
+                    project_idx,
+                    worktree: worktree_from_entry(entry),
+                })
+            }
+            (
+                PendingOp::RemoveWorktree {
+                    project_idx,
+                    worktree_idx,
+                },
+                OpOk::WorktreeRemoved,
+            ) => Some(Action::WorktreeRemoved {
+                project_idx,
+                worktree_idx,
+            }),
+            (PendingOp::FetchPr { project_idx }, OpOk::PrStatuses(statuses)) => {
+                Some(Action::PrStatusesFetched {
+                    project_idx,
+                    statuses,
+                })
+            }
+            (_, _) => {
+                tracing::warn!("OpResult kind did not match pending op; dropping");
+                None
+            }
+        },
+    }
 }
 
 impl ProxySession {
@@ -194,6 +302,9 @@ pub struct SupervisorClient {
     tx: ClientTx,
     sessions: Arc<Mutex<HashMap<SessionId, Arc<ProxySession>>>>,
     pending_spawns: Arc<Mutex<HashMap<u64, PendingSpawn>>>,
+    /// In-flight `Op` continuations, keyed by `request_id` (shares the
+    /// `next_request` counter with `pending_spawns`).
+    pending_ops: Arc<Mutex<HashMap<u64, PendingOp>>>,
     notify: Arc<Notify>,
     next_request: AtomicU64,
     /// Resumed sessions reported by the supervisor at handshake. Empty after
@@ -274,6 +385,90 @@ impl SupervisorClient {
 
     pub fn unsubscribe_usage(&self) {
         let _ = self.tx.send(ClientMsg::UnsubscribeUsage);
+    }
+
+    /// Allocate a `request_id`, record the continuation, and ship the `Op`.
+    /// The reader thread turns the eventual `OpResult` back into an `Action`.
+    fn send_op(&self, pending: PendingOp, req: OpRequest) -> Result<()> {
+        let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        self.pending_ops.lock().unwrap().insert(request_id, pending);
+        self.tx
+            .send(ClientMsg::Op { request_id, req })
+            .map_err(|_| anyhow!("supervisor disconnected"))?;
+        Ok(())
+    }
+
+    /// Validate a path as a git repo (supervisor-side). On success the reader
+    /// posts `Action::ProjectValidated`; the reducer then derives the slug and
+    /// persists the project (config logic stays client-side).
+    pub fn request_open_project(
+        &self,
+        repo_path: PathBuf,
+        setup_script: Option<String>,
+        import_existing: bool,
+    ) -> Result<()> {
+        self.send_op(
+            PendingOp::OpenProject {
+                setup_script,
+                import_existing,
+            },
+            OpRequest::Validate { repo_path },
+        )
+    }
+
+    pub fn request_import_worktrees(&self, project_idx: usize, repo_path: PathBuf) -> Result<()> {
+        self.send_op(
+            PendingOp::ImportWorktrees { project_idx },
+            OpRequest::ListWorktrees { repo_path },
+        )
+    }
+
+    pub fn request_add_worktree(
+        &self,
+        project_idx: usize,
+        repo_path: PathBuf,
+        branch: String,
+    ) -> Result<()> {
+        self.send_op(
+            PendingOp::AddWorktree { project_idx },
+            OpRequest::WorktreeAdd { repo_path, branch },
+        )
+    }
+
+    pub fn request_remove_worktree(
+        &self,
+        project_idx: usize,
+        worktree_idx: usize,
+        repo_path: PathBuf,
+        dest_path: PathBuf,
+        branch: Option<String>,
+    ) -> Result<()> {
+        self.send_op(
+            PendingOp::RemoveWorktree {
+                project_idx,
+                worktree_idx,
+            },
+            OpRequest::WorktreeRemove {
+                repo_path,
+                dest_path,
+                branch,
+            },
+        )
+    }
+
+    pub fn request_fetch_pr(
+        &self,
+        project_idx: usize,
+        repo_path: PathBuf,
+        worktrees: Vec<(usize, PathBuf)>,
+    ) -> Result<()> {
+        self.send_op(
+            PendingOp::FetchPr { project_idx },
+            OpRequest::FetchPr {
+                repo_path,
+                worktrees,
+            },
+        )
     }
 }
 
@@ -358,6 +553,7 @@ fn handshake(
         tx,
         sessions: Arc::new(Mutex::new(HashMap::new())),
         pending_spawns: Arc::new(Mutex::new(HashMap::new())),
+        pending_ops: Arc::new(Mutex::new(HashMap::new())),
         notify,
         next_request: AtomicU64::new(1),
         initial_sessions: Mutex::new(sessions),
@@ -439,6 +635,16 @@ fn spawn_reader(
                 }
                 SupervisorMsg::Usage(report) => {
                     let _ = action_tx.blocking_send(Action::UsageReceived(report));
+                }
+                SupervisorMsg::OpResult { request_id, result } => {
+                    let pending = client.pending_ops.lock().unwrap().remove(&request_id);
+                    let Some(pending) = pending else {
+                        tracing::warn!(request_id, "OpResult for unknown request; ignoring");
+                        continue;
+                    };
+                    if let Some(action) = op_result_to_action(pending, result) {
+                        let _ = action_tx.blocking_send(action);
+                    }
                 }
             }
         }
