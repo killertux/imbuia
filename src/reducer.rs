@@ -268,6 +268,11 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
                 state.command_status = Some(format!("remote supervisor '{name}' disconnected"));
             }
         }
+        Action::SupervisorConnected { .. } => {
+            // Handled entirely in `runtime::handle_action` (it mutates the live
+            // connection registry, which this pure reducer can't reach). Never
+            // reaches here, but the match must stay exhaustive.
+        }
         Action::UsageReceived(sup, report) => {
             if let Some(popup) = state.usage_popup.as_mut() {
                 popup.reports.insert(sup, report);

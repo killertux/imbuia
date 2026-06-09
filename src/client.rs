@@ -544,11 +544,16 @@ impl SupervisorClient {
 /// from this.
 pub struct Supervisors {
     entries: Vec<SupervisorEntry>,
+    /// Mints client-global session ids, shared across every connection (so a
+    /// late/background (re)connect keeps allocating from the same space).
+    global_ids: Arc<AtomicU64>,
 }
 
 struct SupervisorEntry {
     id: crate::app::SupervisorId,
     name: String,
+    /// Remote URL (`host:port`) to (re)dial; `None` for the local supervisor.
+    url: Option<String>,
     client: Option<Arc<SupervisorClient>>,
 }
 
@@ -569,12 +574,53 @@ impl Supervisors {
             .unwrap_or("local")
     }
 
+    pub fn is_connected(&self, id: crate::app::SupervisorId) -> bool {
+        self.get(id).is_some()
+    }
+
+    /// The configured URL for a remote `id`, if any (`None` for local/unknown).
+    pub fn url_of(&self, id: crate::app::SupervisorId) -> Option<String> {
+        self.entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.url.clone())
+    }
+
+    /// Shared session-id counter, for handing to a background (re)connect.
+    pub fn global_ids(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.global_ids)
+    }
+
+    /// Install a freshly-connected client (after a background dial / reconnect).
+    pub fn set_client(&mut self, id: crate::app::SupervisorId, client: Arc<SupervisorClient>) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+            e.client = Some(client);
+        }
+    }
+
+    /// Drop a supervisor's connection (it died / detached); reconnect re-dials.
+    pub fn mark_disconnected(&mut self, id: crate::app::SupervisorId) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+            e.client = None;
+        }
+    }
+
+    /// `(id, url)` for every configured remote not currently connected — the
+    /// set the runtime dials in the background at startup and on `:reconnect`.
+    pub fn disconnected_remotes(&self) -> Vec<(crate::app::SupervisorId, String)> {
+        self.entries
+            .iter()
+            .filter(|e| e.client.is_none())
+            .filter_map(|e| e.url.clone().map(|u| (e.id, u)))
+            .collect()
+    }
+
     /// Iterate every currently-connected client (for usage fan-out, rebind).
     pub fn connected(&self) -> impl Iterator<Item = &Arc<SupervisorClient>> {
         self.entries.iter().filter_map(|e| e.client.as_ref())
     }
 
-    /// id↔name projection for `AppState`.
+    /// id↔name + connected-set projection for `AppState`.
     pub fn directory(&self) -> crate::app::SupervisorDirectory {
         crate::app::SupervisorDirectory {
             entries: self
@@ -582,15 +628,23 @@ impl Supervisors {
                 .iter()
                 .map(|e| (e.id, e.name.clone()))
                 .collect(),
+            connected: self
+                .entries
+                .iter()
+                .filter(|e| e.client.is_some())
+                .map(|e| e.id)
+                .collect(),
         }
     }
 }
 
-/// Connect the local supervisor (auto-spawning if needed) plus every configured
-/// remote, best-effort. The local connection is required; a remote that fails
-/// to connect is logged and left `None` (its projects surface an error on use).
+/// Connect the local supervisor (auto-spawning if needed) and seed an entry for
+/// every configured remote as **disconnected**. The local connection is the
+/// only one required to start; remotes are dialed afterwards in the background
+/// (see `runtime`) so an unreachable host never blocks or crashes startup —
+/// each just stays disconnected (grayed in the sidebar) until it connects or
+/// the user runs `:reconnect`.
 pub async fn connect_all(
-    config_dir: &Path,
     global: &config::GlobalConfig,
     notify: Arc<Notify>,
     action_tx: mpsc::Sender<Action>,
@@ -613,37 +667,31 @@ pub async fn connect_all(
     let mut entries = vec![SupervisorEntry {
         id: LOCAL,
         name: "local".into(),
+        url: None,
         client: Some(local),
     }];
 
-    // Remotes (best-effort), numbered in config order.
+    // Remotes: seed disconnected entries (numbered in config order). The
+    // runtime dials each in the background once the UI is up.
     for (i, (name, cfg)) in global.effective_remotes().into_iter().enumerate() {
-        let id = SupervisorId(i as u32 + 1);
-        let client = match connect_remote_handshake(
-            config_dir,
-            &cfg.url,
-            id,
-            Arc::clone(&global_ids),
-            Arc::clone(&notify),
-            action_tx.clone(),
-        )
-        .await
-        {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!(name = %name, url = %cfg.url, "remote supervisor unavailable: {e:#}");
-                None
-            }
-        };
-        entries.push(SupervisorEntry { id, name, client });
+        entries.push(SupervisorEntry {
+            id: SupervisorId(i as u32 + 1),
+            name,
+            url: Some(cfg.url),
+            client: None,
+        });
     }
 
-    Ok(Supervisors { entries })
+    Ok(Supervisors {
+        entries,
+        global_ids,
+    })
 }
 
 /// Connect + handshake one remote, with an overall timeout so a dead host
-/// doesn't stall startup.
-async fn connect_remote_handshake(
+/// doesn't stall the dial. Used by the runtime's background startup connects
+/// and by `:reconnect`.
+pub(crate) async fn connect_remote_handshake(
     config_dir: &Path,
     url: &str,
     sup_id: crate::app::SupervisorId,

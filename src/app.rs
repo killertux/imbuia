@@ -49,13 +49,25 @@ pub const LOCAL: SupervisorId = SupervisorId(0);
 pub struct SupervisorDirectory {
     /// `(id, name)` in display order — `LOCAL` first, then remotes by name.
     pub entries: Vec<(SupervisorId, String)>,
+    /// Ids with a live connection right now. `LOCAL` is always considered
+    /// connected (see [`is_connected`]). Remotes appear here only while their
+    /// `SupervisorClient` is attached, so the sidebar can gray out projects
+    /// whose host is currently unreachable.
+    pub connected: std::collections::HashSet<SupervisorId>,
 }
 
 impl SupervisorDirectory {
     pub fn local_only() -> Self {
         Self {
             entries: vec![(LOCAL, "local".to_string())],
+            connected: std::iter::once(LOCAL).collect(),
         }
+    }
+
+    /// Whether `id` currently has a live connection. `LOCAL` is always true
+    /// (it's auto-spawned and required for the app to run at all).
+    pub fn is_connected(&self, id: SupervisorId) -> bool {
+        id == LOCAL || self.connected.contains(&id)
     }
 
     pub fn name_of(&self, id: SupervisorId) -> &str {
@@ -618,6 +630,14 @@ pub enum Action {
     /// **remote** just drops that supervisor's sessions and shows a message —
     /// the rest of the app keeps running.
     SupervisorLost(SupervisorId, String),
+    /// Runtime → runtime: a (re)connection to a remote supervisor succeeded.
+    /// Handled entirely in `runtime` (it mutates the live `client::Supervisors`
+    /// registry, which the pure reducer can't touch) — installs the client,
+    /// re-binds its resumed sessions, and flips the directory's connected flag.
+    SupervisorConnected {
+        id: SupervisorId,
+        client: Arc<crate::client::SupervisorClient>,
+    },
     /// Supervisor → reducer: a fresh resource-usage snapshot from one
     /// supervisor (tagged so the popup can segregate per-supervisor).
     UsageReceived(SupervisorId, UsageReport),
@@ -707,6 +727,10 @@ impl std::fmt::Debug for Action {
             Action::SupervisorLost(sup, s) => {
                 f.debug_tuple("SupervisorLost").field(sup).field(s).finish()
             }
+            Action::SupervisorConnected { id, .. } => f
+                .debug_struct("SupervisorConnected")
+                .field("id", id)
+                .finish(),
             Action::UsageReceived(sup, _) => f
                 .debug_struct("UsageReceived")
                 .field("supervisor", sup)
@@ -775,6 +799,10 @@ pub enum Command {
     /// The client process keeps running and will auto-spawn a fresh
     /// supervisor on its next attach attempt (today: at next start).
     RestartSupervisor,
+    /// (Re)dial a remote supervisor in the background. On success the runtime
+    /// posts `Action::SupervisorConnected`; on failure `Action::OperationFailed`.
+    /// The command handler guarantees `id` is a currently-disconnected remote.
+    ReconnectSupervisor(SupervisorId),
     /// Start receiving `UsageReport` frames (1 Hz).
     SubscribeUsage,
     /// Stop receiving usage frames.

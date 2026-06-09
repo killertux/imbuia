@@ -97,6 +97,12 @@ pub const COMMANDS: &[CmdSpec] = &[
         handler: cmd_usage,
     },
     CmdSpec {
+        names: &["reconnect", "rc"],
+        usage: ":reconnect",
+        description: "Reconnect the selected project's (disconnected) remote supervisor.",
+        handler: cmd_reconnect,
+    },
+    CmdSpec {
         names: &["launch", "l"],
         usage: ":launch [name]",
         description: "Launch a named command in a new tab (or pick from a popup).",
@@ -152,6 +158,29 @@ pub(crate) fn execute_command(state: &mut AppState, s: &str, cmds: &mut Commands
 pub(crate) fn cmd_usage(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
     state.usage_popup = Some(UsagePopup::new(state.supervisors.clone()));
     cmds.push(Command::SubscribeUsage);
+}
+
+fn cmd_reconnect(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
+    use crate::app::LOCAL;
+    let Some((pi, _)) = state.sidebar_selection else {
+        state.command_status = Some("select a project first".into());
+        return;
+    };
+    let Some(project) = state.projects.get(pi) else {
+        return;
+    };
+    let sup = project.supervisor;
+    if sup == LOCAL {
+        state.command_status = Some("local supervisor is always connected".into());
+        return;
+    }
+    let name = state.supervisors.name_of(sup).to_string();
+    if state.supervisors.is_connected(sup) {
+        state.command_status = Some(format!("supervisor '{name}' already connected"));
+        return;
+    }
+    state.command_status = Some(format!("reconnecting to '{name}'…"));
+    cmds.push(Command::ReconnectSupervisor(sup));
 }
 
 fn cmd_restart_supervisor(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {

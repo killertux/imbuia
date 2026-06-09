@@ -866,16 +866,22 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
         let marker = if project.expanded { "▼" } else { "▶" };
         let is_selected_header = state.sidebar_selection == Some((pi, None));
         // Tag projects hosted on a remote supervisor with its name; local
-        // (the default) stays unadorned.
+        // (the default) stays unadorned. A disconnected remote is marked
+        // `[name ✗]` and the whole row is dimmed (see `dim` below).
+        let connected = state.supervisors.is_connected(project.supervisor);
         let header = match state.supervisors.config_name(project.supervisor) {
-            Some(sup) => format!("{marker} {}  [{sup}]", project.name),
+            Some(sup) if connected => format!("{marker} {}  [{sup}]", project.name),
+            Some(sup) => format!("{marker} {}  [{sup} ✗]", project.name),
             None => format!("{marker} {}", project.name),
         };
+        // Dim only remote projects that are currently offline.
+        let dim = !connected && project.supervisor != crate::app::LOCAL;
         lines.push(styled_line(
             truncate_to_width(&header, max_w),
             is_selected_header,
             focused,
             true,
+            dim,
             theme,
         ));
         if project.expanded {
@@ -980,9 +986,11 @@ fn styled_line(
     selected: bool,
     focused: bool,
     bold: bool,
+    dim: bool,
     theme: &Theme,
 ) -> Line<'static> {
-    let mut style = Style::default().fg(theme.fg).bg(theme.bg);
+    let base_fg = if dim { theme.fg_dim } else { theme.fg };
+    let mut style = Style::default().fg(base_fg).bg(theme.bg);
     if bold {
         style = style.add_modifier(Modifier::BOLD);
     }
