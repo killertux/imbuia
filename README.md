@@ -118,6 +118,7 @@ available follow-up keys. The current bindings:
 | `:launch [name]` / `:l`       | Launch a named command in a new tab; no arg → picker popup.   |
 | `:tabnew` / `:tabclose`       | New terminal / close current terminal.                        |
 | `:usage` / `:u`               | Live memory + CPU per session and its descendants.            |
+| `:reconnect` / `:rc`          | Re-dial the selected project's disconnected remote supervisor. |
 | `:restart-supervisor` / `:rs` | Kill PTY supervisor (and every session) and exit.             |
 | `:set theme=dark\|light`      | Switch palette (persisted).                                   |
 | `:set sidebar.width=N`        | Resize sidebar.                                               |
@@ -256,8 +257,12 @@ Launch `imbuia` as usual. On the first connection to each remote:
 - the supervisor, if its `authorized_keys` is empty, **pins your client** and
   lets it in.
 
-A remote that's unreachable at startup is non-fatal — it's just unavailable
-until you relaunch (projects pinned to it report an error when used).
+Remotes never block startup: the app comes up immediately with the local
+supervisor and dials each remote in the **background**, flipping it live as soon
+as it connects. A remote that's unreachable is non-fatal — its projects render
+**grayed with a `✗`** in the sidebar (and report an error if you try to use
+them). Select such a project and run `:reconnect` (`:rc`) to re-dial it without
+restarting; if it drops mid-session, the same command brings it back.
 
 > Older configs with a single `[remote]` table still work — it's treated as a
 > remote named `remote`.

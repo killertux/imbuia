@@ -2035,3 +2035,118 @@ fn terminal_chord_replay_forwards_buffered_keys_on_mismatch() {
     assert!(s.pending_chord.is_empty());
     assert_eq!(s.mode, Mode::Terminal);
 }
+
+// --- remote supervisor connect/disconnect ---------------------------------
+
+use crate::app::{SupervisorDirectory, SupervisorId};
+
+/// Directory with the local supervisor plus one remote ("remote", id 1) that is
+/// currently disconnected, and a single project pinned to that remote (selected).
+fn state_with_disconnected_remote() -> AppState {
+    let mut s = AppState::new();
+    s.supervisors = SupervisorDirectory {
+        entries: vec![
+            (crate::app::LOCAL, "local".into()),
+            (SupervisorId(1), "remote".into()),
+        ],
+        connected: std::iter::once(crate::app::LOCAL).collect(),
+    };
+    s.projects = vec![Project {
+        slug: "p".into(),
+        name: "p".into(),
+        repo_path: PathBuf::from("."),
+        supervisor: SupervisorId(1),
+        worktrees: Vec::new(),
+        expanded: true,
+        setup_script: None,
+        launchers: Vec::new(),
+        github_enabled: false,
+        gh_poll_interval_secs: None,
+    }];
+    s.sidebar_selection = Some((0, None));
+    s
+}
+
+#[test]
+fn directory_is_connected_treats_local_as_always_up() {
+    let dir = SupervisorDirectory {
+        entries: vec![
+            (crate::app::LOCAL, "local".into()),
+            (SupervisorId(1), "remote".into()),
+        ],
+        connected: std::iter::once(crate::app::LOCAL).collect(),
+    };
+    assert!(dir.is_connected(crate::app::LOCAL));
+    assert!(!dir.is_connected(SupervisorId(1)));
+}
+
+#[test]
+fn reconnect_disconnected_remote_emits_command() {
+    let mut s = state_with_disconnected_remote();
+    let mut cmds = Commands::new();
+    crate::commands::execute_command(&mut s, "reconnect", &mut cmds);
+    assert!(matches!(
+        cmds.as_slice(),
+        [Command::ReconnectSupervisor(SupervisorId(1))]
+    ));
+    assert!(
+        s.command_status
+            .as_deref()
+            .unwrap()
+            .contains("reconnecting")
+    );
+}
+
+#[test]
+fn reconnect_local_project_is_noop() {
+    let mut s = state_with_disconnected_remote();
+    s.projects[0].supervisor = crate::app::LOCAL;
+    let mut cmds = Commands::new();
+    crate::commands::execute_command(&mut s, "reconnect", &mut cmds);
+    assert!(cmds.is_empty());
+    assert!(
+        s.command_status
+            .as_deref()
+            .unwrap()
+            .contains("always connected")
+    );
+}
+
+#[test]
+fn reconnect_already_connected_remote_is_noop() {
+    let mut s = state_with_disconnected_remote();
+    s.supervisors.connected.insert(SupervisorId(1));
+    let mut cmds = Commands::new();
+    crate::commands::execute_command(&mut s, "reconnect", &mut cmds);
+    assert!(cmds.is_empty());
+    assert!(
+        s.command_status
+            .as_deref()
+            .unwrap()
+            .contains("already connected")
+    );
+}
+
+#[test]
+fn losing_remote_drops_only_its_sessions() {
+    // Reducer half of remote-loss handling (the registry flip lives in runtime).
+    let mut s = state_with_disconnected_remote();
+    s.supervisors.connected.insert(SupervisorId(1));
+    s.projects[0].worktrees = vec![Worktree {
+        name: "w".into(),
+        path: PathBuf::from("."),
+        branch: None,
+        sessions: vec![1],
+        active_tab: Some(0),
+    }];
+    s.sessions.insert(1, FakeSession::new(1));
+    s.active_worktree = Some((0, 0));
+
+    let _ = reduce(
+        &mut s,
+        Action::SupervisorLost(SupervisorId(1), "eof".into()),
+    );
+    assert!(s.sessions.is_empty());
+    assert!(s.projects[0].worktrees[0].sessions.is_empty());
+    assert!(s.running, "losing a remote must not stop the app");
+}

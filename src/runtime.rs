@@ -33,8 +33,8 @@ pub async fn run() -> Result<()> {
     // configured remote, before we start polling input — resumed sessions need
     // to be wired into AppState first so output frames arriving immediately
     // after handshake can find their parsers.
-    let supervisors =
-        client::connect_all(&config_dir, &global, Arc::clone(&notify), action_tx.clone()).await?;
+    let mut supervisors =
+        client::connect_all(&global, Arc::clone(&notify), action_tx.clone()).await?;
 
     spawn_input_thread(action_tx.clone());
 
@@ -67,8 +67,12 @@ pub async fn run() -> Result<()> {
         state.sidebar_selection = Some((0, None));
     }
 
-    // Re-bind sessions every connected supervisor has from a previous run.
-    rebind_resumed_sessions(&mut state, &supervisors);
+    // Re-bind sessions every connected supervisor has from a previous run
+    // (only the local one is connected this early; remotes rebind as they
+    // come up via `Action::SupervisorConnected`).
+    for client in supervisors.connected() {
+        rebind_one(&mut state, client);
+    }
     // Host terminal may have resized since the supervisor last saw a client;
     // push the current dimensions to every resumed PTY before the first
     // render so the screen isn't drawn against stale rows/cols.
@@ -77,6 +81,21 @@ pub async fn run() -> Result<()> {
         for cmd in cmds {
             execute(cmd, &state, &action_tx, &notify, &supervisors);
         }
+    }
+
+    // Dial every configured remote in the background — startup is never
+    // blocked by a slow/dead host, and each surfaces via `SupervisorConnected`
+    // when it comes up (or stays disconnected / grayed otherwise).
+    for (id, url) in supervisors.disconnected_remotes() {
+        spawn_remote_connect(
+            id,
+            url,
+            config_dir.clone(),
+            supervisors.global_ids(),
+            Arc::clone(&notify),
+            action_tx.clone(),
+            false, // startup: stay quiet on failure (just stays disconnected)
+        );
     }
 
     // sysinfo handle for sampling THIS client's own process while the usage
@@ -113,9 +132,9 @@ pub async fn run() -> Result<()> {
             biased;
             maybe_action = action_rx.recv() => {
                 let Some(action) = maybe_action else { break };
-                handle_action(&mut state, action, &action_tx, &notify, &supervisors);
+                handle_action(&mut state, action, &action_tx, &notify, &mut supervisors);
                 while let Ok(action) = action_rx.try_recv() {
-                    handle_action(&mut state, action, &action_tx, &notify, &supervisors);
+                    handle_action(&mut state, action, &action_tx, &notify, &mut supervisors);
                 }
                 redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
             }
@@ -123,12 +142,12 @@ pub async fn run() -> Result<()> {
                 redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
             }
             _ = update_tick.tick() => {
-                handle_action(&mut state, Action::PeriodicUpdateCheck, &action_tx, &notify, &supervisors);
+                handle_action(&mut state, Action::PeriodicUpdateCheck, &action_tx, &notify, &mut supervisors);
                 redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
             }
             _ = pr_tick.tick() => {
                 if maybe_emit_pr_poll(&mut state, &mut pr_poll_last) {
-                    handle_action(&mut state, Action::PeriodicPrCheck, &action_tx, &notify, &supervisors);
+                    handle_action(&mut state, Action::PeriodicPrCheck, &action_tx, &notify, &mut supervisors);
                     redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
                 }
             }
@@ -139,7 +158,7 @@ pub async fn run() -> Result<()> {
                 if state.usage_popup.is_some()
                     && let Some(node) = sample_client_node(&mut usage_sys)
                 {
-                    handle_action(&mut state, Action::LocalUsageSampled(node), &action_tx, &notify, &supervisors);
+                    handle_action(&mut state, Action::LocalUsageSampled(node), &action_tx, &notify, &mut supervisors);
                     redraw_at.get_or_insert_with(|| Instant::now() + FRAME);
                 }
             }
@@ -155,38 +174,79 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-fn rebind_resumed_sessions(state: &mut AppState, supervisors: &Supervisors) {
-    // Each connected supervisor reports its own resumed sessions; bind them to
-    // the matching project/worktree, but only if that project is actually
-    // hosted on this supervisor (else it's an orphan to be killed).
-    for client in supervisors.connected() {
-        let sup_id = client.supervisor_id();
-        for meta in client.drain_initial_sessions() {
-            let located = locate(state, &meta.project_slug, &meta.worktree_name)
-                .filter(|&(pi, _)| state.projects[pi].supervisor == sup_id);
-            let Some((pi, wi)) = located else {
-                tracing::warn!(
-                    slug = %meta.project_slug,
-                    worktree = %meta.worktree_name,
-                    id = meta.id,
-                    "supervisor reported session for unknown/mismatched project; dropping"
-                );
-                client.kill(meta.id);
-                continue;
-            };
-            let proxy = client.adopt(&meta);
-            let global = proxy.id();
-            let wt = &mut state.projects[pi].worktrees[wi];
-            wt.sessions.push(global);
-            if wt.active_tab.is_none() {
-                wt.active_tab = Some(wt.sessions.len() - 1);
-            }
-            state.sessions.insert(global, proxy as Arc<dyn Session>);
-            if state.active_worktree.is_none() {
-                state.active_worktree = Some((pi, wi));
-            }
+/// Re-bind one supervisor's resumed sessions to their project/worktree tabs.
+/// Called for the local supervisor at startup and for each remote as it comes
+/// up (`SupervisorConnected`). Sessions for a project not hosted here (or no
+/// longer present) are orphans and get killed.
+fn rebind_one(state: &mut AppState, client: &Arc<SupervisorClient>) {
+    let sup_id = client.supervisor_id();
+    for meta in client.drain_initial_sessions() {
+        let located = locate(state, &meta.project_slug, &meta.worktree_name)
+            .filter(|&(pi, _)| state.projects[pi].supervisor == sup_id);
+        let Some((pi, wi)) = located else {
+            tracing::warn!(
+                slug = %meta.project_slug,
+                worktree = %meta.worktree_name,
+                id = meta.id,
+                "supervisor reported session for unknown/mismatched project; dropping"
+            );
+            client.kill(meta.id);
+            continue;
+        };
+        let proxy = client.adopt(&meta);
+        let global = proxy.id();
+        let wt = &mut state.projects[pi].worktrees[wi];
+        wt.sessions.push(global);
+        if wt.active_tab.is_none() {
+            wt.active_tab = Some(wt.sessions.len() - 1);
+        }
+        state.sessions.insert(global, proxy as Arc<dyn Session>);
+        if state.active_worktree.is_none() {
+            state.active_worktree = Some((pi, wi));
         }
     }
+}
+
+/// Dial a remote supervisor off the main task, posting `SupervisorConnected` on
+/// success. On failure: `verbose` (a user-initiated `:reconnect`) surfaces an
+/// `OperationFailed`; otherwise (startup) it's a quiet warning — the supervisor
+/// just stays disconnected.
+#[allow(clippy::too_many_arguments)]
+fn spawn_remote_connect(
+    id: crate::app::SupervisorId,
+    url: String,
+    config_dir: std::path::PathBuf,
+    global_ids: Arc<std::sync::atomic::AtomicU64>,
+    notify: Arc<Notify>,
+    action_tx: mpsc::Sender<Action>,
+    verbose: bool,
+) {
+    tokio::spawn(async move {
+        match client::connect_remote_handshake(
+            &config_dir,
+            &url,
+            id,
+            global_ids,
+            Arc::clone(&notify),
+            action_tx.clone(),
+        )
+        .await
+        {
+            Ok(client) => {
+                let _ = action_tx
+                    .send(Action::SupervisorConnected { id, client })
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(%url, "remote supervisor unavailable: {e:#}");
+                if verbose {
+                    let _ = action_tx
+                        .send(Action::OperationFailed(format!("reconnect: {e:#}")))
+                        .await;
+                }
+            }
+        }
+    });
 }
 
 fn locate(state: &AppState, slug: &str, wt_name: &str) -> Option<(usize, usize)> {
@@ -203,12 +263,71 @@ fn handle_action(
     action: Action,
     action_tx: &mpsc::Sender<Action>,
     notify: &Arc<Notify>,
-    supervisors: &Supervisors,
+    supervisors: &mut Supervisors,
 ) {
+    use crate::app::LOCAL;
+    // A couple of actions mutate the live connection registry, which the pure
+    // reducer can't reach. Handle those here; everything else flows through
+    // `reduce` unchanged.
+    match action {
+        Action::SupervisorConnected { id, client } => {
+            on_supervisor_connected(state, supervisors, id, client, action_tx, notify);
+            return;
+        }
+        // A remote dropping: let the reducer drop its sessions + show a message,
+        // then flip the registry entry to disconnected so the sidebar grays it
+        // and `:reconnect` can re-dial.
+        Action::SupervisorLost(sup, reason) if sup != LOCAL => {
+            let cmds = reduce(state, Action::SupervisorLost(sup, reason));
+            for cmd in cmds {
+                execute(cmd, state, action_tx, notify, supervisors);
+            }
+            supervisors.mark_disconnected(sup);
+            state.supervisors = supervisors.directory();
+            return;
+        }
+        _ => {}
+    }
     let cmds = reduce(state, action);
     for cmd in cmds {
         execute(cmd, state, action_tx, notify, supervisors);
     }
+}
+
+/// Install a freshly-connected remote: register the client, re-bind its resumed
+/// sessions, refresh the directory's connected flag (un-grays the sidebar), and
+/// push current dimensions to the resumed PTYs.
+fn on_supervisor_connected(
+    state: &mut AppState,
+    supervisors: &mut Supervisors,
+    id: crate::app::SupervisorId,
+    client: Arc<SupervisorClient>,
+    action_tx: &mpsc::Sender<Action>,
+    notify: &Arc<Notify>,
+) {
+    if supervisors.is_connected(id) {
+        // Already connected (e.g. a duplicate / racing dial); drop the spare.
+        tracing::warn!(
+            ?id,
+            "SupervisorConnected for already-connected supervisor; ignoring"
+        );
+        return;
+    }
+    supervisors.set_client(id, Arc::clone(&client));
+    rebind_one(state, &client);
+    state.supervisors = supervisors.directory();
+    // If the usage popup is open, start streaming this supervisor's usage too.
+    if state.usage_popup.is_some() {
+        client.subscribe_usage();
+    }
+    let name = supervisors.name_of(id).to_string();
+    state.command_status = Some(format!("supervisor '{name}' connected"));
+    // Resync PTY dimensions for the just-rebound sessions.
+    let cmds = reduce(state, Action::Resize(state.term_size));
+    for cmd in cmds {
+        execute(cmd, state, action_tx, notify, supervisors);
+    }
+    notify.notify_one();
 }
 
 /// Resolve a project-indexed command's target supervisor, or `None` (logging)
@@ -236,7 +355,7 @@ fn execute(
     cmd: Command,
     state: &AppState,
     action_tx: &mpsc::Sender<Action>,
-    _notify: &Arc<Notify>,
+    notify: &Arc<Notify>,
     supervisors: &Supervisors,
 ) {
     use crate::app::{LOCAL, SupervisorId};
@@ -317,6 +436,22 @@ fn execute(
             // `:rs` targets the local supervisor (the auto-spawned one).
             if let Some(client) = supervisors.get(LOCAL) {
                 client.shutdown_supervisor();
+            }
+        }
+        Command::ReconnectSupervisor(id) => {
+            // The command handler already guaranteed this is a disconnected
+            // remote; dial it off-task. `verbose` so a failed reconnect tells
+            // the user (unlike the quiet background dials at startup).
+            if let Some(url) = supervisors.url_of(id) {
+                spawn_remote_connect(
+                    id,
+                    url,
+                    state.config_dir.clone(),
+                    supervisors.global_ids(),
+                    Arc::clone(notify),
+                    action_tx.clone(),
+                    true,
+                );
             }
         }
         Command::SubscribeUsage => {

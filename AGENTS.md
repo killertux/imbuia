@@ -48,7 +48,7 @@ codebase. Humans should read `README.md` first.
 | `git.rs`          | `std::process::Command` wrappers (`validate_repo`, `head_branch`, `worktree_add`, `worktree_remove`). **Run inside the supervisor**, not the client (see Disk ops below). |
 | `github.rs`       | `gh` CLI wrapper for PR status. Also **run inside the supervisor**. |
 | `session.rs`      | `Session` trait + `FakeSession` for tests. The real impl is in `client.rs`. |
-| `client.rs`       | `Supervisors` registry (local + N remotes), one `SupervisorClient` per connection; `connect_all` (eager, best-effort); `ProxySession` (client-side `Session` impl) with local↔global session-id remap; double-fork helpers, reader + writer tasks. |
+| `client.rs`       | `Supervisors` registry (local + N remotes, each with `url`/`connected` state + `set_client`/`mark_disconnected`); one `SupervisorClient` per connection; `connect_all` (local sync + remotes seeded disconnected, dialed later in the background); `ProxySession` (client-side `Session` impl) with local↔global session-id remap; double-fork helpers, reader + writer tasks. |
 | `supervisor.rs`   | `imbuia --supervisor` entry: owns a tokio runtime; PTY spawn/own (portable-pty + vt100) on blocking threads; UDS accept loop (always) + optional TCP+TLS acceptor (`--listen`); per-client async `handle_conn`. |
 | `ipc.rs`          | Shared wire types (`ClientMsg`, `SupervisorMsg`, `Handshake*`, `OpRequest`/`OpOk` incl. `ListDir`/`DirListing`), framed read/write (`[u32 len][u8 codec][payload]`; codec 0=raw, 1=zstd — `write_frame_async(.., compress)` gates compression on size + remote-only, reader auto-detects; sync twins are test-only), socket path resolution. `PROTOCOL_VERSION = 2`. |
 | `transport.rs`    | Optional remote transport: Ed25519 identity load/gen, SPKI fingerprints, rustls (ring) client/server configs with pinned-key verifiers. Both sides TOFU: client pins the supervisor in `known_hosts`; supervisor pins the first client into `authorized_keys` when empty. |
@@ -157,6 +157,25 @@ crossterm Event ─► input::map ─► Action ─┐
   fresh remote needs no manual key exchange — add more clients by hand). All
   in `transport.rs`. The local UDS path is unauthenticated (filesystem perms
   are the boundary).
+- **Remotes connect in the background; only LOCAL blocks startup.**
+  `client::connect_all` connects the local supervisor (required — its failure
+  aborts `run`) and seeds a *disconnected* `SupervisorEntry` (storing the
+  `url`) for every configured remote. The runtime then dials each remote in a
+  background task (`runtime::spawn_remote_connect`) so a slow/dead host never
+  stalls or crashes the TUI. On success the task posts
+  `Action::SupervisorConnected { id, client }`; on failure it's a quiet log
+  (startup) or an `OperationFailed` (a user-initiated `:reconnect`, which
+  passes `verbose = true`). **`SupervisorConnected` and remote `SupervisorLost`
+  are intercepted in `runtime::handle_action` before the reducer** — they
+  mutate the live `client::Supervisors` registry (`set_client` /
+  `mark_disconnected`), which the pure reducer can't reach, then re-snapshot
+  `state.supervisors = supervisors.directory()`. `on_supervisor_connected` also
+  re-binds that supervisor's resumed sessions (`rebind_one`) and pushes a
+  resize. The directory's `connected: HashSet<SupervisorId>` (LOCAL implicitly
+  always connected via `is_connected`) drives the **grayed-out + `✗`** sidebar
+  rendering for offline remote projects. `:reconnect` (`:rc`) re-dials the
+  selected project's supervisor (`Command::ReconnectSupervisor`); the command
+  handler short-circuits LOCAL / already-connected cases client-side.
 - **Single client at a time.** The supervisor's accept loop hands the new
   client an exclusive slot. The old client (if any) gets
   `SupervisorMsg::Detached`, then its `CancellationToken` is fired to tear
@@ -175,7 +194,8 @@ crossterm Event ─► input::map ─► Action ─┐
   carries `project_slug` + `worktree_name` strings; the supervisor stores
   them in `SessionMeta` and echoes them back on `HandshakeResp::Ok`. The
   client uses them to re-bind resumed sessions to the right tab via
-  `runtime::rebind_resumed_sessions`. If a project/worktree no longer
+  `runtime::rebind_one` (run per supervisor — at startup for LOCAL, on
+  `SupervisorConnected` for each remote). If a project/worktree no longer
   exists locally, the orphan session is killed (see `runtime::locate`).
 - **Spawned session sizing.** `client::request_spawn` stores `(dest, rows,
   cols)` in `pending_spawns` keyed by `request_id`. When the supervisor
