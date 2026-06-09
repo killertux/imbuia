@@ -342,7 +342,7 @@ fn project_client<'a>(
     match supervisors.get(sup) {
         Some(c) => Some(c),
         None => {
-            let _ = action_tx.blocking_send(Action::OperationFailed(format!(
+            let _ = action_tx.try_send(Action::OperationFailed(format!(
                 "supervisor '{}' is not connected",
                 supervisors.name_of(sup)
             )));
@@ -364,7 +364,7 @@ fn execute(
         match supervisors.get(sup) {
             Some(c) => Some(c),
             None => {
-                let _ = action_tx.blocking_send(Action::OperationFailed(format!(
+                let _ = action_tx.try_send(Action::OperationFailed(format!(
                     "supervisor '{}' is not connected",
                     supervisors.name_of(sup)
                 )));
@@ -423,7 +423,7 @@ fn execute(
                 )
             {
                 tracing::warn!("supervisor spawn request failed: {e}");
-                let _ = action_tx.blocking_send(Action::OperationFailed(format!("spawn: {e}")));
+                let _ = action_tx.try_send(Action::OperationFailed(format!("spawn: {e}")));
             }
         }
         Command::KillSession(id) => {
@@ -474,14 +474,14 @@ fn execute(
                 && let Err(e) =
                     client.request_open_project(supervisor, path, setup_script, import_existing)
             {
-                let _ = action_tx.blocking_send(Action::OperationFailed(format!("open: {e}")));
+                let _ = action_tx.try_send(Action::OperationFailed(format!("open: {e}")));
             }
         }
         Command::ListDir { supervisor, path } => {
             if let Some(client) = targeted(supervisor)
                 && let Err(e) = client.request_list_dir(path)
             {
-                let _ = action_tx.blocking_send(Action::OperationFailed(format!("list dir: {e}")));
+                let _ = action_tx.try_send(Action::OperationFailed(format!("list dir: {e}")));
             }
         }
         Command::ImportWorktrees {
@@ -491,7 +491,7 @@ fn execute(
             if let Some(client) = project_client(state, supervisors, project_idx, action_tx)
                 && let Err(e) = client.request_import_worktrees(project_idx, repo_path)
             {
-                let _ = action_tx.blocking_send(Action::OperationFailed(format!("import: {e}")));
+                let _ = action_tx.try_send(Action::OperationFailed(format!("import: {e}")));
             }
         }
         Command::AddWorktree {
@@ -502,7 +502,7 @@ fn execute(
             if let Some(client) = project_client(state, supervisors, project_idx, action_tx)
                 && let Err(e) = client.request_add_worktree(project_idx, repo_path, branch)
             {
-                let _ = action_tx.blocking_send(Action::OperationFailed(format!("worktree: {e}")));
+                let _ = action_tx.try_send(Action::OperationFailed(format!("worktree: {e}")));
             }
         }
         Command::RemoveWorktree {
@@ -521,8 +521,8 @@ fn execute(
                     branch,
                 )
             {
-                let _ = action_tx
-                    .blocking_send(Action::OperationFailed(format!("remove worktree: {e}")));
+                let _ =
+                    action_tx.try_send(Action::OperationFailed(format!("remove worktree: {e}")));
             }
         }
         Command::SaveGlobalConfig => {
