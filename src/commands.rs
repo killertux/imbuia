@@ -133,6 +133,12 @@ pub const COMMANDS: &[CmdSpec] = &[
         handler: cmd_gh_refresh,
     },
     CmdSpec {
+        names: &["palette"],
+        usage: ":palette",
+        description: "Open the command palette (also Ctrl-P).",
+        handler: cmd_palette,
+    },
+    CmdSpec {
         names: &["log-path"],
         usage: ":log-path",
         description: "Show the path to the client log file (tail -f to debug).",
@@ -503,6 +509,10 @@ fn cmd_gh_disable(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
     state.pr_statuses.retain(|(p, _), _| *p != pi);
     state.command_status = Some("GitHub PR status disabled".into());
     cmds.push(Command::SaveProjectConfig(pi));
+}
+
+fn cmd_palette(state: &mut AppState, _args: &[&str], _cmds: &mut Commands) {
+    crate::reducer::open_palette(state);
 }
 
 fn cmd_log_path(state: &mut AppState, _args: &[&str], _cmds: &mut Commands) {

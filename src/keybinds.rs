@@ -33,6 +33,7 @@ pub enum BindableAction {
     CloseTab,
     EnterTerminalMode,
     EnterCommandMode,
+    CommandPalette,
 
     // Leader-chord targets.
     NextTab,
@@ -66,6 +67,7 @@ impl BindableAction {
             Self::CloseTab => "close_tab",
             Self::EnterTerminalMode => "enter_terminal_mode",
             Self::EnterCommandMode => "enter_command_mode",
+            Self::CommandPalette => "command_palette",
             Self::NextTab => "next_tab",
             Self::PrevTab => "prev_tab",
             Self::SidebarGrow => "sidebar_grow",
@@ -98,6 +100,7 @@ impl BindableAction {
             Self::CloseTab => "close the current tab",
             Self::EnterTerminalMode => "switch to Terminal mode",
             Self::EnterCommandMode => "open the :ex command line",
+            Self::CommandPalette => "open the command palette",
             Self::NextTab => "next tab",
             Self::PrevTab => "previous tab",
             Self::SidebarGrow => "grow the sidebar",
@@ -133,6 +136,7 @@ pub const ALL: &[BindableAction] = &[
     BindableAction::CloseTab,
     BindableAction::EnterTerminalMode,
     BindableAction::EnterCommandMode,
+    BindableAction::CommandPalette,
     BindableAction::NextTab,
     BindableAction::PrevTab,
     BindableAction::SidebarGrow,
@@ -270,6 +274,10 @@ pub fn defaults() -> KeyMap {
     add_n(&mut normal, "x", BindableAction::CloseTab);
     add_n(&mut normal, "i", BindableAction::EnterTerminalMode);
     add_n(&mut normal, ":", BindableAction::EnterCommandMode);
+    // Ctrl+Shift+P folds into <C-p> (see `canonical`), so both chords open
+    // the palette — and legacy terminals, which can't tell them apart, still
+    // work.
+    add_n(&mut normal, "<C-p>", BindableAction::CommandPalette);
     add_n(&mut normal, "gt", BindableAction::NextTab);
     add_n(&mut normal, "gT", BindableAction::PrevTab);
     add_n(&mut normal, "<C-w>>", BindableAction::SidebarGrow);

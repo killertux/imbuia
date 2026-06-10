@@ -316,6 +316,16 @@ impl UsagePopup {
     }
 }
 
+/// Modal command palette (`<C-p>` / `:palette`): a query line over the
+/// unified command + keybind-action registry. `entries` is built once at
+/// open time from the live keymap; `filtered` holds ranked indices into it.
+pub struct PalettePopup {
+    pub query: String,
+    pub entries: Vec<crate::palette::PaletteEntry>,
+    pub filtered: Vec<usize>,
+    pub cursor: u16,
+}
+
 /// Autocomplete state for the `:` command line.
 #[derive(Clone, Debug, Default)]
 pub struct CommandCompletion {
@@ -391,6 +401,8 @@ pub struct AppState {
     pub launch_popup: Option<LaunchPopup>,
     /// Active usage popup (`:usage`), if any.
     pub usage_popup: Option<UsagePopup>,
+    /// Active command palette (`<C-p>` / `:palette`), if any.
+    pub palette_popup: Option<PalettePopup>,
     /// `~/.config/imbuia` (or XDG equivalent). Resolved once at startup.
     pub config_dir: PathBuf,
     /// Description of the currently running async operation (open project,
@@ -455,6 +467,7 @@ impl AppState {
             open_project_popup: None,
             launch_popup: None,
             usage_popup: None,
+            palette_popup: None,
             config_dir: PathBuf::new(),
             pending_op: None,
             pending_confirm: None,
