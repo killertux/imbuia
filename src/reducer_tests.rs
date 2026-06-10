@@ -2223,7 +2223,10 @@ fn palette_typing_filters_and_enter_executes_quit() {
         // `q` is the only name-prefix match — must rank first.
         assert_eq!(popup.entries[popup.filtered[0]].name, "q");
     }
-    let _ = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    let _ = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
     assert!(s.palette_popup.is_none());
     assert!(!s.running);
 }
@@ -2236,12 +2239,14 @@ fn palette_enter_on_set_prefills_command_line() {
         let _ = reduce(&mut s, Action::Key(plain(c)));
     }
     assert_eq!(
-        s.palette_popup.as_ref().unwrap().entries
-            [s.palette_popup.as_ref().unwrap().filtered[0]]
+        s.palette_popup.as_ref().unwrap().entries[s.palette_popup.as_ref().unwrap().filtered[0]]
             .name,
         "set"
     );
-    let _ = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    let _ = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
     assert!(s.palette_popup.is_none());
     assert_eq!(s.mode, Mode::Command);
     assert_eq!(s.command, "set ");
@@ -2254,7 +2259,10 @@ fn palette_enter_on_command_only_entry_runs_handler() {
     for c in "log-path".chars() {
         let _ = reduce(&mut s, Action::Key(plain(c)));
     }
-    let _ = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    let _ = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
     assert!(s.palette_popup.is_none());
     assert!(s.command_status.as_deref().unwrap().starts_with("log:"));
 }
@@ -2263,7 +2271,10 @@ fn palette_enter_on_command_only_entry_runs_handler() {
 fn palette_esc_closes_without_side_effects() {
     let mut s = AppState::new();
     let _ = reduce(&mut s, Action::Key(ctrl('p')));
-    let cmds = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    let cmds = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    );
     assert!(s.palette_popup.is_none());
     assert!(cmds.is_empty());
     assert!(s.running);
@@ -2274,9 +2285,15 @@ fn palette_esc_closes_without_side_effects() {
 fn palette_cursor_moves_and_clamps() {
     let mut s = AppState::new();
     let _ = reduce(&mut s, Action::Key(ctrl('p')));
-    let _ = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+    let _ = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+    );
     assert_eq!(s.palette_popup.as_ref().unwrap().cursor, 0);
-    let _ = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    let _ = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+    );
     let _ = reduce(&mut s, Action::Key(ctrl('n')));
     assert_eq!(s.palette_popup.as_ref().unwrap().cursor, 2);
     let _ = reduce(&mut s, Action::Key(ctrl('p')));
@@ -2296,8 +2313,14 @@ fn palette_backspace_refilters() {
     let _ = reduce(&mut s, Action::Key(plain('z')));
     let _ = reduce(&mut s, Action::Key(plain('z')));
     assert!(s.palette_popup.as_ref().unwrap().filtered.is_empty());
-    let _ = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)));
-    let _ = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)));
+    let _ = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+    );
+    let _ = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+    );
     let popup = s.palette_popup.as_ref().unwrap();
     assert_eq!(popup.filtered.len(), popup.entries.len());
 }
@@ -2308,7 +2331,10 @@ fn palette_enter_on_empty_results_just_closes() {
     let _ = reduce(&mut s, Action::Key(ctrl('p')));
     let _ = reduce(&mut s, Action::Key(plain('z')));
     let _ = reduce(&mut s, Action::Key(plain('z')));
-    let cmds = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    let cmds = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
     assert!(s.palette_popup.is_none());
     assert!(cmds.is_empty());
     assert!(s.running);

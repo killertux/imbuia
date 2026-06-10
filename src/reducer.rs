@@ -1080,9 +1080,7 @@ fn handle_palette_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
             };
             match popup.entries[idx].exec {
                 PaletteExec::Action(action) => dispatch_action(state, action, cmds),
-                PaletteExec::Command(name) => {
-                    crate::commands::execute_command(state, name, cmds)
-                }
+                PaletteExec::Command(name) => crate::commands::execute_command(state, name, cmds),
                 PaletteExec::Prefill(name) => {
                     // Drop into the `:` line with "<name> " so the user types
                     // arguments and submits with Enter.
