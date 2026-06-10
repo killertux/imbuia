@@ -44,6 +44,8 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         render_usage_popup(frame, area, usage, theme);
     } else if let Some(launch) = &state.launch_popup {
         render_launch_popup(frame, area, launch, theme);
+    } else if let Some(palette) = &state.palette_popup {
+        render_palette_popup(frame, area, palette, theme);
     }
 
     // Always last so it floats over whatever is below.
@@ -197,6 +199,87 @@ fn render_launch_popup(
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         " j/k or ↑↓ · Enter to launch · Esc cancel",
+        Style::default().fg(theme.fg_dim),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_palette_popup(
+    frame: &mut Frame,
+    area: Rect,
+    popup: &crate::app::PalettePopup,
+    theme: &Theme,
+) {
+    let width = 72u16.min(area.width.saturating_sub(4));
+    // query line + list + hint line + borders.
+    let height = (popup.filtered.len() as u16 + 5)
+        .clamp(7, 24)
+        .min(area.height.saturating_sub(4));
+    let r = centered_rect(width, height, area);
+    frame.render_widget(Clear, r);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border_focus))
+        .style(Style::default().bg(theme.bg).fg(theme.fg))
+        .title(
+            Line::from(" Commands ".to_string())
+                .style(
+                    Style::default()
+                        .fg(theme.header_fg)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .alignment(Alignment::Center),
+        );
+    let inner = block.inner(r);
+    frame.render_widget(block, r);
+
+    let mut lines = Vec::with_capacity(inner.height as usize);
+    lines.push(Line::from(vec![
+        Span::styled(" > ", Style::default().fg(theme.header_fg)),
+        Span::styled(popup.query.clone(), Style::default().fg(theme.fg)),
+        Span::styled("█", Style::default().fg(theme.fg_dim)),
+    ]));
+
+    // List window: keep the cursor visible (query + hint rows eat 2 lines).
+    let visible = inner.height.saturating_sub(2) as usize;
+    let offset = (popup.cursor as usize + 1).saturating_sub(visible);
+    let name_w = 18usize;
+    for (row, &idx) in popup.filtered.iter().enumerate().skip(offset).take(visible) {
+        let entry = &popup.entries[idx];
+        let selected = row as u16 == popup.cursor;
+        let prefix = if selected { "▸ " } else { "  " };
+        let style = if selected {
+            Style::default()
+                .bg(theme.selection_bg)
+                .fg(theme.selection_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg)
+        };
+        let keybind = match &entry.keybind {
+            Some(b) => format!("  {b}"),
+            None => String::new(),
+        };
+        let desc_room = (width as usize)
+            .saturating_sub(2 + name_w + 1 + keybind.len() + 2)
+            .max(8);
+        lines.push(Line::from(vec![
+            Span::styled(format!("{prefix}{:<name_w$}", entry.name), style),
+            Span::styled(
+                format!(" {}", truncate(entry.description, desc_room)),
+                Style::default().fg(theme.fg_dim),
+            ),
+            Span::styled(keybind, Style::default().fg(theme.fg_dim)),
+        ]));
+    }
+    if popup.filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matching commands",
+            Style::default().fg(theme.fg_dim),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        " type to filter · ↑↓/C-p C-n move · Enter run · Esc cancel",
         Style::default().fg(theme.fg_dim),
     )));
     frame.render_widget(Paragraph::new(lines), inner);

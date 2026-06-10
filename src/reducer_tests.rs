@@ -2150,3 +2150,166 @@ fn losing_remote_drops_only_its_sessions() {
     assert!(s.projects[0].worktrees[0].sessions.is_empty());
     assert!(s.running, "losing a remote must not stop the app");
 }
+
+// ── command palette ─────────────────────────────────────────────────────────
+
+#[test]
+fn ctrl_p_opens_palette_in_normal_mode() {
+    let mut s = AppState::new();
+    let cmds = reduce(&mut s, Action::Key(ctrl('p')));
+    assert!(cmds.is_empty());
+    let popup = s.palette_popup.as_ref().expect("palette open");
+    assert_eq!(popup.filtered.len(), popup.entries.len());
+    assert_eq!(popup.entries.len(), 31);
+}
+
+#[test]
+fn ctrl_shift_p_also_opens_palette() {
+    // canonical() folds Ctrl+Shift+P into <C-p>, regardless of how the
+    // keyboard protocol reports the char.
+    let mut s = AppState::new();
+    let k = KeyEvent::new(
+        KeyCode::Char('P'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    let _ = reduce(&mut s, Action::Key(k));
+    assert!(s.palette_popup.is_some());
+}
+
+#[test]
+fn ctrl_p_in_terminal_mode_reaches_the_pty() {
+    let mut s = AppState::new();
+    s.projects = mock_projects();
+    s.active_worktree = Some((0, 0));
+    let _ = reduce(
+        &mut s,
+        Action::SessionSpawned {
+            session: FakeSession::new(7),
+            dest: (0, 0),
+        },
+    );
+    s.mode = Mode::Terminal;
+    let cmds = reduce(&mut s, Action::Key(ctrl('p')));
+    assert!(s.palette_popup.is_none());
+    assert!(matches!(cmds.as_slice(), [Command::WriteKey(7, _)]));
+}
+
+#[test]
+fn ctrl_p_in_command_mode_is_ignored() {
+    let mut s = AppState::new();
+    let _ = reduce(&mut s, Action::Key(plain(':')));
+    assert_eq!(s.mode, Mode::Command);
+    let _ = reduce(&mut s, Action::Key(ctrl('p')));
+    assert!(s.palette_popup.is_none());
+    assert_eq!(s.mode, Mode::Command);
+}
+
+#[test]
+fn palette_command_opens_it_too() {
+    let mut s = AppState::new();
+    let mut cmds = Commands::new();
+    crate::commands::execute_command(&mut s, "palette", &mut cmds);
+    assert!(s.palette_popup.is_some());
+}
+
+#[test]
+fn palette_typing_filters_and_enter_executes_quit() {
+    let mut s = AppState::new();
+    let _ = reduce(&mut s, Action::Key(ctrl('p')));
+    let _ = reduce(&mut s, Action::Key(plain('q')));
+    {
+        let popup = s.palette_popup.as_ref().unwrap();
+        assert_eq!(popup.query, "q");
+        // `q` is the only name-prefix match — must rank first.
+        assert_eq!(popup.entries[popup.filtered[0]].name, "q");
+    }
+    let _ = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert!(s.palette_popup.is_none());
+    assert!(!s.running);
+}
+
+#[test]
+fn palette_enter_on_set_prefills_command_line() {
+    let mut s = AppState::new();
+    let _ = reduce(&mut s, Action::Key(ctrl('p')));
+    for c in "set".chars() {
+        let _ = reduce(&mut s, Action::Key(plain(c)));
+    }
+    assert_eq!(
+        s.palette_popup.as_ref().unwrap().entries
+            [s.palette_popup.as_ref().unwrap().filtered[0]]
+            .name,
+        "set"
+    );
+    let _ = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert!(s.palette_popup.is_none());
+    assert_eq!(s.mode, Mode::Command);
+    assert_eq!(s.command, "set ");
+}
+
+#[test]
+fn palette_enter_on_command_only_entry_runs_handler() {
+    let mut s = AppState::new();
+    let _ = reduce(&mut s, Action::Key(ctrl('p')));
+    for c in "log-path".chars() {
+        let _ = reduce(&mut s, Action::Key(plain(c)));
+    }
+    let _ = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert!(s.palette_popup.is_none());
+    assert!(s.command_status.as_deref().unwrap().starts_with("log:"));
+}
+
+#[test]
+fn palette_esc_closes_without_side_effects() {
+    let mut s = AppState::new();
+    let _ = reduce(&mut s, Action::Key(ctrl('p')));
+    let cmds = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert!(s.palette_popup.is_none());
+    assert!(cmds.is_empty());
+    assert!(s.running);
+    assert_eq!(s.mode, Mode::Normal);
+}
+
+#[test]
+fn palette_cursor_moves_and_clamps() {
+    let mut s = AppState::new();
+    let _ = reduce(&mut s, Action::Key(ctrl('p')));
+    let _ = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+    assert_eq!(s.palette_popup.as_ref().unwrap().cursor, 0);
+    let _ = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    let _ = reduce(&mut s, Action::Key(ctrl('n')));
+    assert_eq!(s.palette_popup.as_ref().unwrap().cursor, 2);
+    let _ = reduce(&mut s, Action::Key(ctrl('p')));
+    assert_eq!(s.palette_popup.as_ref().unwrap().cursor, 1);
+    // Clamp at the end of the list.
+    for _ in 0..100 {
+        let _ = reduce(&mut s, Action::Key(ctrl('n')));
+    }
+    let popup = s.palette_popup.as_ref().unwrap();
+    assert_eq!(popup.cursor as usize, popup.filtered.len() - 1);
+}
+
+#[test]
+fn palette_backspace_refilters() {
+    let mut s = AppState::new();
+    let _ = reduce(&mut s, Action::Key(ctrl('p')));
+    let _ = reduce(&mut s, Action::Key(plain('z')));
+    let _ = reduce(&mut s, Action::Key(plain('z')));
+    assert!(s.palette_popup.as_ref().unwrap().filtered.is_empty());
+    let _ = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)));
+    let _ = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)));
+    let popup = s.palette_popup.as_ref().unwrap();
+    assert_eq!(popup.filtered.len(), popup.entries.len());
+}
+
+#[test]
+fn palette_enter_on_empty_results_just_closes() {
+    let mut s = AppState::new();
+    let _ = reduce(&mut s, Action::Key(ctrl('p')));
+    let _ = reduce(&mut s, Action::Key(plain('z')));
+    let _ = reduce(&mut s, Action::Key(plain('z')));
+    let cmds = reduce(&mut s, Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert!(s.palette_popup.is_none());
+    assert!(cmds.is_empty());
+    assert!(s.running);
+}

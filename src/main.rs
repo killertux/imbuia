@@ -20,6 +20,7 @@ mod input;
 mod ipc;
 mod keybinds;
 mod layout;
+mod palette;
 mod proc;
 mod reducer;
 mod render;

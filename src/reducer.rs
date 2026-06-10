@@ -483,6 +483,11 @@ fn handle_paste(state: &mut AppState, text: String, cmds: &mut Commands) {
 }
 
 fn handle_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
+    // Command palette is modal: typed chars filter, Enter executes.
+    if state.palette_popup.is_some() {
+        handle_palette_key(state, k, cmds);
+        return;
+    }
     // Usage popup is modal: arrow/expand/close handled here.
     if state.usage_popup.is_some() {
         handle_usage_popup_key(state, k, cmds);
@@ -1018,9 +1023,93 @@ fn dispatch_action(state: &mut AppState, action: BindableAction, cmds: &mut Comm
         BindableAction::LaunchPicker => crate::commands::cmd_launch(state, &[], cmds),
         BindableAction::UsagePopup => crate::commands::cmd_usage(state, &[], cmds),
         BindableAction::HelpPopup => state.help_open = true,
+        BindableAction::CommandPalette => open_palette(state),
         BindableAction::Quit => state.running = false,
         BindableAction::LeaveTerminal => state.mode = Mode::Normal,
     }
+}
+
+/// Open the command palette. Entries are built from the live keymap at open
+/// time so user-overlaid bindings show correct hints. Shared by the `<C-p>`
+/// action and `:palette`.
+pub(crate) fn open_palette(state: &mut AppState) {
+    let entries = crate::palette::build_entries(&state.keymap);
+    let filtered = crate::palette::filter(&entries, "");
+    state.palette_popup = Some(crate::app::PalettePopup {
+        query: String::new(),
+        entries,
+        filtered,
+        cursor: 0,
+    });
+}
+
+fn handle_palette_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
+    use crate::palette::PaletteExec;
+    // Ctrl-n / Ctrl-p move the cursor — j/k are taken by the query line.
+    if k.modifiers.contains(KeyModifiers::CONTROL) {
+        match k.code {
+            KeyCode::Char('n') | KeyCode::Char('N') => move_palette_cursor(state, 1),
+            KeyCode::Char('p') | KeyCode::Char('P') => move_palette_cursor(state, -1),
+            _ => {}
+        }
+        return;
+    }
+    let plain_or_shift = k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT;
+    match k.code {
+        KeyCode::Esc => state.palette_popup = None,
+        KeyCode::Down => move_palette_cursor(state, 1),
+        KeyCode::Up => move_palette_cursor(state, -1),
+        KeyCode::Char(c) if plain_or_shift => {
+            if let Some(popup) = state.palette_popup.as_mut() {
+                popup.query.push(c);
+                refresh_palette_filter(popup);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(popup) = state.palette_popup.as_mut() {
+                popup.query.pop();
+                refresh_palette_filter(popup);
+            }
+        }
+        KeyCode::Enter => {
+            let Some(popup) = state.palette_popup.take() else {
+                return;
+            };
+            let Some(&idx) = popup.filtered.get(popup.cursor as usize) else {
+                return; // empty result list — Enter is a no-op close
+            };
+            match popup.entries[idx].exec {
+                PaletteExec::Action(action) => dispatch_action(state, action, cmds),
+                PaletteExec::Command(name) => {
+                    crate::commands::execute_command(state, name, cmds)
+                }
+                PaletteExec::Prefill(name) => {
+                    // Drop into the `:` line with "<name> " so the user types
+                    // arguments and submits with Enter.
+                    state.mode = Mode::Command;
+                    state.command = format!("{name} ");
+                    state.command_status = None;
+                    state.command_completion = None;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Re-rank the entry list after a query edit and reset the cursor to the top
+/// (the best match).
+fn refresh_palette_filter(popup: &mut crate::app::PalettePopup) {
+    popup.filtered = crate::palette::filter(&popup.entries, &popup.query);
+    popup.cursor = 0;
+}
+
+fn move_palette_cursor(state: &mut AppState, delta: i32) {
+    let Some(popup) = state.palette_popup.as_mut() else {
+        return;
+    };
+    let max = popup.filtered.len().saturating_sub(1) as i32;
+    popup.cursor = (popup.cursor as i32 + delta).clamp(0, max.max(0)) as u16;
 }
 
 fn handle_command_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
