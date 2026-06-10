@@ -65,8 +65,12 @@ pub fn head_branch(path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// Create a worktree at `dest` for `branch`. If `branch` doesn't exist locally,
-/// retry with `-b` to create it from current HEAD.
+/// Create a worktree at `dest` for `branch`. If `branch` doesn't exist
+/// locally, create it — based on the default remote's HEAD branch (e.g.
+/// `origin/main`) after a fetch, so new worktrees start from the freshest
+/// upstream code rather than the local clone's possibly-stale HEAD. Falls
+/// back to current HEAD when the repo has no remote or the fetch fails
+/// (offline).
 pub fn worktree_add(repo: &Path, dest: &Path, branch: &str) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -82,12 +86,73 @@ pub fn worktree_add(repo: &Path, dest: &Path, branch: &str) -> Result<()> {
         return Ok(());
     }
     // Fallback: create the branch.
-    run_with(
-        &["worktree", "add", "-b", branch, &dest_str],
-        Some(repo),
-        GIT_LONG_TIMEOUT,
-    )?;
+    if let Some(start) = fresh_remote_start(repo) {
+        // `--no-track`: the new branch is the user's own; tracking the
+        // remote's main would make a later `git pull` merge it silently.
+        run_with(
+            &[
+                "worktree",
+                "add",
+                "--no-track",
+                "-b",
+                branch,
+                &dest_str,
+                &start,
+            ],
+            Some(repo),
+            GIT_LONG_TIMEOUT,
+        )?;
+    } else {
+        run_with(
+            &["worktree", "add", "-b", branch, &dest_str],
+            Some(repo),
+            GIT_LONG_TIMEOUT,
+        )?;
+    }
     Ok(())
+}
+
+/// Fetch the default remote and return its HEAD branch as a start point for
+/// new branches (e.g. `origin/main`). `None` means "use local HEAD": no
+/// remote configured, fetch failed (offline), or the remote HEAD can't be
+/// resolved.
+fn fresh_remote_start(repo: &Path) -> Option<String> {
+    let remote = default_remote(repo)?;
+    if let Err(e) = run_with(&["fetch", &remote], Some(repo), GIT_LONG_TIMEOUT) {
+        tracing::warn!(remote = %remote, "fetch failed, basing new branch on local HEAD: {e}");
+        return None;
+    }
+    let start = remote_head(repo, &remote);
+    if start.is_none() {
+        tracing::warn!(remote = %remote, "couldn't resolve remote HEAD, basing new branch on local HEAD");
+    }
+    start
+}
+
+/// The remote to base new branches on: `origin` if present, else the first
+/// configured remote, else `None` (local-only repo).
+fn default_remote(repo: &Path) -> Option<String> {
+    let out = run(&["remote"], Some(repo)).ok()?;
+    let mut remotes = out.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = remotes.next()?.to_string();
+    if first == "origin" || remotes.all(|r| r != "origin") {
+        Some(first)
+    } else {
+        Some("origin".to_string())
+    }
+}
+
+/// Resolve the remote's default branch (e.g. `origin/main`). The symbolic
+/// ref `refs/remotes/<remote>/HEAD` is set on clone but may be missing on
+/// repos that grew the remote later — in that case ask the remote directly
+/// via `remote set-head --auto` (network) and retry.
+fn remote_head(repo: &Path, remote: &str) -> Option<String> {
+    let head_ref = format!("{remote}/HEAD");
+    if let Ok(r) = run(&["rev-parse", "--abbrev-ref", &head_ref], Some(repo)) {
+        return Some(r);
+    }
+    run(&["remote", "set-head", remote, "--auto"], Some(repo)).ok()?;
+    run(&["rev-parse", "--abbrev-ref", &head_ref], Some(repo)).ok()
 }
 
 /// One row from `git worktree list --porcelain`. `branch` is `None` for
