@@ -211,11 +211,16 @@ fn render_palette_popup(
     theme: &Theme,
 ) {
     let width = 72u16.min(area.width.saturating_sub(4));
+    // Anchor the top edge at a fixed Y (~1/6 down the screen) instead of
+    // centering: as typing narrows the list the popup shrinks, and a centered
+    // rect would make the query line jump every keystroke. With a fixed top
+    // only the bottom edge moves.
+    let y = area.y + area.height / 6;
+    let avail = area.height.saturating_sub(area.height / 6 + 2);
     // query line + list + hint line + borders.
-    let height = (popup.filtered.len() as u16 + 5)
-        .clamp(7, 24)
-        .min(area.height.saturating_sub(4));
-    let r = centered_rect(width, height, area);
+    let height = (popup.filtered.len() as u16 + 5).clamp(7, 24).min(avail);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let r = Rect::new(x, y, width, height);
     frame.render_widget(Clear, r);
     let block = Block::default()
         .borders(Borders::ALL)
