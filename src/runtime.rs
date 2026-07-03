@@ -426,11 +426,11 @@ fn execute(
                 let _ = action_tx.try_send(Action::OperationFailed(format!("spawn: {e}")));
             }
         }
-        Command::KillSession(id) => {
-            // Routes implicitly via the session's own connection.
-            if let Some(sess) = state.sessions.get(&id) {
-                sess.kill();
-            }
+        Command::KillSession(sess) => {
+            // Routes implicitly via the session's own connection. We hold the
+            // handle directly (the reducer already removed it from
+            // `state.sessions`), so the kill still reaches the supervisor.
+            sess.kill();
         }
         Command::RestartSupervisor => {
             // `:rs` targets the local supervisor (the auto-spawned one).

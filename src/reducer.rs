@@ -26,7 +26,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
                 // and Spawned arrival. Kill the orphan PTY upstream and don't
                 // register it locally — otherwise it lingers forever with no
                 // UI to close it.
-                cmds.push(Command::KillSession(id));
+                cmds.push(Command::KillSession(session));
             }
         }
         Action::Key(k) => handle_key(state, k, &mut cmds),
@@ -815,10 +815,13 @@ pub(crate) fn close_current_tab(state: &mut AppState, cmds: &mut Commands) {
         }
         id
     };
-    state.sessions.remove(&session_id);
     // Ask the supervisor to terminate the child. Local removal stops
-    // rendering; the kill stops the process so we don't leak shells.
-    cmds.push(Command::KillSession(session_id));
+    // rendering; the kill stops the process so we don't leak shells. Hand the
+    // session handle to the command so the kill fires even though we've just
+    // dropped it from `state.sessions`.
+    if let Some(sess) = state.sessions.remove(&session_id) {
+        cmds.push(Command::KillSession(sess));
+    }
 }
 
 fn worktree_mut(state: &mut AppState, dest: (usize, usize)) -> Option<&mut Worktree> {
@@ -1239,8 +1242,9 @@ fn handle_pending_confirm_key(state: &mut AppState, k: KeyEvent, cmds: &mut Comm
                         .and_then(|p| p.worktrees.get_mut(worktree_idx))
                     {
                         for id in w.sessions.drain(..) {
-                            state.sessions.remove(&id);
-                            cmds.push(Command::KillSession(id));
+                            if let Some(sess) = state.sessions.remove(&id) {
+                                cmds.push(Command::KillSession(sess));
+                            }
                         }
                         w.active_tab = None;
                     }

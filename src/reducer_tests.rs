@@ -686,12 +686,20 @@ fn o_inert_without_active_worktree() {
 #[test]
 fn x_closes_current_tab_and_drops_session() {
     let mut s = mk_state_with_two_tabs();
-    let _ = reduce(&mut s, Action::Key(plain('x')));
+    let cmds = reduce(&mut s, Action::Key(plain('x')));
     // We removed the active tab (index 1). 101 remains.
     assert_eq!(s.projects[0].worktrees[0].sessions, vec![101]);
     assert_eq!(s.projects[0].worktrees[0].active_tab, Some(0));
     assert!(!s.sessions.contains_key(&102));
     assert!(s.sessions.contains_key(&101));
+    // And the kill must carry the *handle* for the closed session (102), not
+    // merely its id — `runtime::execute` calls `.kill()` on it after we've
+    // dropped it from `state.sessions`, so the supervisor actually reaps the
+    // child (otherwise it reappears on reattach). Regression guard.
+    match cmds.as_slice() {
+        [Command::KillSession(sess)] => assert_eq!(sess.id(), 102),
+        other => panic!("expected a single KillSession(102), got {other:?}"),
+    }
 }
 
 #[test]
