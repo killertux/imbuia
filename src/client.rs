@@ -49,6 +49,15 @@ pub(crate) struct ProxySession {
     notify: Arc<Notify>,
 }
 
+impl std::fmt::Debug for ProxySession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxySession")
+            .field("global_id", &self.global_id)
+            .field("local_id", &self.local_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Channel-backed handle to the supervisor: enqueues `ClientMsg` onto an
 /// unbounded queue drained by a dedicated async writer task. Crucially,
 /// `UnboundedSender::send` is synchronous and non-blocking, so reducer/runtime

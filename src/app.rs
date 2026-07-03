@@ -807,7 +807,11 @@ pub enum Command {
         worktree_name: String,
     },
     /// Ask the supervisor to terminate the given session (e.g. on `:tabclose`).
-    KillSession(SessionId),
+    /// Carries the session handle itself (not just its id) so the kill still
+    /// fires after the reducer has removed the session from `state.sessions` —
+    /// otherwise `execute` couldn't look it up and the supervisor's child would
+    /// leak (reappearing on reattach). See `runtime::execute`.
+    KillSession(Arc<dyn Session>),
     /// Send `Shutdown` to the supervisor and wire down the local session map.
     /// The client process keeps running and will auto-spawn a fresh
     /// supervisor on its next attach attempt (today: at next start).

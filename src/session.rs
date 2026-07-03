@@ -11,8 +11,9 @@ pub type SessionId = u64;
 
 /// Abstraction over an in-pane backend: today, a [`crate::client::ProxySession`]
 /// talking to the supervisor; could be an in-process agent harness tomorrow.
-/// Object-safe.
-pub trait Session: Send + Sync {
+/// Object-safe. `Debug` is required so `Arc<dyn Session>` can ride inside a
+/// `Command` (e.g. `Command::KillSession`), which derives `Debug`.
+pub trait Session: Send + Sync + std::fmt::Debug {
     fn id(&self) -> SessionId;
     fn write_key(&self, key: KeyEvent) -> io::Result<()>;
     fn write_mouse(&self, ev: MouseEvent) -> io::Result<()>;
@@ -52,6 +53,13 @@ impl FakeSession {
             pastes: Mutex::new(Vec::new()),
             resizes: Mutex::new(Vec::new()),
         })
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for FakeSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeSession").field("id", &self.id).finish()
     }
 }
 
