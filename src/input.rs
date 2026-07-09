@@ -323,6 +323,102 @@ impl KbdTracker {
     }
 }
 
+/// Sniffs OSC 52 clipboard-*copy* sequences out of a PTY byte stream so the
+/// client can forward them to the real outer terminal (see
+/// `Command::SetClipboard`). imbuia re-renders inner output cell-by-cell via
+/// vt100, so escape sequences with no on-screen effect — OSC 52 among them —
+/// are otherwise swallowed by the parser and never reach the emulator that
+/// owns the system clipboard. Mirrors [`KbdTracker`]: fed the raw stream, it
+/// keeps partial-sequence state across frames.
+///
+/// Only copy requests (`ESC ] 52 ; <ty> ; <base64> ST`) are surfaced; paste
+/// queries (`… ; ?`) carry no data and are ignored.
+#[derive(Default)]
+pub struct ClipboardSniffer {
+    scan: OscScan,
+    /// Bytes accumulated between `ESC ]` and the string terminator.
+    buf: Vec<u8>,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum OscScan {
+    #[default]
+    Ground,
+    Esc,
+    Osc,
+    OscEsc,
+}
+
+/// Cap on a single buffered OSC payload; a copy larger than this is dropped
+/// rather than buffered unbounded. 1 MiB of base64 ≈ 768 KiB of clipboard.
+const MAX_OSC: usize = 1 << 20;
+
+impl ClipboardSniffer {
+    /// Feed a chunk of PTY output; returns the payload (`<ty>;<base64>`) of any
+    /// completed OSC 52 copy sequences, ready to splice into
+    /// `ESC ] 52 ; <payload> BEL`.
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        for &b in bytes {
+            match self.scan {
+                OscScan::Ground => {
+                    if b == 0x1b {
+                        self.scan = OscScan::Esc;
+                    }
+                }
+                OscScan::Esc => match b {
+                    b']' => {
+                        self.scan = OscScan::Osc;
+                        self.buf.clear();
+                    }
+                    0x1b => {} // stay: ESC ESC
+                    _ => self.scan = OscScan::Ground,
+                },
+                OscScan::Osc => match b {
+                    0x07 => {
+                        // BEL terminator.
+                        if let Some(p) = self.take_copy() {
+                            out.push(p);
+                        }
+                        self.scan = OscScan::Ground;
+                    }
+                    0x1b => self.scan = OscScan::OscEsc,
+                    _ => {
+                        self.buf.push(b);
+                        if self.buf.len() > MAX_OSC {
+                            self.buf.clear();
+                            self.scan = OscScan::Ground;
+                        }
+                    }
+                },
+                OscScan::OscEsc => {
+                    // The string terminator is `ESC \`; anything else aborts.
+                    if b == b'\\'
+                        && let Some(p) = self.take_copy()
+                    {
+                        out.push(p);
+                    }
+                    self.buf.clear();
+                    self.scan = if b == 0x1b { OscScan::Esc } else { OscScan::Ground };
+                }
+            }
+        }
+        out
+    }
+
+    /// If the buffered OSC is a `52` *copy* (not a `?` paste query), return its
+    /// `<ty>;<base64>` payload.
+    fn take_copy(&self) -> Option<String> {
+        let s = std::str::from_utf8(&self.buf).ok()?;
+        let payload = s.strip_prefix("52;")?;
+        // Paste queries end in `;?` (or are a bare `?`) and carry no data.
+        if payload.rsplit(';').next()? == "?" {
+            return None;
+        }
+        Some(payload.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,5 +561,47 @@ mod tests {
         let mut t = KbdTracker::default();
         t.feed(b"\x1b[2J\x1b[1;1H\x1b[?1049h hello \x1b[0m");
         assert_eq!(t.encoding(), KbdEncoding::Legacy);
+    }
+
+    #[test]
+    fn sniffs_osc52_copy_bel_terminated() {
+        let mut s = ClipboardSniffer::default();
+        let out = s.feed(b"before\x1b]52;c;aGVsbG8=\x07after");
+        assert_eq!(out, vec!["c;aGVsbG8=".to_string()]);
+    }
+
+    #[test]
+    fn sniffs_osc52_copy_st_terminated() {
+        let mut s = ClipboardSniffer::default();
+        let out = s.feed(b"\x1b]52;p;ZGF0YQ==\x1b\\");
+        assert_eq!(out, vec!["p;ZGF0YQ==".to_string()]);
+    }
+
+    #[test]
+    fn sniffs_osc52_split_across_frames() {
+        let mut s = ClipboardSniffer::default();
+        assert!(s.feed(b"\x1b]52;c;aGVs").is_empty());
+        let out = s.feed(b"bG8=\x07");
+        assert_eq!(out, vec!["c;aGVsbG8=".to_string()]);
+    }
+
+    #[test]
+    fn ignores_osc52_paste_query() {
+        let mut s = ClipboardSniffer::default();
+        assert!(s.feed(b"\x1b]52;c;?\x07").is_empty());
+    }
+
+    #[test]
+    fn ignores_non_52_osc() {
+        let mut s = ClipboardSniffer::default();
+        // Window-title (OSC 0) must not be mistaken for a clipboard copy.
+        assert!(s.feed(b"\x1b]0;my title\x07").is_empty());
+    }
+
+    #[test]
+    fn sniffs_multiple_copies_in_one_chunk() {
+        let mut s = ClipboardSniffer::default();
+        let out = s.feed(b"\x1b]52;c;YQ==\x07\x1b]52;c;Yg==\x07");
+        assert_eq!(out, vec!["c;YQ==".to_string(), "c;Yg==".to_string()]);
     }
 }
