@@ -40,6 +40,13 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
             state.sessions.remove(&id);
             remove_session_from_worktrees(state, id);
         }
+        Action::ClipboardCopy { session, payload } => {
+            // Forward to the outer terminal only from the focused session, so a
+            // background tab's copy can't hijack the user's clipboard.
+            if state.focused_session_id() == Some(session) {
+                cmds.push(Command::SetClipboard(payload));
+            }
+        }
         Action::ProjectValidated {
             supervisor,
             canonical_path,

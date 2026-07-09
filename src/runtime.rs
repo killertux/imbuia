@@ -401,6 +401,18 @@ fn execute(
                 tracing::warn!(session = id, "resize failed: {e}");
             }
         }
+        Command::SetClipboard(payload) => {
+            // Write OSC 52 straight to our stdout, bypassing ratatui's cell
+            // diff. Safe: `execute` runs on the main task, sequenced with
+            // `terminal.draw` (never concurrent), and OSC 52 moves no cursor
+            // and paints no cells, so it can't corrupt the frame. The outer
+            // emulator does the actual system-clipboard write.
+            use std::io::Write;
+            let mut out = stdout();
+            if let Err(e) = write!(out, "\x1b]52;{payload}\x07").and_then(|_| out.flush()) {
+                tracing::warn!("clipboard OSC 52 write failed: {e}");
+            }
+        }
         Command::SpawnInWorktree {
             supervisor,
             rows,

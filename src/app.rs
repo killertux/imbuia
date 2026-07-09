@@ -605,6 +605,14 @@ pub enum Action {
     Paste(String),
     Resize(TermSize),
     SessionExited(SessionId),
+    /// Client reader → reducer: a session emitted an OSC 52 clipboard-*copy*.
+    /// The reducer forwards it (as `Command::SetClipboard`) only when `session`
+    /// is the focused one, so a background tab can't clobber the clipboard.
+    /// `payload` is the ready-to-splice `<ty>;<base64>`.
+    ClipboardCopy {
+        session: SessionId,
+        payload: String,
+    },
     /// Supervisor → reducer (via the client reader): a path validated as a git
     /// repo. The reducer derives the slug (config logic — needs the other
     /// projects' slugs), builds the `Project`, and persists it.
@@ -703,6 +711,11 @@ impl std::fmt::Debug for Action {
             Action::Paste(s) => f.debug_tuple("Paste").field(&s.len()).finish(),
             Action::Resize(sz) => f.debug_tuple("Resize").field(sz).finish(),
             Action::SessionExited(id) => f.debug_tuple("SessionExited").field(id).finish(),
+            Action::ClipboardCopy { session, payload } => f
+                .debug_struct("ClipboardCopy")
+                .field("session", session)
+                .field("len", &payload.len())
+                .finish(),
             Action::ProjectValidated {
                 repo_name,
                 import_existing,
@@ -788,6 +801,12 @@ pub enum Command {
     /// app enabled bracketed paste.
     WritePaste(SessionId, String),
     ResizePty(SessionId, u16, u16),
+    /// Write an OSC 52 clipboard-set straight to the real (outer) terminal,
+    /// bypassing ratatui's cell diff. The outer emulator performs the
+    /// system-clipboard write locally — the mechanism that lets OSC 52 cross a
+    /// remote boundary, which imbuia's re-rendering pipeline otherwise breaks.
+    /// The payload is the `<ty>;<base64>` spliced into `ESC ] 52 ; … BEL`.
+    SetClipboard(String),
     /// Ask the runtime to spawn a PTY for the given destination worktree.
     /// On success it dispatches `Action::SessionSpawned { dest, .. }`.
     /// `initial_command`, when set, is written verbatim to the PTY immediately

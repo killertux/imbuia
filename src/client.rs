@@ -45,6 +45,10 @@ pub(crate) struct ProxySession {
     /// doesn't track it). Fed by the reader thread, read by `write_key` to pick
     /// the encoding for modified functional keys (Shift+Enter, …).
     kbd: Arc<Mutex<input::KbdTracker>>,
+    /// Extracts OSC 52 clipboard-copy sequences from this session's output so
+    /// the reader can forward them to the outer terminal (they'd otherwise be
+    /// swallowed by the local vt100 re-render). Fed by the reader thread.
+    clip: Arc<Mutex<input::ClipboardSniffer>>,
     tx: ClientTx,
     notify: Arc<Notify>,
 }
@@ -390,6 +394,7 @@ impl SupervisorClient {
             local_id: meta.id,
             parser,
             kbd: Arc::new(Mutex::new(input::KbdTracker::default())),
+            clip: Arc::new(Mutex::new(input::ClipboardSniffer::default())),
             tx: self.tx.clone(),
             notify: Arc::clone(&self.notify),
         });
@@ -858,6 +863,7 @@ fn spawn_reader(client: Arc<SupervisorClient>, mut rd: BoxRead, action_tx: mpsc:
                             local_id: id,
                             parser,
                             kbd: Arc::new(Mutex::new(input::KbdTracker::default())),
+                            clip: Arc::new(Mutex::new(input::ClipboardSniffer::default())),
                             tx: client.tx.clone(),
                             notify: Arc::clone(&client.notify),
                         });
@@ -892,6 +898,25 @@ fn spawn_reader(client: Arc<SupervisorClient>, mut rd: BoxRead, action_tx: mpsc:
                         // so write_key knows how to encode modified keys.
                         if let Ok(mut k) = sess.kbd.lock() {
                             k.feed(&bytes);
+                        }
+                        // …and for OSC 52 clipboard copies, which the local
+                        // vt100 re-render would otherwise swallow. Collect
+                        // under the lock, then post outside it (guards aren't
+                        // Send across the .await). `contents_formatted` dumps
+                        // never carry OSC 52, so replaying one is a no-op.
+                        let copies = sess
+                            .clip
+                            .lock()
+                            .map(|mut c| c.feed(&bytes))
+                            .unwrap_or_default();
+                        let global = sess.global_id;
+                        for payload in copies {
+                            let _ = action_tx
+                                .send(Action::ClipboardCopy {
+                                    session: global,
+                                    payload,
+                                })
+                                .await;
                         }
                         client.notify.notify_one();
                     }

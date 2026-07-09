@@ -111,6 +111,57 @@ fn ctrl_w_then_unknown_clears_leader_silently() {
 }
 
 #[test]
+fn clipboard_copy_from_focused_session_forwards() {
+    let mut s = AppState::new();
+    s.term_size = TermSize::new(40, 200);
+    s.projects = mock_projects();
+    let _ = reduce(
+        &mut s,
+        Action::SessionSpawned {
+            session: FakeSession::new(7),
+            dest: (0, 0),
+        },
+    );
+    s.active_worktree = Some((0, 0));
+    assert_eq!(s.focused_session_id(), Some(7));
+    let cmds = reduce(
+        &mut s,
+        Action::ClipboardCopy {
+            session: 7,
+            payload: "c;aGk=".into(),
+        },
+    );
+    assert!(matches!(
+        cmds.as_slice(),
+        [Command::SetClipboard(p)] if p == "c;aGk="
+    ));
+}
+
+#[test]
+fn clipboard_copy_from_background_session_is_dropped() {
+    let mut s = AppState::new();
+    s.term_size = TermSize::new(40, 200);
+    s.projects = mock_projects();
+    let _ = reduce(
+        &mut s,
+        Action::SessionSpawned {
+            session: FakeSession::new(7),
+            dest: (0, 0),
+        },
+    );
+    s.active_worktree = Some((0, 0));
+    // A different (unfocused) session must not clobber the clipboard.
+    let cmds = reduce(
+        &mut s,
+        Action::ClipboardCopy {
+            session: 99,
+            payload: "c;aGk=".into(),
+        },
+    );
+    assert!(cmds.is_empty());
+}
+
+#[test]
 fn session_exit_does_not_quit() {
     let mut s = AppState::new();
     let fake = FakeSession::new(1);
