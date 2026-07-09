@@ -399,7 +399,11 @@ impl ClipboardSniffer {
                         out.push(p);
                     }
                     self.buf.clear();
-                    self.scan = if b == 0x1b { OscScan::Esc } else { OscScan::Ground };
+                    self.scan = if b == 0x1b {
+                        OscScan::Esc
+                    } else {
+                        OscScan::Ground
+                    };
                 }
             }
         }
