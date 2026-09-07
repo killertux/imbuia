@@ -23,6 +23,7 @@ use crate::ipc::{
 use crate::{config, git, github, transport};
 use anyhow::{Context, Result};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -44,6 +45,22 @@ const OUTPUT_LOG_CAP: usize = 2 * 1024 * 1024;
 struct OutputLog {
     buf: VecDeque<u8>,
     truncated: bool,
+}
+
+struct IncomingUpload {
+    request_id: u64,
+    expected_size: u64,
+    received: u64,
+    part_path: PathBuf,
+    final_path: PathBuf,
+    file: tokio::fs::File,
+    hasher: Sha256,
+}
+
+impl Drop for IncomingUpload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.part_path);
+    }
 }
 use arc_swap::ArcSwapOption;
 use std::path::PathBuf;
@@ -159,6 +176,10 @@ async fn serve(listen: Option<String>) -> Result<()> {
     let sock = ipc::resolve_socket_path();
     init_logging(&sock);
     write_pidfile(&sock)?;
+
+    // A supervisor restart also kills every PTY, so no surviving composer can
+    // still reference files from the previous instance.
+    let _ = std::fs::remove_dir_all(upload_dir());
 
     // If a stale socket exists, unlink. We're the sole owner.
     let _ = std::fs::remove_file(&sock);
@@ -394,6 +415,11 @@ async fn command_loop<R>(
 where
     R: AsyncRead + Unpin,
 {
+    let mut upload: Option<IncomingUpload> = None;
+    // Upload frames are streamed without a start/ack round trip. If start is
+    // rejected, consume the remainder of that request without producing one
+    // error response per chunk.
+    let mut discarded_upload: Option<u64> = None;
     loop {
         let msg: ClientMsg = tokio::select! {
             biased;
@@ -450,6 +476,96 @@ where
                     // queue; this `send` is non-blocking unless that queue is
                     // full, in which case it paces this client's intake.
                     let _ = sess.write_tx.send(bytes);
+                }
+            }
+            ClientMsg::UploadStart {
+                request_id,
+                id,
+                file_name,
+                size,
+            } => {
+                let result = if upload.is_some() {
+                    Err("another clipboard upload is already active".into())
+                } else if size > ipc::MAX_UPLOAD_BYTES {
+                    Err(format!(
+                        "upload is too large ({size} bytes; maximum {})",
+                        ipc::MAX_UPLOAD_BYTES
+                    ))
+                } else if !shared.registry.lock().unwrap().sessions.contains_key(&id) {
+                    Err("target session no longer exists".into())
+                } else {
+                    match IncomingUpload::start(request_id, size, &file_name).await {
+                        Ok(incoming) => {
+                            upload = Some(incoming);
+                            Ok(())
+                        }
+                        Err(e) => Err(format!("{e:#}")),
+                    }
+                };
+                if let Err(error) = result {
+                    discarded_upload = Some(request_id);
+                    let _ = tx
+                        .send(SupervisorMsg::UploadResult {
+                            request_id,
+                            result: Err(error),
+                        })
+                        .await;
+                }
+            }
+            ClientMsg::UploadChunk {
+                request_id,
+                offset,
+                bytes,
+            } => {
+                if discarded_upload == Some(request_id) {
+                    continue;
+                }
+                let valid = upload.as_ref().is_some_and(|u| u.request_id == request_id);
+                if !valid {
+                    let _ = tx
+                        .send(SupervisorMsg::UploadResult {
+                            request_id,
+                            result: Err("upload chunk has no matching start".into()),
+                        })
+                        .await;
+                    continue;
+                }
+                let write_result = upload.as_mut().unwrap().write_chunk(offset, &bytes).await;
+                if let Err(error) = write_result {
+                    upload = None;
+                    let _ = tx
+                        .send(SupervisorMsg::UploadResult {
+                            request_id,
+                            result: Err(format!("{error:#}")),
+                        })
+                        .await;
+                }
+            }
+            ClientMsg::UploadFinish { request_id, sha256 } => {
+                if discarded_upload == Some(request_id) {
+                    discarded_upload = None;
+                    continue;
+                }
+                let result = match upload.take() {
+                    Some(incoming) if incoming.request_id == request_id => {
+                        incoming.finish(sha256).await.map_err(|e| format!("{e:#}"))
+                    }
+                    Some(other) => {
+                        upload = Some(other);
+                        Err("upload finish has no matching start".into())
+                    }
+                    None => Err("upload finish has no matching start".into()),
+                };
+                let _ = tx
+                    .send(SupervisorMsg::UploadResult { request_id, result })
+                    .await;
+            }
+            ClientMsg::UploadCancel { request_id } => {
+                if discarded_upload == Some(request_id) {
+                    discarded_upload = None;
+                }
+                if upload.as_ref().is_some_and(|u| u.request_id == request_id) {
+                    upload = None;
                 }
             }
             ClientMsg::Resize { id, rows, cols } => {
@@ -529,9 +645,133 @@ where
                 // supervisor.
                 let sock = ipc::resolve_socket_path();
                 let _ = std::fs::remove_file(&sock);
+                let _ = std::fs::remove_dir_all(upload_dir());
                 std::process::exit(0);
             }
         }
+    }
+}
+
+impl IncomingUpload {
+    async fn start(request_id: u64, expected_size: u64, supplied_name: &str) -> Result<Self> {
+        let root = upload_dir();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .context("create upload directory")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).await?;
+        }
+
+        let safe = sanitize_upload_name(supplied_name);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let final_path = root.join(format!("{request_id}-{nonce}-{safe}"));
+        let part_path = final_path.with_extension(format!(
+            "{}part",
+            final_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| format!("{e}."))
+                .unwrap_or_default()
+        ));
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part_path)
+            .await
+            .context("create upload file")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&part_path, std::fs::Permissions::from_mode(0o600)).await?;
+        }
+        Ok(Self {
+            request_id,
+            expected_size,
+            received: 0,
+            part_path,
+            final_path,
+            file,
+            hasher: Sha256::new(),
+        })
+    }
+
+    async fn write_chunk(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        if offset != self.received {
+            anyhow::bail!(
+                "non-contiguous upload offset {offset}, expected {}",
+                self.received
+            );
+        }
+        let next = self
+            .received
+            .checked_add(bytes.len() as u64)
+            .context("upload size overflow")?;
+        if next > self.expected_size || next > ipc::MAX_UPLOAD_BYTES {
+            anyhow::bail!("upload exceeded declared size");
+        }
+        self.file
+            .write_all(bytes)
+            .await
+            .context("write upload chunk")?;
+        self.hasher.update(bytes);
+        self.received = next;
+        Ok(())
+    }
+
+    async fn finish(mut self, expected_hash: [u8; 32]) -> Result<ipc::UploadedFile> {
+        use tokio::io::AsyncWriteExt;
+        if self.received != self.expected_size {
+            anyhow::bail!(
+                "upload ended at {} bytes, expected {}",
+                self.received,
+                self.expected_size
+            );
+        }
+        let actual: [u8; 32] = self.hasher.clone().finalize().into();
+        if actual != expected_hash {
+            anyhow::bail!("upload checksum mismatch");
+        }
+        self.file.flush().await.context("flush upload")?;
+        tokio::fs::rename(&self.part_path, &self.final_path)
+            .await
+            .context("finalize upload")?;
+        Ok(ipc::UploadedFile {
+            path: self.final_path.clone(),
+            size: self.received,
+        })
+    }
+}
+
+fn upload_dir() -> PathBuf {
+    ipc::resolve_socket_path().with_file_name("uploads")
+}
+
+fn sanitize_upload_name(name: &str) -> String {
+    let base = std::path::Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("clipboard-file");
+    let safe: String = base
+        .chars()
+        .take(96)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() || safe == "." || safe == ".." {
+        "clipboard-file".into()
+    } else {
+        safe
     }
 }
 
@@ -1424,5 +1664,15 @@ mod tests {
             expand_user(std::path::Path::new("/abs/x")),
             std::path::PathBuf::from("/abs/x")
         );
+    }
+
+    #[test]
+    fn upload_names_cannot_escape_private_directory() {
+        assert_eq!(sanitize_upload_name("../../shot.png"), "shot.png");
+        assert_eq!(
+            sanitize_upload_name("my screenshot.png"),
+            "my_screenshot.png"
+        );
+        assert_eq!(sanitize_upload_name(".."), "clipboard-file");
     }
 }

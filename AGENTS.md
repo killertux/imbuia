@@ -50,9 +50,10 @@ codebase. Humans should read `README.md` first.
 | `session.rs`      | `Session` trait + `FakeSession` for tests. The real impl is in `client.rs`. |
 | `client.rs`       | `Supervisors` registry (local + N remotes, each with `url`/`connected` state + `set_client`/`mark_disconnected`); one `SupervisorClient` per connection; `connect_all` (local sync + remotes seeded disconnected, dialed later in the background); `ProxySession` (client-side `Session` impl) with local↔global session-id remap; double-fork helpers, reader + writer tasks. |
 | `supervisor.rs`   | `imbuia --supervisor` entry: owns a tokio runtime; PTY spawn/own (portable-pty + vt100) on blocking threads; UDS accept loop (always) + optional TCP+TLS acceptor (`--listen`); per-client async `handle_conn`. |
-| `ipc.rs`          | Shared wire types (`ClientMsg`, `SupervisorMsg`, `Handshake*`, `OpRequest`/`OpOk` incl. `ListDir`/`DirListing`), framed read/write (`[u32 len][u8 codec][payload]`; codec 0=raw, 1=zstd — `write_frame_async(.., compress)` gates compression on size + remote-only, reader auto-detects; sync twins are test-only), socket path resolution. `PROTOCOL_VERSION = 2`. |
+| `ipc.rs`          | Shared wire types (`ClientMsg`, `SupervisorMsg`, `Handshake*`, ops and chunked uploads), framed read/write (`[u32 len][u8 codec][payload]`; codec 0=raw, 1=zstd — `write_frame_async(.., compress)` gates compression on size + remote-only, reader auto-detects; sync twins are test-only), socket path resolution. `PROTOCOL_VERSION = 3`. |
 | `transport.rs`    | Optional remote transport: Ed25519 identity load/gen, SPKI fingerprints, rustls (ring) client/server configs with pinned-key verifiers. Both sides TOFU: client pins the supervisor in `known_hosts`; supervisor pins the first client into `authorized_keys` when empty. |
 | `input.rs`        | crossterm `Event` → `Action`; `encode_key` with DECCKM handling + kitty/modifyOtherKeys passthrough; `KbdTracker` infers the inner app's keyboard protocol from its output. |
+| `clipboard.rs`    | Client-side desktop clipboard ingestion. Reads files/images/text off the runtime task; images become PNG and uploads are capped at 32 MiB. |
 | `layout.rs`       | `chrome()` → sidebar/tab_bar/terminal/action_bar rects.          |
 | `render.rs`       | ratatui rendering. Reads from vt100 `Screen` cell-by-cell.       |
 | `theme.rs`        | `ThemeKind` (Dark / Light) + hardcoded palettes ported from rowdy. |
@@ -223,8 +224,26 @@ crossterm Event ─► input::map ─► Action ─┐
 - Wheel routing (`client::ProxySession::write_mouse`):
   1. App enabled SGR mouse → forward encoded bytes (unless Shift bypass).
   2. Alt screen + no mouse + plain wheel → synthesise arrow keys (less/vim).
+     These pass through `input::encode_key`; apps such as Codex that request
+     kitty's report-all mode require kitty navigation keycodes instead of
+     legacy `CSI A`/`CSI B` bytes.
   3. Else (main screen, plain wheel, or **Shift+wheel from anywhere**) →
      `bump_scrollback` (local vt100 view).
+
+## Remote clipboard paste
+
+- Terminal-mode `Ctrl-V` stays native for local sessions. For remote sessions,
+  the client reads its desktop clipboard on a blocking helper thread.
+- Text uses the normal bracketed-paste path. A copied file or raw image is
+  uploaded to the owning supervisor in 64 KiB chunks with a declared size and
+  SHA-256 checksum. Only after `UploadResult` succeeds is its supervisor-local
+  path pasted into the PTY.
+- Uploads are capped at 32 MiB, written into a private `uploads` directory next
+  to the supervisor socket, and use a `.part` file plus atomic rename. Names
+  are reduced to safe basenames. The directory is cleared on supervisor
+  startup and clean shutdown.
+- The connection writer drains interactive control messages between upload
+  chunks so a large clipboard item does not block keystrokes or resizes.
 
 ## Async ops contract
 
@@ -266,9 +285,10 @@ handler (thread or worker — never inline on the command loop), and map the
 `OpResult` back to an existing `Action` in `spawn_reader`. Don't run git/`gh`
 in `runtime.rs` and don't add tokio tasks there.
 
-`Spawn`/`Spawned` and `Op`/`OpResult` are the only request/response pairs
-(correlated via `request_id` against `pending_spawns` / `pending_ops`); the
-rest of the `ClientMsg`s are fire-and-forget.
+`Spawn`/`Spawned`, `Op`/`OpResult`, and the
+`UploadStart`+`UploadChunk`+`UploadFinish`/`UploadResult` flow are the
+request/response pairs (correlated via `request_id` against the corresponding
+pending maps); the rest of the `ClientMsg`s are fire-and-forget.
 
 ## Persistence
 

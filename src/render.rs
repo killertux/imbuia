@@ -887,6 +887,7 @@ fn help_lines(theme: &Theme, state: &AppState) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
 
     lines.push(header("TERMINAL".into()));
+    lines.push(kr(A::PasteClipboard));
     lines.push(row(
         "Shift+wheel",
         "scroll local scrollback (bypasses TUI app)",

@@ -32,6 +32,29 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
         Action::Key(k) => handle_key(state, k, &mut cmds),
         Action::Mouse(m) => handle_mouse(state, m, &mut cmds),
         Action::Paste(text) => handle_paste(state, text, &mut cmds),
+        Action::ClipboardPrepared { session, content } => match content {
+            crate::clipboard::ClipboardContent::Text(text) => {
+                cmds.push(Command::WritePaste(session, text));
+            }
+            crate::clipboard::ClipboardContent::File { name, bytes } => {
+                cmds.push(Command::UploadFile {
+                    session,
+                    name,
+                    bytes,
+                });
+            }
+        },
+        Action::ClipboardUploadReady {
+            session,
+            remote_path,
+        } => {
+            if state.sessions.contains_key(&session) {
+                cmds.push(Command::WritePaste(
+                    session,
+                    remote_path.to_string_lossy().into_owned(),
+                ));
+            }
+        }
         Action::Resize(size) => {
             state.term_size = size;
             broadcast_resize(state, &mut cmds);
@@ -1036,6 +1059,25 @@ fn dispatch_action(state: &mut AppState, action: BindableAction, cmds: &mut Comm
         BindableAction::CommandPalette => open_palette(state),
         BindableAction::Quit => state.running = false,
         BindableAction::LeaveTerminal => state.mode = Mode::Normal,
+        BindableAction::PasteClipboard => {
+            let Some(id) = state.focused_session_id() else {
+                return;
+            };
+            let is_remote = state
+                .active_worktree
+                .and_then(|(pi, _)| state.projects.get(pi))
+                .is_some_and(|p| p.supervisor != crate::app::LOCAL);
+            if is_remote {
+                cmds.push(Command::ReadClipboard(id));
+            } else {
+                // Local child applications can read the same desktop clipboard,
+                // so preserve their native Ctrl-V handling exactly.
+                cmds.push(Command::WriteKey(
+                    id,
+                    KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+                ));
+            }
+        }
     }
 }
 

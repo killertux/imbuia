@@ -202,7 +202,9 @@ mod tests {
         for action in crate::keybinds::ALL {
             let excluded = matches!(
                 action,
-                BindableAction::LeaveTerminal | BindableAction::CommandPalette
+                BindableAction::LeaveTerminal
+                    | BindableAction::PasteClipboard
+                    | BindableAction::CommandPalette
             );
             let present = entries
                 .iter()

@@ -161,6 +161,75 @@ fn clipboard_copy_from_background_session_is_dropped() {
     assert!(cmds.is_empty());
 }
 
+fn state_with_terminal_session(supervisor: crate::app::SupervisorId) -> AppState {
+    let mut s = AppState::new();
+    s.projects = mock_projects();
+    s.projects[0].supervisor = supervisor;
+    let _ = reduce(
+        &mut s,
+        Action::SessionSpawned {
+            session: FakeSession::new(7),
+            dest: (0, 0),
+        },
+    );
+    s.active_worktree = Some((0, 0));
+    s.mode = Mode::Terminal;
+    s
+}
+
+#[test]
+fn ctrl_v_on_remote_session_requests_local_clipboard() {
+    let mut s = state_with_terminal_session(crate::app::SupervisorId(1));
+    let cmds = reduce(&mut s, Action::Key(ctrl('v')));
+    assert!(matches!(cmds.as_slice(), [Command::ReadClipboard(7)]));
+}
+
+#[test]
+fn ctrl_v_on_local_session_preserves_native_child_handling() {
+    let mut s = state_with_terminal_session(crate::app::LOCAL);
+    let cmds = reduce(&mut s, Action::Key(ctrl('v')));
+    assert!(matches!(
+        cmds.as_slice(),
+        [Command::WriteKey(7, key)] if *key == ctrl('v')
+    ));
+}
+
+#[test]
+fn prepared_clipboard_file_becomes_upload_command() {
+    let mut s = state_with_terminal_session(crate::app::SupervisorId(1));
+    let cmds = reduce(
+        &mut s,
+        Action::ClipboardPrepared {
+            session: 7,
+            content: crate::clipboard::ClipboardContent::File {
+                name: "shot.png".into(),
+                bytes: vec![1, 2, 3],
+            },
+        },
+    );
+    assert!(matches!(
+        cmds.as_slice(),
+        [Command::UploadFile { session: 7, name, bytes }]
+            if name == "shot.png" && bytes == &[1, 2, 3]
+    ));
+}
+
+#[test]
+fn completed_clipboard_upload_pastes_remote_path() {
+    let mut s = state_with_terminal_session(crate::app::SupervisorId(1));
+    let cmds = reduce(
+        &mut s,
+        Action::ClipboardUploadReady {
+            session: 7,
+            remote_path: PathBuf::from("/tmp/imbuia/7-shot.png"),
+        },
+    );
+    assert!(matches!(
+        cmds.as_slice(),
+        [Command::WritePaste(7, path)] if path == "/tmp/imbuia/7-shot.png"
+    ));
+}
+
 #[test]
 fn session_exit_does_not_quit() {
     let mut s = AppState::new();

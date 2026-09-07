@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 mod app;
 mod client;
+mod clipboard;
 mod commands;
 mod config;
 mod git;
