@@ -155,8 +155,18 @@ pub fn resolve_config_dir() -> PathBuf {
     dir
 }
 
-pub fn load_or_default(dir: &Path) -> (GlobalConfig, Vec<ProjectConfig>) {
-    let mut global = load_global(dir).unwrap_or_default();
+pub fn load_or_default(dir: &Path) -> Result<(GlobalConfig, Vec<ProjectConfig>)> {
+    let mut global = match load_global(dir) {
+        Ok(global) => global,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            GlobalConfig::default()
+        }
+        Err(error) => return Err(error),
+    };
     // First launch (or any state where keybinds is empty): seed the toml
     // with every default so the user can discover/customise them. Failure
     // to write is logged, not fatal — the in-memory map still has them.
@@ -177,7 +187,7 @@ pub fn load_or_default(dir: &Path) -> (GlobalConfig, Vec<ProjectConfig>) {
             Err(e) => tracing::warn!(slug = %slug, "skipping project: {e}"),
         }
     }
-    (global, projects)
+    Ok((global, projects))
 }
 
 /// Slugs are used as filenames; reject anything that could traverse or that
@@ -418,9 +428,38 @@ mod tests {
             gh_poll_interval_secs: None,
         };
         save_project(&dir, &proj).unwrap();
-        let (_, ps) = load_or_default(&dir);
+        let (_, ps) = load_or_default(&dir).unwrap();
         assert_eq!(ps.len(), 1);
         assert_eq!(ps[0].slug, "ok");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_or_default_creates_config_when_missing() {
+        let dir = std::env::temp_dir().join(format!("imbuia-cfg-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let (global, projects) = load_or_default(&dir).unwrap();
+
+        assert!(projects.is_empty());
+        assert!(!global.keybinds.is_empty());
+        assert!(!load_global(&dir).unwrap().keybinds.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_or_default_does_not_replace_invalid_config() {
+        let dir = std::env::temp_dir().join(format!("imbuia-cfg-invalid-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = global_path(&dir);
+        let invalid = "this is not valid toml = [";
+        fs::write(&path, invalid).unwrap();
+
+        let error = load_or_default(&dir).unwrap_err();
+
+        assert!(error.to_string().contains("parsing"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
         fs::remove_dir_all(&dir).unwrap();
     }
 
