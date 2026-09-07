@@ -88,6 +88,7 @@ cargo build --release
 | `:`                       | Enter Command mode.                                             |
 | `Ctrl-Q` / `:q`           | Quit.                                                           |
 | **Shift+wheel**           | Always scrolls terminal scrollback (bypasses TUI app).          |
+| **Ctrl+V**                | Paste normally; for remote sessions, upload a copied file/image and paste its remote path. |
 
 ### `<Space>` leader
 
@@ -266,6 +267,13 @@ restarting; if it drops mid-session, the same command brings it back.
 
 > Older configs with a single `[remote]` table still work — it's treated as a
 > remote named `remote`.
+
+In a remote terminal, **Ctrl-V** reads the client's desktop clipboard. Text is
+pasted normally; a single copied file or clipboard image is securely streamed
+to the remote supervisor and its remote path is pasted into the child app. Raw
+images become `clipboard.png`; uploads are limited to 32 MiB and live until the
+supervisor restarts. Local sessions retain the child application's native
+Ctrl-V behavior.
 
 ### 3. Open a project on a supervisor
 

@@ -65,19 +65,29 @@ fn kitty_mod_bits(m: KeyModifiers) -> u8 {
     v
 }
 
-/// Encode "functional" keys (Enter/Tab/Backspace/Esc) whose modifiers the
-/// legacy encoding can't represent, using whatever enhanced protocol the inner
+/// Encode functional/navigation keys whose modifiers the legacy encoding
+/// can't represent, using whatever enhanced protocol the inner
 /// app negotiated. Returns `None` to fall through to the legacy path — which
 /// happens for unmodified keys (unless the app asked for report-all) and for
 /// every non-functional key. Printable `Char`s deliberately stay legacy:
 /// kitty's base-layout keycodes can't be reconstructed from crossterm's
 /// already-shifted char, so re-encoding them would corrupt normal typing.
 fn encode_functional_enhanced(k: KeyEvent, kbd: KbdEncoding) -> Option<Vec<u8>> {
-    let keycode: u32 = match k.code {
-        KeyCode::Enter => 13,
-        KeyCode::Tab => 9,
-        KeyCode::Backspace => 127,
-        KeyCode::Esc => 27,
+    let (legacy_keycode, kitty_keycode): (u32, u32) = match k.code {
+        KeyCode::Enter => (13, 13),
+        KeyCode::Tab => (9, 9),
+        KeyCode::Backspace => (127, 127),
+        KeyCode::Esc => (27, 27),
+        KeyCode::Insert => (2, 57348),
+        KeyCode::Delete => (3, 57349),
+        KeyCode::Left => (0, 57350),
+        KeyCode::Right => (0, 57351),
+        KeyCode::Up => (0, 57352),
+        KeyCode::Down => (0, 57353),
+        KeyCode::PageUp => (5, 57354),
+        KeyCode::PageDown => (6, 57355),
+        KeyCode::Home => (0, 57356),
+        KeyCode::End => (0, 57357),
         _ => return None,
     };
     let bits = kitty_mod_bits(k.modifiers);
@@ -89,9 +99,12 @@ fn encode_functional_enhanced(k: KeyEvent, kbd: KbdEncoding) -> Option<Vec<u8>> 
     }
     let modparam = bits + 1;
     let s = match kbd {
-        KbdEncoding::Kitty(_) if bits == 0 => format!("\x1b[{keycode}u"),
-        KbdEncoding::Kitty(_) => format!("\x1b[{keycode};{modparam}u"),
-        KbdEncoding::ModifyOtherKeys => format!("\x1b[27;{modparam};{keycode}~"),
+        KbdEncoding::Kitty(_) if bits == 0 => format!("\x1b[{kitty_keycode}u"),
+        KbdEncoding::Kitty(_) => format!("\x1b[{kitty_keycode};{modparam}u"),
+        KbdEncoding::ModifyOtherKeys if legacy_keycode != 0 => {
+            format!("\x1b[27;{modparam};{legacy_keycode}~")
+        }
+        KbdEncoding::ModifyOtherKeys => return None,
         KbdEncoding::Legacy => return None,
     };
     Some(s.into_bytes())
@@ -99,9 +112,9 @@ fn encode_functional_enhanced(k: KeyEvent, kbd: KbdEncoding) -> Option<Vec<u8>> 
 
 /// Encode a key event for transmission to the PTY, honoring terminal modes.
 pub fn encode_key(k: KeyEvent, app_cursor: bool, kbd: KbdEncoding) -> Vec<u8> {
-    // Enhanced-keyboard passthrough for modified functional keys (Shift+Enter,
-    // Ctrl+Enter, …). Returns None (falls through to legacy) when no protocol
-    // is active, so we emit exactly the same legacy bytes as before.
+    // Enhanced-keyboard passthrough for functional/navigation keys. Returns
+    // None (falls through to legacy) when no protocol is active, so we emit
+    // exactly the same legacy bytes as before.
     if let Some(bytes) = encode_functional_enhanced(k, kbd) {
         return bytes;
     }
@@ -503,6 +516,26 @@ mod tests {
             KbdEncoding::Kitty(1),
         );
         assert_eq!(out, b"A");
+    }
+
+    #[test]
+    fn kitty_report_all_encodes_navigation_keys() {
+        assert_eq!(
+            encode_key(
+                ev(KeyCode::Up, KeyModifiers::NONE),
+                false,
+                KbdEncoding::Kitty(8)
+            ),
+            b"\x1b[57352u"
+        );
+        assert_eq!(
+            encode_key(
+                ev(KeyCode::PageDown, KeyModifiers::NONE),
+                false,
+                KbdEncoding::Kitty(8)
+            ),
+            b"\x1b[57355u"
+        );
     }
 
     #[test]

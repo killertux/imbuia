@@ -52,6 +52,7 @@ pub enum BindableAction {
 
     // Terminal-mode allow-list.
     LeaveTerminal,
+    PasteClipboard,
 }
 
 impl BindableAction {
@@ -82,6 +83,7 @@ impl BindableAction {
             Self::HelpPopup => "help_popup",
             Self::Quit => "quit",
             Self::LeaveTerminal => "leave_terminal",
+            Self::PasteClipboard => "paste_clipboard",
         }
     }
 
@@ -115,12 +117,13 @@ impl BindableAction {
             Self::HelpPopup => "help",
             Self::Quit => "quit imbuia",
             Self::LeaveTerminal => "leave Terminal mode",
+            Self::PasteClipboard => "paste local clipboard into the terminal",
         }
     }
 
     pub fn scope(self) -> Scope {
         match self {
-            Self::LeaveTerminal => Scope::Terminal,
+            Self::LeaveTerminal | Self::PasteClipboard => Scope::Terminal,
             _ => Scope::Normal,
         }
     }
@@ -151,6 +154,7 @@ pub const ALL: &[BindableAction] = &[
     BindableAction::HelpPopup,
     BindableAction::Quit,
     BindableAction::LeaveTerminal,
+    BindableAction::PasteClipboard,
 ];
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -296,6 +300,7 @@ pub fn defaults() -> KeyMap {
         parse_unchecked("<C-\\><C-n>"),
         BindableAction::LeaveTerminal,
     ));
+    terminal.push((parse_unchecked("<C-v>"), BindableAction::PasteClipboard));
 
     KeyMap { normal, terminal }
 }
@@ -345,7 +350,7 @@ pub fn defaults_as_config() -> BTreeMap<String, String> {
     out
 }
 
-fn is_reserved(b: &Binding, action: BindableAction) -> bool {
+fn is_reserved(b: &Binding, _action: BindableAction) -> bool {
     // <Esc> bare is always reserved.
     if b.0.len() == 1
         && b.0[0]
@@ -364,11 +369,6 @@ fn is_reserved(b: &Binding, action: BindableAction) -> bool {
                 code: KeyCode::Char('q'),
             })
     {
-        return true;
-    }
-    // Only `leave_terminal` may live in the Terminal scope. Refuse anything
-    // else that tries to land there.
-    if action.scope() == Scope::Terminal && action != BindableAction::LeaveTerminal {
         return true;
     }
     false

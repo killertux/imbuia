@@ -1,6 +1,6 @@
 [package]
 name = "imbuia"
-version = "0.16.1"
+version = "0.16.2"
 edition = "2024"
 authors = ["Clemente <clemente@brick.so>"]
 description = "Elm-architecture TUI that supervises persistent terminal sessions across project worktrees."
@@ -13,10 +13,12 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0.102"
+arboard = "3.6.1"
 arc-swap = "1.9.1"
 bincode = { version = "2", features = ["serde"] }
 bytes = "1.11.1"
 crossterm = "0.29.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 libc = "0.2.186"
 nix = { version = "0.31.3", features = ["process", "fs", "signal", "term"] }
 portable-pty = "0.9.0"

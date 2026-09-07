@@ -12,6 +12,7 @@ use crate::session::Session;
 use crate::{config, transport};
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::event::{KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -50,6 +51,9 @@ pub(crate) struct ProxySession {
     /// swallowed by the local vt100 re-render). Fed by the reader thread.
     clip: Arc<Mutex<input::ClipboardSniffer>>,
     tx: ClientTx,
+    upload_tx: UploadTx,
+    next_request: Arc<AtomicU64>,
+    pending_uploads: Arc<Mutex<HashMap<u64, PendingUpload>>>,
     notify: Arc<Notify>,
 }
 
@@ -67,6 +71,19 @@ impl std::fmt::Debug for ProxySession {
 /// `UnboundedSender::send` is synchronous and non-blocking, so reducer/runtime
 /// call sites stay unchanged even though the writer is now async.
 type ClientTx = mpsc::UnboundedSender<ClientMsg>;
+type UploadTx = mpsc::Sender<UploadJob>;
+
+struct UploadJob {
+    request_id: u64,
+    id: SessionId,
+    file_name: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Copy, Clone)]
+struct PendingUpload {
+    global_session_id: SessionId,
+}
 
 #[derive(Copy, Clone, Debug)]
 struct PendingSpawn {
@@ -282,6 +299,27 @@ impl Session for ProxySession {
         Ok(())
     }
 
+    fn upload_file(&self, name: String, bytes: Vec<u8>) -> io::Result<()> {
+        let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        self.pending_uploads.lock().unwrap().insert(
+            request_id,
+            PendingUpload {
+                global_session_id: self.global_id,
+            },
+        );
+        let job = UploadJob {
+            request_id,
+            id: self.local_id,
+            file_name: name,
+            bytes,
+        };
+        if let Err(e) = self.upload_tx.try_send(job) {
+            self.pending_uploads.lock().unwrap().remove(&request_id);
+            return Err(io::Error::other(format!("upload queue busy: {e}")));
+        }
+        Ok(())
+    }
+
     fn write_mouse(&self, ev: MouseEvent) -> io::Result<()> {
         let (mode, enc, app_cursor, alt_screen) = {
             let p = self.parser.lock().expect("parser poisoned");
@@ -309,7 +347,8 @@ impl Session for ProxySession {
             }
         }
         if !shift_bypass && alt_screen && is_scroll {
-            let arrow_bytes = scroll_as_arrows(ev.kind, app_cursor, 3);
+            let kbd = self.kbd.lock().expect("kbd tracker poisoned").encoding();
+            let arrow_bytes = scroll_as_arrows(ev.kind, app_cursor, kbd, 3);
             if !arrow_bytes.is_empty() {
                 return self.send(ClientMsg::WriteBytes {
                     id: self.local_id,
@@ -361,6 +400,7 @@ pub struct SupervisorClient {
     /// reducer/usage popup can attribute output to the right host).
     sup_id: crate::app::SupervisorId,
     tx: ClientTx,
+    upload_tx: UploadTx,
     /// Keyed by per-supervisor wire id (what frames carry).
     sessions: Arc<Mutex<HashMap<SessionId, Arc<ProxySession>>>>,
     /// Mints client-global session ids, shared across all supervisor
@@ -370,8 +410,9 @@ pub struct SupervisorClient {
     /// In-flight `Op` continuations, keyed by `request_id` (shares the
     /// `next_request` counter with `pending_spawns`).
     pending_ops: Arc<Mutex<HashMap<u64, PendingOp>>>,
+    pending_uploads: Arc<Mutex<HashMap<u64, PendingUpload>>>,
     notify: Arc<Notify>,
-    next_request: AtomicU64,
+    next_request: Arc<AtomicU64>,
     /// Resumed sessions reported by the supervisor at handshake. Empty after
     /// `drain_initial_sessions` is called.
     initial_sessions: Mutex<Vec<SessionMeta>>,
@@ -396,6 +437,9 @@ impl SupervisorClient {
             kbd: Arc::new(Mutex::new(input::KbdTracker::default())),
             clip: Arc::new(Mutex::new(input::ClipboardSniffer::default())),
             tx: self.tx.clone(),
+            upload_tx: self.upload_tx.clone(),
+            next_request: Arc::clone(&self.next_request),
+            pending_uploads: Arc::clone(&self.pending_uploads),
             notify: Arc::clone(&self.notify),
         });
         self.sessions
@@ -806,24 +850,75 @@ async fn handshake(
     // only ever does `tx.send(msg)` (O(1), non-blocking), so paste floods and a
     // back-pressured supervisor can't freeze the TUI.
     let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+    let (upload_tx, mut upload_rx) = mpsc::channel::<UploadJob>(2);
     tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if let Err(e) = ipc::write_frame_async(&mut wr, &msg, compress).await {
-                tracing::warn!("supervisor write loop exiting: {e}");
-                break;
+        'writer: loop {
+            tokio::select! {
+                biased;
+                Some(msg) = rx.recv() => {
+                    if let Err(e) = ipc::write_frame_async(&mut wr, &msg, compress).await {
+                        tracing::warn!("supervisor write loop exiting: {e}");
+                        break;
+                    }
+                }
+                Some(job) = upload_rx.recv() => {
+                    let size = job.bytes.len() as u64;
+                    let start = ClientMsg::UploadStart {
+                        request_id: job.request_id,
+                        id: job.id,
+                        file_name: job.file_name,
+                        size,
+                    };
+                    if ipc::write_frame_async(&mut wr, &start, compress).await.is_err() {
+                        break;
+                    }
+                    let mut hasher = Sha256::new();
+                    const CHUNK: usize = 64 * 1024;
+                    for (index, chunk) in job.bytes.chunks(CHUNK).enumerate() {
+                        // Preserve terminal latency: drain control traffic
+                        // between file chunks rather than queueing a whole file
+                        // in front of keystrokes and resizes.
+                        while let Ok(msg) = rx.try_recv() {
+                            if ipc::write_frame_async(&mut wr, &msg, compress).await.is_err() {
+                                break 'writer;
+                            }
+                        }
+                        hasher.update(chunk);
+                        let msg = ClientMsg::UploadChunk {
+                            request_id: job.request_id,
+                            offset: (index * CHUNK) as u64,
+                            bytes: chunk.to_vec(),
+                        };
+                        if ipc::write_frame_async(&mut wr, &msg, compress).await.is_err() {
+                            break 'writer;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    let msg = ClientMsg::UploadFinish {
+                        request_id: job.request_id,
+                        sha256: hasher.finalize().into(),
+                    };
+                    if ipc::write_frame_async(&mut wr, &msg, compress).await.is_err() {
+                        break;
+                    }
+                }
+                else => break,
             }
         }
     });
 
+    let next_request = Arc::new(AtomicU64::new(1));
     let client = Arc::new(SupervisorClient {
         sup_id,
         tx,
+        upload_tx,
         sessions: Arc::new(Mutex::new(HashMap::new())),
         global_ids,
         pending_spawns: Arc::new(Mutex::new(HashMap::new())),
         pending_ops: Arc::new(Mutex::new(HashMap::new())),
+        pending_uploads: Arc::new(Mutex::new(HashMap::new())),
         notify,
-        next_request: AtomicU64::new(1),
+        next_request,
         initial_sessions: Mutex::new(sessions),
     });
 
@@ -865,6 +960,9 @@ fn spawn_reader(client: Arc<SupervisorClient>, mut rd: BoxRead, action_tx: mpsc:
                             kbd: Arc::new(Mutex::new(input::KbdTracker::default())),
                             clip: Arc::new(Mutex::new(input::ClipboardSniffer::default())),
                             tx: client.tx.clone(),
+                            upload_tx: client.upload_tx.clone(),
+                            next_request: Arc::clone(&client.next_request),
+                            pending_uploads: Arc::clone(&client.pending_uploads),
                             notify: Arc::clone(&client.notify),
                         });
                         client
@@ -953,6 +1051,21 @@ fn spawn_reader(client: Arc<SupervisorClient>, mut rd: BoxRead, action_tx: mpsc:
                     if let Some(action) = op_result_to_action(pending, result) {
                         let _ = action_tx.send(action).await;
                     }
+                }
+                SupervisorMsg::UploadResult { request_id, result } => {
+                    let pending = client.pending_uploads.lock().unwrap().remove(&request_id);
+                    let Some(pending) = pending else {
+                        tracing::warn!(request_id, "UploadResult for unknown request; ignoring");
+                        continue;
+                    };
+                    let action = match result {
+                        Ok(file) => Action::ClipboardUploadReady {
+                            session: pending.global_session_id,
+                            remote_path: file.path,
+                        },
+                        Err(error) => Action::OperationFailed(format!("clipboard upload: {error}")),
+                    };
+                    let _ = action_tx.send(action).await;
                 }
             }
         }
@@ -1044,14 +1157,18 @@ async fn wait_for_socket(path: &Path, timeout: Duration) -> Result<UnixStream> {
 // --- mouse / scroll encoding (copied from session.rs; sole owner now that
 //      `PtySession` is gone) -----------------------------------------------
 
-fn scroll_as_arrows(kind: MouseEventKind, app_cursor: bool, lines: usize) -> Vec<u8> {
-    let seq: &[u8] = match (kind, app_cursor) {
-        (MouseEventKind::ScrollUp, false) => b"\x1b[A",
-        (MouseEventKind::ScrollDown, false) => b"\x1b[B",
-        (MouseEventKind::ScrollUp, true) => b"\x1bOA",
-        (MouseEventKind::ScrollDown, true) => b"\x1bOB",
+fn scroll_as_arrows(
+    kind: MouseEventKind,
+    app_cursor: bool,
+    kbd: input::KbdEncoding,
+    lines: usize,
+) -> Vec<u8> {
+    let code = match kind {
+        MouseEventKind::ScrollUp => crossterm::event::KeyCode::Up,
+        MouseEventKind::ScrollDown => crossterm::event::KeyCode::Down,
         _ => return Vec::new(),
     };
+    let seq = input::encode_key(KeyEvent::new(code, KeyModifiers::NONE), app_cursor, kbd);
     seq.repeat(lines)
 }
 
@@ -1120,5 +1237,32 @@ fn encode_mouse(ev: MouseEvent, mode: MouseProtocolMode, enc: MouseProtocolEncod
             let cy_byte = (row + 32).min(255) as u8;
             vec![0x1b, b'[', b'M', cb_byte, cx_byte, cy_byte]
         }
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    #[test]
+    fn wheel_uses_kitty_navigation_codes_when_report_all_is_active() {
+        assert_eq!(
+            scroll_as_arrows(
+                MouseEventKind::ScrollUp,
+                false,
+                input::KbdEncoding::Kitty(8),
+                3,
+            ),
+            b"\x1b[57352u\x1b[57352u\x1b[57352u"
+        );
+        assert_eq!(
+            scroll_as_arrows(
+                MouseEventKind::ScrollDown,
+                false,
+                input::KbdEncoding::Legacy,
+                2,
+            ),
+            b"\x1b[B\x1b[B"
+        );
     }
 }

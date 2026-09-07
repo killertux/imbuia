@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-/// Bumped to 2 when the frame layout gained the 1-byte codec tag (see
-/// `write_frame_async`). The handshake refuses version mismatches.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Version 3 adds chunked clipboard-file uploads. The handshake refuses
+/// version mismatches.
+pub const PROTOCOL_VERSION: u32 = 3;
 const MAX_FRAME: u32 = 8 * 1024 * 1024;
+pub const MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Per-frame codec tag (the byte after the length prefix).
 const CODEC_RAW: u8 = 0;
@@ -72,6 +73,24 @@ pub enum ClientMsg {
     WriteBytes {
         id: SessionId,
         bytes: Vec<u8>,
+    },
+    UploadStart {
+        request_id: u64,
+        id: SessionId,
+        file_name: String,
+        size: u64,
+    },
+    UploadChunk {
+        request_id: u64,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    UploadFinish {
+        request_id: u64,
+        sha256: [u8; 32],
+    },
+    UploadCancel {
+        request_id: u64,
     },
     Resize {
         id: SessionId,
@@ -183,6 +202,14 @@ pub enum OpOk {
 pub type OpResult = std::result::Result<OpOk, String>;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct UploadedFile {
+    pub path: PathBuf,
+    pub size: u64,
+}
+
+pub type UploadResult = std::result::Result<UploadedFile, String>;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SupervisorMsg {
     Spawned {
         request_id: u64,
@@ -219,6 +246,10 @@ pub enum SupervisorMsg {
     OpResult {
         request_id: u64,
         result: OpResult,
+    },
+    UploadResult {
+        request_id: u64,
+        result: UploadResult,
     },
 }
 
@@ -491,6 +522,22 @@ mod tests {
                 id: 42,
                 bytes: b"hello".to_vec(),
             },
+            ClientMsg::UploadStart {
+                request_id: 8,
+                id: 42,
+                file_name: "shot.png".into(),
+                size: 3,
+            },
+            ClientMsg::UploadChunk {
+                request_id: 8,
+                offset: 0,
+                bytes: vec![1, 2, 3],
+            },
+            ClientMsg::UploadFinish {
+                request_id: 8,
+                sha256: [7; 32],
+            },
+            ClientMsg::UploadCancel { request_id: 8 },
             ClientMsg::Resize {
                 id: 1,
                 rows: 30,
@@ -570,6 +617,13 @@ mod tests {
                 bytes: vec![],
             },
             SupervisorMsg::Exited { id: 5 },
+            SupervisorMsg::UploadResult {
+                request_id: 8,
+                result: Ok(UploadedFile {
+                    path: PathBuf::from("/tmp/shot.png"),
+                    size: 3,
+                }),
+            },
             SupervisorMsg::Detached {
                 reason: "stolen".into(),
             },

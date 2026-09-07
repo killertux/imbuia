@@ -21,6 +21,9 @@ pub trait Session: Send + Sync + std::fmt::Debug {
     /// in bracketed-paste escapes only when the inner app enabled bracketed
     /// paste (DECSET 2004).
     fn write_paste(&self, text: &str) -> io::Result<()>;
+    /// Upload bytes to the owning supervisor. On success its reader posts an
+    /// action that pastes the resulting supervisor-local path into this tab.
+    fn upload_file(&self, name: String, bytes: Vec<u8>) -> io::Result<()>;
     fn resize(&self, rows: u16, cols: u16) -> Result<()>;
     /// Ask the owning supervisor to terminate this session. Routing is implicit
     /// — each session holds its own connection's sender — so the caller doesn't
@@ -39,6 +42,7 @@ pub struct FakeSession {
     pub writes: Mutex<Vec<crossterm::event::KeyEvent>>,
     pub mice: Mutex<Vec<crossterm::event::MouseEvent>>,
     pub pastes: Mutex<Vec<String>>,
+    pub uploads: Mutex<Vec<(String, Vec<u8>)>>,
     pub resizes: Mutex<Vec<(u16, u16)>>,
 }
 
@@ -51,6 +55,7 @@ impl FakeSession {
             writes: Mutex::new(Vec::new()),
             mice: Mutex::new(Vec::new()),
             pastes: Mutex::new(Vec::new()),
+            uploads: Mutex::new(Vec::new()),
             resizes: Mutex::new(Vec::new()),
         })
     }
@@ -78,6 +83,10 @@ impl Session for FakeSession {
     }
     fn write_paste(&self, text: &str) -> io::Result<()> {
         self.pastes.lock().unwrap().push(text.to_string());
+        Ok(())
+    }
+    fn upload_file(&self, name: String, bytes: Vec<u8>) -> io::Result<()> {
+        self.uploads.lock().unwrap().push((name, bytes));
         Ok(())
     }
     fn resize(&self, rows: u16, cols: u16) -> Result<()> {

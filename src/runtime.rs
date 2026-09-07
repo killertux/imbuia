@@ -387,6 +387,33 @@ fn execute(
                 tracing::warn!(session = id, "write_paste failed: {e}");
             }
         }
+        Command::ReadClipboard(id) => {
+            let tx = action_tx.clone();
+            std::thread::spawn(move || match crate::clipboard::read() {
+                Ok(content) => {
+                    let _ = tx.blocking_send(Action::ClipboardPrepared {
+                        session: id,
+                        content,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx
+                        .blocking_send(Action::OperationFailed(format!("clipboard paste: {e:#}")));
+                }
+            });
+        }
+        Command::UploadFile {
+            session,
+            name,
+            bytes,
+        } => {
+            if let Some(sess) = state.sessions.get(&session)
+                && let Err(e) = sess.upload_file(name, bytes)
+            {
+                let _ =
+                    action_tx.try_send(Action::OperationFailed(format!("clipboard upload: {e}")));
+            }
+        }
         Command::WriteMouse(id, ev) => {
             if let Some(sess) = state.sessions.get(&id)
                 && let Err(e) = sess.write_mouse(ev)

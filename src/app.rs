@@ -603,6 +603,17 @@ pub enum Action {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Paste(String),
+    /// Result of reading the workstation clipboard off the main task.
+    ClipboardPrepared {
+        session: SessionId,
+        content: crate::clipboard::ClipboardContent,
+    },
+    /// Supervisor persisted an upload; paste this supervisor-local path into
+    /// the session that initiated it.
+    ClipboardUploadReady {
+        session: SessionId,
+        remote_path: PathBuf,
+    },
     Resize(TermSize),
     SessionExited(SessionId),
     /// Client reader → reducer: a session emitted an OSC 52 clipboard-*copy*.
@@ -709,6 +720,19 @@ impl std::fmt::Debug for Action {
             Action::Key(k) => f.debug_tuple("Key").field(k).finish(),
             Action::Mouse(m) => f.debug_tuple("Mouse").field(m).finish(),
             Action::Paste(s) => f.debug_tuple("Paste").field(&s.len()).finish(),
+            Action::ClipboardPrepared { session, content } => f
+                .debug_struct("ClipboardPrepared")
+                .field("session", session)
+                .field("content", content)
+                .finish(),
+            Action::ClipboardUploadReady {
+                session,
+                remote_path,
+            } => f
+                .debug_struct("ClipboardUploadReady")
+                .field("session", session)
+                .field("remote_path", remote_path)
+                .finish(),
             Action::Resize(sz) => f.debug_tuple("Resize").field(sz).finish(),
             Action::SessionExited(id) => f.debug_tuple("SessionExited").field(id).finish(),
             Action::ClipboardCopy { session, payload } => f
@@ -800,6 +824,14 @@ pub enum Command {
     /// in bracketed-paste escapes (`\x1b[200~ … \x1b[201~`) only when the inner
     /// app enabled bracketed paste.
     WritePaste(SessionId, String),
+    /// Read the local workstation clipboard on a blocking helper thread.
+    ReadClipboard(SessionId),
+    /// Transfer one prepared local file to the session's supervisor.
+    UploadFile {
+        session: SessionId,
+        name: String,
+        bytes: Vec<u8>,
+    },
     ResizePty(SessionId, u16, u16),
     /// Write an OSC 52 clipboard-set straight to the real (outer) terminal,
     /// bypassing ratatui's cell diff. The outer emulator performs the
