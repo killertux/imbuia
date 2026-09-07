@@ -24,7 +24,7 @@ pub async fn run() -> Result<()> {
     let term_size = TermSize::new(area.height, area.width);
 
     let config_dir = config::resolve_config_dir();
-    let (global, project_cfgs) = config::load_or_default(&config_dir);
+    let (global, project_cfgs) = config::load_or_default(&config_dir)?;
 
     let notify = Arc::new(Notify::new());
     let (action_tx, mut action_rx) = mpsc::channel::<Action>(256);
