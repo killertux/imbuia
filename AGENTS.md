@@ -225,8 +225,8 @@ crossterm Event ─► input::map ─► Action ─┐
   1. App enabled SGR mouse → forward encoded bytes (unless Shift bypass).
   2. Alt screen + no mouse + plain wheel → synthesise arrow keys (less/vim).
      These pass through `input::encode_key`; apps such as Codex that request
-     kitty's report-all mode require kitty navigation keycodes instead of
-     legacy `CSI A`/`CSI B` bytes.
+     kitty's report-all mode still require `CSI A`/`CSI B` arrow sequences,
+     not private-use key numbers encoded as CSI-u.
   3. Else (main screen, plain wheel, or **Shift+wheel from anywhere**) →
      `bump_scrollback` (local vt100 view).
 
