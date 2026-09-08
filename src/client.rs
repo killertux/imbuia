@@ -1245,7 +1245,64 @@ mod scroll_tests {
     use super::*;
 
     #[test]
-    fn wheel_uses_kitty_navigation_codes_when_report_all_is_active() {
+    fn wheel_routing_uses_negotiated_modes_and_supervisor_local_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (upload_tx, _) = mpsc::channel(1);
+        let session = ProxySession {
+            global_id: 42,
+            local_id: 7,
+            parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 100))),
+            kbd: Arc::new(Mutex::new(input::KbdTracker::default())),
+            clip: Arc::new(Mutex::new(input::ClipboardSniffer::default())),
+            tx,
+            upload_tx,
+            next_request: Arc::new(AtomicU64::new(1)),
+            pending_uploads: Arc::new(Mutex::new(HashMap::new())),
+            notify: Arc::new(Notify::new()),
+        };
+        // Exercise the same mode prelude received on attach or in live output.
+        let prelude = b"\x1b[?1049h\x1b[?1h\x1b[>8u";
+        session.parser.lock().unwrap().process(prelude);
+        session.kbd.lock().unwrap().feed(prelude);
+        let mut wheel = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 4,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        for (kind, expected) in [
+            (MouseEventKind::ScrollUp, b"\x1b[A\x1b[A\x1b[A".as_slice()),
+            (MouseEventKind::ScrollDown, b"\x1b[B\x1b[B\x1b[B".as_slice()),
+        ] {
+            wheel.kind = kind;
+            session.write_mouse(wheel).unwrap();
+            match rx.try_recv().unwrap() {
+                ClientMsg::WriteBytes { id, bytes } => {
+                    assert_eq!(id, 7);
+                    assert_eq!(bytes, expected);
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+        // An app that requests mouse reporting gets the wheel, not arrows.
+        session
+            .parser
+            .lock()
+            .unwrap()
+            .process(b"\x1b[?1000h\x1b[?1006h");
+        session.write_mouse(wheel).unwrap();
+        match rx.try_recv().unwrap() {
+            ClientMsg::WriteBytes { bytes, .. } => assert_eq!(bytes, b"\x1b[<65;5;3M"),
+            other => panic!("unexpected message: {other:?}"),
+        }
+        // Shift bypass must never send input to the app.
+        wheel.modifiers = KeyModifiers::SHIFT;
+        session.write_mouse(wheel).unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn wheel_uses_csi_arrows_when_report_all_is_active() {
         assert_eq!(
             scroll_as_arrows(
                 MouseEventKind::ScrollUp,
@@ -1253,7 +1310,7 @@ mod scroll_tests {
                 input::KbdEncoding::Kitty(8),
                 3,
             ),
-            b"\x1b[57352u\x1b[57352u\x1b[57352u"
+            b"\x1b[A\x1b[A\x1b[A"
         );
         assert_eq!(
             scroll_as_arrows(

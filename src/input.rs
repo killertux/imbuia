@@ -73,21 +73,23 @@ fn kitty_mod_bits(m: KeyModifiers) -> u8 {
 /// kitty's base-layout keycodes can't be reconstructed from crossterm's
 /// already-shifted char, so re-encoding them would corrupt normal typing.
 fn encode_functional_enhanced(k: KeyEvent, kbd: KbdEncoding) -> Option<Vec<u8>> {
-    let (legacy_keycode, kitty_keycode): (u32, u32) = match k.code {
-        KeyCode::Enter => (13, 13),
-        KeyCode::Tab => (9, 9),
-        KeyCode::Backspace => (127, 127),
-        KeyCode::Esc => (27, 27),
-        KeyCode::Insert => (2, 57348),
-        KeyCode::Delete => (3, 57349),
-        KeyCode::Left => (0, 57350),
-        KeyCode::Right => (0, 57351),
-        KeyCode::Up => (0, 57352),
-        KeyCode::Down => (0, 57353),
-        KeyCode::PageUp => (5, 57354),
-        KeyCode::PageDown => (6, 57355),
-        KeyCode::Home => (0, 57356),
-        KeyCode::End => (0, 57357),
+    // Kitty preserves the CSI letter/tilde encodings for navigation keys.
+    // Its internal private-use key numbers are not CSI-u wire encodings.
+    let (keycode, suffix): (u32, char) = match k.code {
+        KeyCode::Enter => (13, 'u'),
+        KeyCode::Tab => (9, 'u'),
+        KeyCode::Backspace => (127, 'u'),
+        KeyCode::Esc => (27, 'u'),
+        KeyCode::Insert => (2, '~'),
+        KeyCode::Delete => (3, '~'),
+        KeyCode::Left => (1, 'D'),
+        KeyCode::Right => (1, 'C'),
+        KeyCode::Up => (1, 'A'),
+        KeyCode::Down => (1, 'B'),
+        KeyCode::PageUp => (5, '~'),
+        KeyCode::PageDown => (6, '~'),
+        KeyCode::Home => (1, 'H'),
+        KeyCode::End => (1, 'F'),
         _ => return None,
     };
     let bits = kitty_mod_bits(k.modifiers);
@@ -99,10 +101,13 @@ fn encode_functional_enhanced(k: KeyEvent, kbd: KbdEncoding) -> Option<Vec<u8>> 
     }
     let modparam = bits + 1;
     let s = match kbd {
-        KbdEncoding::Kitty(_) if bits == 0 => format!("\x1b[{kitty_keycode}u"),
-        KbdEncoding::Kitty(_) => format!("\x1b[{kitty_keycode};{modparam}u"),
-        KbdEncoding::ModifyOtherKeys if legacy_keycode != 0 => {
-            format!("\x1b[27;{modparam};{legacy_keycode}~")
+        KbdEncoding::Kitty(_) if bits == 0 && suffix.is_ascii_alphabetic() && suffix != 'u' => {
+            format!("\x1b[{suffix}")
+        }
+        KbdEncoding::Kitty(_) if bits == 0 => format!("\x1b[{keycode}{suffix}"),
+        KbdEncoding::Kitty(_) => format!("\x1b[{keycode};{modparam}{suffix}"),
+        KbdEncoding::ModifyOtherKeys if matches!(suffix, 'u' | '~') => {
+            format!("\x1b[27;{modparam};{keycode}~")
         }
         KbdEncoding::ModifyOtherKeys => return None,
         KbdEncoding::Legacy => return None,
@@ -526,7 +531,7 @@ mod tests {
                 false,
                 KbdEncoding::Kitty(8)
             ),
-            b"\x1b[57352u"
+            b"\x1b[A"
         );
         assert_eq!(
             encode_key(
@@ -534,8 +539,45 @@ mod tests {
                 false,
                 KbdEncoding::Kitty(8)
             ),
-            b"\x1b[57355u"
+            b"\x1b[6~"
         );
+    }
+
+    #[test]
+    fn kitty_navigation_preserves_csi_suffixes_and_modifiers() {
+        for (code, plain, modified) in [
+            (KeyCode::Up, "\x1b[A", "\x1b[1;5A"),
+            (KeyCode::Down, "\x1b[B", "\x1b[1;5B"),
+            (KeyCode::Left, "\x1b[D", "\x1b[1;5D"),
+            (KeyCode::Right, "\x1b[C", "\x1b[1;5C"),
+            (KeyCode::Home, "\x1b[H", "\x1b[1;5H"),
+            (KeyCode::End, "\x1b[F", "\x1b[1;5F"),
+            (KeyCode::Insert, "\x1b[2~", "\x1b[2;5~"),
+            (KeyCode::Delete, "\x1b[3~", "\x1b[3;5~"),
+            (KeyCode::PageUp, "\x1b[5~", "\x1b[5;5~"),
+            (KeyCode::PageDown, "\x1b[6~", "\x1b[6;5~"),
+        ] {
+            for app_cursor in [false, true] {
+                assert_eq!(
+                    encode_key(
+                        ev(code, KeyModifiers::NONE),
+                        app_cursor,
+                        KbdEncoding::Kitty(8)
+                    ),
+                    plain.as_bytes(),
+                );
+                for flags in [1, 8] {
+                    assert_eq!(
+                        encode_key(
+                            ev(code, KeyModifiers::CONTROL),
+                            app_cursor,
+                            KbdEncoding::Kitty(flags)
+                        ),
+                        modified.as_bytes(),
+                    );
+                }
+            }
+        }
     }
 
     #[test]
