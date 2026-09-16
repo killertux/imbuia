@@ -1,5 +1,7 @@
 use super::*;
-use crate::app::{Project, Worktree, mock_projects};
+use crate::app::{
+    LOCAL, PrStatus, Project, SupervisorDirectory, SupervisorId, Worktree, mock_projects,
+};
 use crate::layout::{MIN_SIDEBAR_WIDTH, TermSize};
 use crate::session::FakeSession;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -624,13 +626,14 @@ fn h_and_l_switch_ui_focus() {
 #[test]
 fn j_walks_visible_rows() {
     let mut s = mk_state_with_mock_projects();
-    // imbuia (header) → imbuia/main → imbuia/feat-x → brick (header) → ...
+    // Display order is brick, imbuia, scratch. Starting on imbuia:
+    // imbuia header → imbuia/main → imbuia/feat-x → scratch header.
     let _ = reduce(&mut s, Action::Key(plain('j')));
     assert_eq!(s.sidebar_selection, Some((0, Some(0))));
     let _ = reduce(&mut s, Action::Key(plain('j')));
     assert_eq!(s.sidebar_selection, Some((0, Some(1))));
     let _ = reduce(&mut s, Action::Key(plain('j')));
-    assert_eq!(s.sidebar_selection, Some((1, None)));
+    assert_eq!(s.sidebar_selection, Some((2, None)));
 }
 
 #[test]
@@ -649,7 +652,7 @@ fn k_clamps_at_first_row() {
     for _ in 0..5 {
         let _ = reduce(&mut s, Action::Key(plain('k')));
     }
-    assert_eq!(s.sidebar_selection, Some((0, None)));
+    assert_eq!(s.sidebar_selection, Some((1, None)));
 }
 
 #[test]
@@ -1020,17 +1023,14 @@ fn left_down(col: u16, row: u16) -> MouseEvent {
 fn click_on_sidebar_worktree_activates_it() {
     let mut s = mk_state_with_mock_projects();
     s.term_size = TermSize::new(40, 100);
-    // Visible rows (sidebar inner starts at row 1):
-    //   row 1: imbuia header
-    //   row 2: imbuia/main
-    //   row 3: imbuia/feat-x
-    //   row 4: brick header
-    //   row 5: brick/main
+    // Visible rows are sorted by project name; sidebar inner starts at row 1:
+    //   row 1: brick header
+    //   row 2: brick/main
     let cmds = reduce(&mut s, Action::Mouse(left_down(2, 2)));
-    assert_eq!(s.active_worktree, Some((0, 0)));
+    assert_eq!(s.active_worktree, Some((1, 0)));
     assert_eq!(s.ui_focus, UiFocus::Sidebar);
     assert!(cmds.is_empty());
-    assert!(s.projects[0].worktrees[0].sessions.is_empty());
+    assert!(s.projects[1].worktrees[0].sessions.is_empty());
 }
 
 #[test]
@@ -1711,6 +1711,10 @@ fn worktree_remove_command_emits_remove_when_non_main() {
     // mock_projects has imbuia with [main, feat-x]; give feat-x a path
     // that differs from repo_path so it doesn't trip the main-guard.
     s.projects[0].worktrees[1].path = PathBuf::from("/tmp/feat-x");
+    let session = FakeSession::new(77);
+    s.projects[0].worktrees[1].sessions.push(77);
+    s.projects[0].worktrees[1].active_tab = Some(0);
+    s.sessions.insert(77, session);
     s.sidebar_selection = Some((0, Some(1)));
     let cmds = submit_command(&mut s, "worktree-remove");
     // First step: a confirmation is staged, nothing is dispatched yet.
@@ -1728,6 +1732,10 @@ fn worktree_remove_command_emits_remove_when_non_main() {
     let cmds = reduce(&mut s, Action::Key(plain('y')));
     assert!(s.pending_confirm.is_none());
     assert!(s.pending_op.is_some());
+    // The supervisor owns graceful shutdown + escalation as part of the op;
+    // don't race it with fire-and-forget KillSession commands.
+    assert!(s.sessions.contains_key(&77));
+    assert_eq!(s.projects[0].worktrees[1].sessions, vec![77]);
     assert!(matches!(
         cmds.as_slice(),
         [Command::RemoveWorktree {
@@ -1767,9 +1775,140 @@ fn worktree_remove_refuses_main_worktree() {
 }
 
 #[test]
+fn project_remove_command_flags_main_implies_worktrees() {
+    let mut s = AppState::new();
+    s.projects = mock_projects();
+    s.sidebar_selection = Some((0, None));
+    let cmds = submit_command(&mut s, "project-remove --main");
+    assert!(matches!(
+        cmds.as_slice(),
+        [Command::RemoveProject {
+            project_idx: 0,
+            delete_worktrees: true,
+            delete_main: true,
+            ..
+        }]
+    ));
+    assert!(s.pending_op.is_some());
+}
+
+#[test]
+fn project_remove_command_without_flags_keeps_files() {
+    let mut s = AppState::new();
+    s.projects = mock_projects();
+    s.sidebar_selection = Some((1, None));
+    let cmds = submit_command(&mut s, "project-remove");
+    assert!(matches!(
+        cmds.as_slice(),
+        [Command::RemoveProject {
+            project_idx: 1,
+            delete_worktrees: false,
+            delete_main: false,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn project_remove_keybind_opens_popup_with_safe_defaults() {
+    let mut s = AppState::new();
+    s.projects = mock_projects();
+    s.sidebar_selection = Some((0, None));
+    let _ = reduce(&mut s, Action::Key(plain(' ')));
+    let cmds = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT)),
+    );
+    assert!(cmds.is_empty());
+    let popup = s.remove_project_popup.as_ref().unwrap();
+    assert!(popup.delete_worktrees);
+    assert!(!popup.delete_main);
+}
+
+#[test]
+fn project_remove_popup_main_toggle_confirms_both_deletions() {
+    let mut s = AppState::new();
+    s.projects = mock_projects();
+    s.sidebar_selection = Some((0, None));
+    crate::commands::open_project_remove_popup(&mut s);
+    let _ = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+    );
+    let _ = reduce(&mut s, Action::Key(plain(' ')));
+    let cmds = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    assert!(s.remove_project_popup.is_none());
+    assert!(matches!(
+        cmds.as_slice(),
+        [Command::RemoveProject {
+            delete_worktrees: true,
+            delete_main: true,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn project_removed_drops_config_sessions_and_rekeys_indices() {
+    let mut s = AppState::new();
+    s.projects = mock_projects();
+    let session = FakeSession::new(88);
+    s.projects[0].worktrees[0].sessions.push(88);
+    s.sessions.insert(88, session);
+    s.active_worktree = Some((1, 0));
+    s.sidebar_selection = Some((0, Some(0)));
+    s.pr_statuses.insert((0, 0), PrStatus::Open);
+    s.pr_statuses.insert((1, 1), PrStatus::Approved);
+
+    let cmds = reduce(
+        &mut s,
+        Action::ProjectRemoved {
+            project_slug: "imbuia".into(),
+        },
+    );
+
+    assert_eq!(s.projects.len(), 2);
+    assert_eq!(s.projects[0].slug, "brick");
+    assert!(!s.sessions.contains_key(&88));
+    assert_eq!(s.active_worktree, Some((0, 0)));
+    assert_eq!(s.sidebar_selection, Some((1, None)));
+    assert!(!s.pr_statuses.contains_key(&(0, 0)));
+    assert_eq!(s.pr_statuses.get(&(0, 1)), Some(&PrStatus::Approved));
+    assert!(matches!(
+        cmds.as_slice(),
+        [Command::DeleteProjectConfig(slug), Command::SaveGlobalConfig] if slug == "imbuia"
+    ));
+}
+
+#[test]
+fn projects_sort_by_supervisor_then_project_name() {
+    let mut s = AppState::new();
+    s.projects = mock_projects();
+    s.supervisors
+        .entries
+        .push((SupervisorId(1), "alpha".into()));
+    s.supervisors.entries.push((SupervisorId(2), "zeta".into()));
+    s.projects[0].supervisor = SupervisorId(2);
+    s.projects[1].supervisor = LOCAL;
+    s.projects[2].supervisor = SupervisorId(1);
+    s.projects[0].name = "A project".into();
+    s.projects[1].name = "B project".into();
+    s.projects[2].name = "C project".into();
+
+    assert_eq!(s.sorted_project_indices(), vec![2, 1, 0]);
+}
+
+#[test]
 fn worktree_removed_action_drops_entry_and_fixes_selection() {
     let mut s = AppState::new();
     s.projects = mock_projects();
+    let session = FakeSession::new(77);
+    s.projects[0].worktrees[1].sessions.push(77);
+    s.projects[0].worktrees[1].active_tab = Some(0);
+    s.sessions.insert(77, session);
     s.active_worktree = Some((0, 1));
     s.sidebar_selection = Some((0, Some(1)));
     let _ = reduce(
@@ -1780,6 +1919,7 @@ fn worktree_removed_action_drops_entry_and_fixes_selection() {
         },
     );
     assert_eq!(s.projects[0].worktrees.len(), 1);
+    assert!(!s.sessions.contains_key(&77));
     assert_eq!(s.active_worktree, None);
     assert_eq!(s.sidebar_selection, Some((0, Some(0))));
 }
@@ -1929,7 +2069,7 @@ fn pr_statuses_fetched_inserts_by_worktree_idx() {
     let cmds = reduce(
         &mut s,
         Action::PrStatusesFetched {
-            project_idx: 0,
+            project_slug: "imbuia".into(),
             statuses: vec![(0, None), (1, Some(PrStatus::Running))],
         },
     );
@@ -1947,7 +2087,7 @@ fn pr_statuses_fetched_clears_when_none() {
     let _ = reduce(
         &mut s,
         Action::PrStatusesFetched {
-            project_idx: 0,
+            project_slug: "imbuia".into(),
             statuses: vec![(1, None)],
         },
     );
@@ -2166,8 +2306,6 @@ fn terminal_chord_replay_forwards_buffered_keys_on_mismatch() {
 
 // --- remote supervisor connect/disconnect ---------------------------------
 
-use crate::app::{SupervisorDirectory, SupervisorId};
-
 /// Directory with the local supervisor plus one remote ("remote", id 1) that is
 /// currently disconnected, and a single project pinned to that remote (selected).
 fn state_with_disconnected_remote() -> AppState {
@@ -2288,7 +2426,7 @@ fn ctrl_p_opens_palette_in_normal_mode() {
     assert!(cmds.is_empty());
     let popup = s.palette_popup.as_ref().expect("palette open");
     assert_eq!(popup.filtered.len(), popup.entries.len());
-    assert_eq!(popup.entries.len(), 31);
+    assert_eq!(popup.entries.len(), 32);
 }
 
 #[test]

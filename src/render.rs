@@ -31,7 +31,9 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         render_command_completion(frame, regions.action_bar, comp, theme);
     }
 
-    if state.help_open {
+    if let Some(remove) = &state.remove_project_popup {
+        render_remove_project_popup(frame, area, remove, theme);
+    } else if state.help_open {
         let max_scroll = render_help_popup(frame, area, theme, state.help_scroll, state);
         state.help_max_scroll.set(max_scroll);
     } else if let Some(popup) = &state.popup {
@@ -52,6 +54,69 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     if pending_chord_is_space(state) {
         render_space_leader_hint(frame, area, theme, state);
     }
+}
+
+fn render_remove_project_popup(
+    frame: &mut Frame,
+    area: Rect,
+    popup: &crate::app::RemoveProjectPopup,
+    theme: &Theme,
+) {
+    let width = 64.min(area.width.saturating_sub(4));
+    let height = 10.min(area.height.saturating_sub(4));
+    let rect = centered_rect(width, height, area);
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.status_error))
+        .style(Style::default().bg(theme.bg).fg(theme.fg))
+        .title(
+            Line::from(format!(" Remove project: {} ", popup.project_name))
+                .style(
+                    Style::default()
+                        .fg(theme.header_fg)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .alignment(Alignment::Center),
+        );
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let checkbox = |checked: bool, selected: bool, label: &str| {
+        let marker = if checked { "[x]" } else { "[ ]" };
+        let style = if selected {
+            Style::default()
+                .bg(theme.selection_bg)
+                .fg(theme.selection_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg)
+        };
+        Line::from(Span::styled(format!(" {marker} {label}"), style))
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            "All tabs and jobs in this project will be closed.",
+            Style::default().fg(theme.status_error),
+        )),
+        Line::from(""),
+        checkbox(
+            popup.delete_worktrees,
+            popup.cursor == 0,
+            "Delete linked worktree folders",
+        ),
+        checkbox(
+            popup.delete_main,
+            popup.cursor == 1,
+            "Delete main project folder",
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            "↑/↓ select · Space toggle · Enter remove · Esc cancel",
+            Style::default().fg(theme.fg_dim),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 /// True when exactly one chord — `<Space>` — is pending. Used to gate the
@@ -951,7 +1016,8 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
     let focused = state.ui_focus == UiFocus::Sidebar;
     let max_w = inner.width as usize;
     let mut lines: Vec<Line> = Vec::new();
-    for (pi, project) in state.projects.iter().enumerate() {
+    for pi in state.sorted_project_indices() {
+        let project = &state.projects[pi];
         let marker = if project.expanded { "▼" } else { "▶" };
         let is_selected_header = state.sidebar_selection == Some((pi, None));
         // Tag projects hosted on a remote supervisor with its name; local

@@ -112,8 +112,11 @@ enum PendingOp {
         project_idx: usize,
         worktree_idx: usize,
     },
+    RemoveProject {
+        project_slug: String,
+    },
     FetchPr {
-        project_idx: usize,
+        project_slug: String,
     },
     /// Open-project directory browser listing.
     ListDir,
@@ -148,8 +151,11 @@ fn op_result_to_action(pending: PendingOp, result: OpResult) -> Option<Action> {
             PendingOp::RemoveWorktree { .. } => {
                 Action::OperationFailed(format!("remove worktree: {e}"))
             }
-            PendingOp::FetchPr { project_idx } => Action::PrFetchFailed {
-                project_idx,
+            PendingOp::RemoveProject { .. } => {
+                Action::OperationFailed(format!("remove project: {e}"))
+            }
+            PendingOp::FetchPr { project_slug } => Action::PrFetchFailed {
+                project_slug,
                 message: e,
             },
             PendingOp::ListDir => Action::OperationFailed(format!("list dir: {e}")),
@@ -204,9 +210,12 @@ fn op_result_to_action(pending: PendingOp, result: OpResult) -> Option<Action> {
                 project_idx,
                 worktree_idx,
             }),
-            (PendingOp::FetchPr { project_idx }, OpOk::PrStatuses(statuses)) => {
+            (PendingOp::RemoveProject { project_slug }, OpOk::ProjectRemoved) => {
+                Some(Action::ProjectRemoved { project_slug })
+            }
+            (PendingOp::FetchPr { project_slug }, OpOk::PrStatuses(statuses)) => {
                 Some(Action::PrStatusesFetched {
-                    project_idx,
+                    project_slug,
                     statuses,
                 })
             }
@@ -580,14 +589,33 @@ impl SupervisorClient {
         )
     }
 
+    pub fn request_remove_project(
+        &self,
+        project_slug: String,
+        repo_path: PathBuf,
+        worktree_paths: Vec<PathBuf>,
+        delete_worktrees: bool,
+        delete_main: bool,
+    ) -> Result<()> {
+        self.send_op(
+            PendingOp::RemoveProject { project_slug },
+            OpRequest::ProjectRemove {
+                repo_path,
+                worktree_paths,
+                delete_worktrees: delete_worktrees || delete_main,
+                delete_main,
+            },
+        )
+    }
+
     pub fn request_fetch_pr(
         &self,
-        project_idx: usize,
+        project_slug: String,
         repo_path: PathBuf,
         worktrees: Vec<(usize, PathBuf)>,
     ) -> Result<()> {
         self.send_op(
-            PendingOp::FetchPr { project_idx },
+            PendingOp::FetchPr { project_slug },
             OpRequest::FetchPr {
                 repo_path,
                 worktrees,
