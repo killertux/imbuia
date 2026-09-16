@@ -191,14 +191,19 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
             worktree_idx,
         } => {
             state.pending_op = None;
-            let removed_name = state
+            let removed = state
                 .projects
                 .get(project_idx)
                 .and_then(|p| p.worktrees.get(worktree_idx))
-                .map(|w| w.name.clone());
-            // Sessions were already killed at confirm time (see
-            // `PendingConfirm::RemoveWorktree` handler) so the worktree's
-            // `sessions` vec is empty by the time we get here.
+                .map(|w| (w.name.clone(), w.sessions.clone()));
+            // The supervisor only reports success after every PTY belonging to
+            // this worktree has exited. Drop any handles that haven't yet been
+            // removed by their asynchronous `SessionExited` notifications.
+            if let Some((_, sessions)) = &removed {
+                for id in sessions {
+                    state.sessions.remove(id);
+                }
+            }
             if let Some(p) = state.projects.get_mut(project_idx)
                 && worktree_idx < p.worktrees.len()
             {
@@ -253,9 +258,66 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
                 }
             }
             cmds.push(Command::SaveProjectConfig(project_idx));
-            if let Some(name) = removed_name {
+            if let Some((name, _)) = removed {
                 state.command_status = Some(format!("removed worktree '{name}'"));
             }
+        }
+        Action::ProjectRemoved { project_slug } => {
+            state.pending_op = None;
+            let Some(project_idx) = state
+                .projects
+                .iter()
+                .position(|project| project.slug == project_slug)
+            else {
+                return cmds;
+            };
+            let removed_display_pos = state
+                .sorted_project_indices()
+                .iter()
+                .position(|idx| *idx == project_idx)
+                .unwrap_or(0);
+            let project = &state.projects[project_idx];
+            let name = project.name.clone();
+            let slug = project.slug.clone();
+            let session_ids: Vec<SessionId> = project
+                .worktrees
+                .iter()
+                .flat_map(|worktree| worktree.sessions.iter().copied())
+                .collect();
+            for id in session_ids {
+                state.sessions.remove(&id);
+            }
+            state.projects.remove(project_idx);
+
+            state.active_worktree = match state.active_worktree {
+                Some((pi, _)) if pi == project_idx => None,
+                Some((pi, wi)) if pi > project_idx => Some((pi - 1, wi)),
+                other => other,
+            };
+            state.sidebar_selection = match state.sidebar_selection {
+                Some((pi, _)) if pi == project_idx => {
+                    let sorted = state.sorted_project_indices();
+                    sorted
+                        .get(removed_display_pos.min(sorted.len().saturating_sub(1)))
+                        .copied()
+                        .map(|replacement| (replacement, None))
+                }
+                Some((pi, wi)) if pi > project_idx => Some((pi - 1, wi)),
+                other => other,
+            };
+
+            let old_statuses = std::mem::take(&mut state.pr_statuses);
+            for ((pi, wi), status) in old_statuses {
+                if pi < project_idx {
+                    state.pr_statuses.insert((pi, wi), status);
+                } else if pi > project_idx {
+                    state.pr_statuses.insert((pi - 1, wi), status);
+                }
+            }
+            clamp_sidebar_scroll(state);
+            cmds.push(Command::DeleteProjectConfig(slug));
+            cmds.push(Command::SaveGlobalConfig);
+            state.command_status = Some(format!("removed project '{name}'"));
         }
         Action::OperationFailed(msg) => {
             state.pending_op = None;
@@ -393,6 +455,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
                 if p.github_enabled {
                     cmds.push(Command::FetchPrStatuses {
                         project_idx: pi,
+                        project_slug: p.slug.clone(),
                         repo_path: p.repo_path.clone(),
                         worktrees: worktree_paths(p),
                     });
@@ -400,12 +463,18 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
             }
         }
         Action::PrStatusesFetched {
-            project_idx,
+            project_slug,
             statuses,
         } => {
-            let Some(project) = state.projects.get(project_idx) else {
+            let Some(project_idx) = state
+                .projects
+                .iter()
+                .position(|project| project.slug == project_slug)
+            else {
+                state.pr_refresh_in_flight = false;
                 return cmds;
             };
+            let project = &state.projects[project_idx];
             let wt_count = project.worktrees.len();
             let mut matched = 0usize;
             for (wi, status) in &statuses {
@@ -435,7 +504,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
             }
         }
         Action::PrFetchFailed {
-            project_idx: _,
+            project_slug: _,
             message,
         } => {
             if state.pr_refresh_in_flight {
@@ -474,6 +543,7 @@ fn request_pr_refresh_for(
     };
     cmds.push(Command::FetchPrStatuses {
         project_idx,
+        project_slug: p.slug.clone(),
         repo_path: p.repo_path.clone(),
         worktrees: vec![(worktree_idx, wt.path.clone())],
     });
@@ -513,6 +583,11 @@ fn handle_paste(state: &mut AppState, text: String, cmds: &mut Commands) {
 }
 
 fn handle_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
+    // Project removal has destructive filesystem toggles and is fully modal.
+    if state.remove_project_popup.is_some() {
+        handle_remove_project_popup_key(state, k, cmds);
+        return;
+    }
     // Command palette is modal: typed chars filter, Enter executes.
     if state.palette_popup.is_some() {
         handle_palette_key(state, k, cmds);
@@ -864,7 +939,8 @@ fn worktree_mut(state: &mut AppState, dest: (usize, usize)) -> Option<&mut Workt
 /// Flatten the currently-visible sidebar rows (respecting collapsed projects).
 fn sidebar_visible_rows(state: &AppState) -> Vec<SidebarRow> {
     let mut rows = Vec::new();
-    for (pi, p) in state.projects.iter().enumerate() {
+    for pi in state.sorted_project_indices() {
+        let p = &state.projects[pi];
         rows.push(SidebarRow::Project(pi));
         if p.expanded {
             for wi in 0..p.worktrees.len() {
@@ -873,6 +949,55 @@ fn sidebar_visible_rows(state: &AppState) -> Vec<SidebarRow> {
         }
     }
     rows
+}
+
+fn handle_remove_project_popup_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
+    match k.code {
+        KeyCode::Esc => state.remove_project_popup = None,
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(popup) = state.remove_project_popup.as_mut() {
+                popup.cursor = popup.cursor.saturating_sub(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(popup) = state.remove_project_popup.as_mut() {
+                popup.cursor = (popup.cursor + 1).min(1);
+            }
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            if let Some(popup) = state.remove_project_popup.as_mut() {
+                popup.cursor = 1 - popup.cursor;
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some(popup) = state.remove_project_popup.as_mut() {
+                if popup.cursor == 0 {
+                    popup.delete_worktrees = !popup.delete_worktrees;
+                    if !popup.delete_worktrees {
+                        popup.delete_main = false;
+                    }
+                } else {
+                    popup.delete_main = !popup.delete_main;
+                    if popup.delete_main {
+                        popup.delete_worktrees = true;
+                    }
+                }
+            }
+        }
+        KeyCode::Enter => {
+            let Some(popup) = state.remove_project_popup.take() else {
+                return;
+            };
+            crate::commands::request_project_remove(
+                state,
+                popup.project_idx,
+                popup.delete_worktrees,
+                popup.delete_main,
+                cmds,
+            );
+        }
+        _ => {}
+    }
 }
 
 fn selection_to_row(state: &AppState) -> Option<SidebarRow> {
@@ -1050,6 +1175,7 @@ fn dispatch_action(state: &mut AppState, action: BindableAction, cmds: &mut Comm
         BindableAction::SidebarShrink => apply_sidebar_resize(state, -2, cmds),
         BindableAction::SidebarReset => set_sidebar_width(state, DEFAULT_SIDEBAR_WIDTH, cmds),
         BindableAction::OpenProjectPopup => crate::commands::cmd_open(state, &[], cmds),
+        BindableAction::RemoveProject => crate::commands::open_project_remove_popup(state),
         BindableAction::NewWorktree => crate::commands::cmd_worktree(state, &[], cmds),
         BindableAction::RemoveWorktree => crate::commands::cmd_worktree_remove(state, &[], cmds),
         BindableAction::EditProject => crate::commands::cmd_edit(state, &[], cmds),
@@ -1280,23 +1406,10 @@ fn handle_pending_confirm_key(state: &mut AppState, k: KeyEvent, cmds: &mut Comm
                     dest_path,
                     branch,
                 } => {
-                    // Kill sessions *before* the git op so shells aren't
-                    // holding the worktree's CWD/files open while git is
-                    // trying to delete them. KillSession is fire-and-forget
-                    // (SIGKILL via the supervisor); the git remove can race
-                    // with reaping safely.
-                    if let Some(w) = state
-                        .projects
-                        .get_mut(project_idx)
-                        .and_then(|p| p.worktrees.get_mut(worktree_idx))
-                    {
-                        for id in w.sessions.drain(..) {
-                            if let Some(sess) = state.sessions.remove(&id) {
-                                cmds.push(Command::KillSession(sess));
-                            }
-                        }
-                        w.active_tab = None;
-                    }
+                    // Session shutdown is part of the supervisor-side remove
+                    // operation. It waits for graceful exit, escalates to
+                    // SIGKILL, and only invokes git after verifying that the
+                    // worktree's PTY process sessions are gone.
                     state.pending_op = Some(format!("Removing worktree '{name}'…"));
                     cmds.push(Command::RemoveWorktree {
                         project_idx,
@@ -1379,6 +1492,9 @@ fn bump_help_scroll(state: &mut AppState, delta: i32) {
 }
 
 fn handle_mouse(state: &mut AppState, m: MouseEvent, cmds: &mut Commands) {
+    if state.remove_project_popup.is_some() {
+        return;
+    }
     if state.help_open {
         match m.kind {
             MouseEventKind::ScrollUp => bump_help_scroll(state, -3),

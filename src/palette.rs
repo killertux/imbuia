@@ -35,6 +35,7 @@ const PAIRS: &[(BindableAction, &str)] = &[
     (BindableAction::OpenTab, "tabnew"),
     (BindableAction::CloseTab, "tabclose"),
     (BindableAction::OpenProjectPopup, "open"),
+    (BindableAction::RemoveProject, "project-remove"),
     (BindableAction::NewWorktree, "worktree"),
     (BindableAction::RemoveWorktree, "worktree-remove"),
     (BindableAction::EditProject, "edit"),
@@ -165,9 +166,9 @@ mod tests {
 
     #[test]
     fn entry_count_is_stable() {
-        // 10 pairs + 8 command-only + 1 prefill (set) + 12 action-only.
+        // 11 pairs + 8 command-only + 1 prefill (set) + 12 action-only.
         let entries = build_entries(&defaults());
-        assert_eq!(entries.len(), 31);
+        assert_eq!(entries.len(), 32);
     }
 
     #[test]

@@ -37,6 +37,14 @@ use tokio_util::sync::CancellationToken;
 /// drops from the front; see [`push_output_log`].
 const OUTPUT_LOG_CAP: usize = 2 * 1024 * 1024;
 
+/// How long worktree removal gives shells and their jobs to handle SIGHUP.
+const WORKTREE_SESSION_GRACE: Duration = Duration::from_secs(5);
+/// SIGKILL should normally complete immediately. Keep a bounded verification
+/// window for overloaded systems and abort removal rather than racing git if
+/// any process is still alive after it.
+const WORKTREE_SESSION_KILL_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKTREE_SESSION_POLL: Duration = Duration::from_millis(25);
+
 /// Raw-byte replay buffer with a "we've evicted bytes" flag. Once truncated,
 /// `send_dump` prefers the parser's `contents_formatted()` over the (now
 /// possibly mid-escape) buffer — sacrificing scrollback history to avoid
@@ -68,7 +76,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Active-client handle: a bounded queue of outgoing frames drained by a
 /// dedicated async writer task, plus a [`CancellationToken`] used by
@@ -625,12 +633,13 @@ where
                             }
                         }
                         git_op => {
+                            let shared = Arc::clone(shared);
                             thread::spawn(move || {
                                 // Drop guard: a panic in `run_git_op` still
                                 // sends an Err so the client's `pending_op`
                                 // never wedges.
                                 let guard = OpReplyGuard::new(chan, request_id);
-                                let result = run_git_op(git_op);
+                                let result = run_git_op(&shared, git_op);
                                 guard.complete(result);
                             });
                         }
@@ -946,6 +955,132 @@ fn kill_session(shared: &Arc<Shared>, id: SessionId) {
     }
 }
 
+/// Stop every PTY process session rooted in one of `paths` before removing
+/// worktrees/a project. Shell jobs use separate process groups, so signalling only the
+/// shell PID (portable-pty's `ChildKiller` behavior on Unix) is insufficient.
+/// They do, however, remain in the PTY's POSIX session unless they explicitly
+/// daemonize, so signal every PID in that session.
+///
+/// The invariant for the caller is strict: success means no matching process
+/// remains. If graceful shutdown and SIGKILL both fail, return an error and do
+/// not let git touch the worktree.
+fn close_sessions_in_paths(shared: &Arc<Shared>, paths: &[PathBuf]) -> Result<()> {
+    use nix::unistd::{Pid, getsid};
+    use std::collections::HashSet;
+
+    let roots: Vec<(SessionId, u32)> = {
+        let reg = shared.registry.lock().unwrap();
+        let matching: Vec<_> = reg
+            .sessions
+            .values()
+            .filter(|sess| paths.iter().any(|path| sess.meta.cwd == *path))
+            .collect();
+        let missing_pid: Vec<_> = matching
+            .iter()
+            .filter(|sess| sess.child_pid.is_none())
+            .map(|sess| sess.meta.id)
+            .collect();
+        if !missing_pid.is_empty() {
+            anyhow::bail!(
+                "cannot verify shutdown for worktree sessions without process ids: {missing_pid:?}"
+            );
+        }
+        matching
+            .into_iter()
+            .map(|sess| (sess.meta.id, sess.child_pid.unwrap()))
+            .collect()
+    };
+    if roots.is_empty() {
+        return Ok(());
+    }
+
+    // forkpty makes the shell a session leader, so its PID is also the SID.
+    // Ask the OS when possible; retaining the root PID as a fallback still
+    // lets us find jobs if the shell exits between the registry snapshot and
+    // this lookup.
+    let session_ids: HashSet<u32> = roots
+        .iter()
+        .map(|(_, pid)| {
+            getsid(Some(Pid::from_raw(*pid as i32)))
+                .map(|sid| sid.as_raw() as u32)
+                .unwrap_or(*pid)
+        })
+        .collect();
+
+    tracing::info!(
+        paths = paths.len(),
+        sessions = roots.len(),
+        "closing filesystem operation sessions"
+    );
+    let mut system = sysinfo::System::new();
+    let mut remaining = process_ids_in_sessions(&mut system, &session_ids);
+    signal_processes(&remaining, nix::sys::signal::Signal::SIGHUP);
+
+    let graceful_deadline = Instant::now() + WORKTREE_SESSION_GRACE;
+    while !remaining.is_empty() && Instant::now() < graceful_deadline {
+        thread::sleep(WORKTREE_SESSION_POLL);
+        remaining = process_ids_in_sessions(&mut system, &session_ids);
+    }
+    if remaining.is_empty() {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        paths = paths.len(),
+        pids = ?remaining,
+        "sessions did not exit after SIGHUP; escalating to SIGKILL"
+    );
+    let kill_deadline = Instant::now() + WORKTREE_SESSION_KILL_TIMEOUT;
+    loop {
+        // Signal on every pass so a process forked during the previous scan
+        // cannot escape the force-kill phase.
+        signal_processes(&remaining, nix::sys::signal::Signal::SIGKILL);
+        thread::sleep(WORKTREE_SESSION_POLL);
+        remaining = process_ids_in_sessions(&mut system, &session_ids);
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= kill_deadline {
+            anyhow::bail!(
+                "refusing filesystem removal: processes still alive after SIGKILL: {remaining:?}"
+            );
+        }
+    }
+}
+
+fn process_ids_in_sessions(
+    system: &mut sysinfo::System,
+    session_ids: &std::collections::HashSet<u32>,
+) -> Vec<u32> {
+    use nix::unistd::{Pid, getsid};
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    system
+        .processes()
+        .keys()
+        .map(|pid| pid.as_u32())
+        .filter(|pid| {
+            getsid(Some(Pid::from_raw(*pid as i32)))
+                .map(|sid| session_ids.contains(&(sid.as_raw() as u32)))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn signal_processes(pids: &[u32], signal: nix::sys::signal::Signal) {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    for pid in pids {
+        match kill(Pid::from_raw(*pid as i32), signal) {
+            Ok(()) | Err(Errno::ESRCH) => {}
+            Err(e) => tracing::warn!(pid, ?signal, "failed to signal process: {e}"),
+        }
+    }
+}
+
 /// One queued PR-status fetch for the singleton gh worker. Carries the
 /// `chan` to reply on so the worker isn't coupled to whichever client is
 /// active when it finishes.
@@ -998,7 +1133,7 @@ impl Drop for OpReplyGuard {
 /// Run a non-`gh` repo op synchronously. Called on a throwaway thread so the
 /// command loop stays responsive. `FetchPr` is handled by the gh worker, not
 /// here.
-fn run_git_op(req: OpRequest) -> OpResult {
+fn run_git_op(shared: &Arc<Shared>, req: OpRequest) -> OpResult {
     match req {
         OpRequest::Validate { repo_path } => {
             // Expand `~` against the *supervisor's* HOME (the client no longer
@@ -1045,10 +1180,29 @@ fn run_git_op(req: OpRequest) -> OpResult {
             dest_path,
             branch,
         } => {
+            close_sessions_in_paths(shared, std::slice::from_ref(&dest_path))
+                .map_err(|e| format!("{e:#}"))?;
             git::worktree_remove(&repo_path, &dest_path, branch.as_deref())
                 .map_err(|e| format!("{e:#}"))?;
             tracing::info!(repo = %repo_path.display(), branch = ?branch, "worktree removed");
             Ok(OpOk::WorktreeRemoved)
+        }
+        OpRequest::ProjectRemove {
+            repo_path,
+            worktree_paths,
+            delete_worktrees,
+            delete_main,
+        } => {
+            close_sessions_in_paths(shared, &worktree_paths).map_err(|e| format!("{e:#}"))?;
+            git::project_remove(&repo_path, delete_worktrees || delete_main, delete_main)
+                .map_err(|e| format!("{e:#}"))?;
+            tracing::info!(
+                repo = %repo_path.display(),
+                delete_worktrees,
+                delete_main,
+                "project removed"
+            );
+            Ok(OpOk::ProjectRemoved)
         }
         OpRequest::ListDir { path } => list_dir(path),
         OpRequest::FetchPr { .. } => {
@@ -1558,6 +1712,18 @@ fn init_logging(sock: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_scan_finds_current_posix_session() {
+        use nix::unistd::{Pid, getsid};
+        use std::collections::HashSet;
+
+        let pid = std::process::id();
+        let sid = getsid(Some(Pid::from_raw(pid as i32))).unwrap();
+        let mut system = sysinfo::System::new();
+        let pids = process_ids_in_sessions(&mut system, &HashSet::from([sid.as_raw() as u32]));
+        assert!(pids.contains(&pid));
+    }
 
     #[test]
     fn push_output_log_appends_under_cap() {

@@ -3,7 +3,9 @@
 //! Each command is a `CmdSpec` entry in the `COMMANDS` table. Adding a new
 //! one is just appending to the table and writing a `fn(...)` handler.
 
-use crate::app::{AppState, Command, Commands, EditPopup, InputPopup, PopupAction, UsagePopup};
+use crate::app::{
+    AppState, Command, Commands, EditPopup, InputPopup, PopupAction, RemoveProjectPopup, UsagePopup,
+};
 use crate::reducer::{
     close_current_tab, launch_in_active_worktree, open_new_tab_in_active, set_sidebar_width,
 };
@@ -77,6 +79,12 @@ pub const COMMANDS: &[CmdSpec] = &[
         usage: ":worktree-remove",
         description: "Delete the selected worktree (files + local branch).",
         handler: cmd_worktree_remove,
+    },
+    CmdSpec {
+        names: &["project-remove", "project-rm"],
+        usage: ":project-remove [--worktrees] [--main]",
+        description: "Remove the selected project; optionally delete its local files.",
+        handler: cmd_project_remove,
     },
     CmdSpec {
         names: &["import"],
@@ -335,6 +343,82 @@ pub(crate) fn cmd_worktree_remove(state: &mut AppState, _args: &[&str], _cmds: &
     });
 }
 
+fn cmd_project_remove(state: &mut AppState, args: &[&str], cmds: &mut Commands) {
+    let mut delete_worktrees = false;
+    let mut delete_main = false;
+    for arg in args {
+        match *arg {
+            "--worktrees" => delete_worktrees = true,
+            "--main" => {
+                delete_main = true;
+                delete_worktrees = true;
+            }
+            _ => {
+                state.command_status = Some(format!(
+                    "unknown option '{arg}'; usage: :project-remove [--worktrees] [--main]"
+                ));
+                return;
+            }
+        }
+    }
+    let Some(project_idx) = selected_project_idx(state) else {
+        state.command_status = Some("select a project in the sidebar first".into());
+        return;
+    };
+    request_project_remove(state, project_idx, delete_worktrees, delete_main, cmds);
+}
+
+/// Keybinding entry point: unlike the explicit ex command, present the two
+/// filesystem choices before dispatching the removal.
+pub(crate) fn open_project_remove_popup(state: &mut AppState) {
+    let Some(project_idx) = selected_project_idx(state) else {
+        state.command_status = Some("select a project in the sidebar first".into());
+        return;
+    };
+    let project = &state.projects[project_idx];
+    state.remove_project_popup = Some(RemoveProjectPopup {
+        project_idx,
+        project_name: project.name.clone(),
+        delete_worktrees: true,
+        delete_main: false,
+        cursor: 0,
+    });
+}
+
+pub(crate) fn request_project_remove(
+    state: &mut AppState,
+    project_idx: usize,
+    delete_worktrees: bool,
+    delete_main: bool,
+    cmds: &mut Commands,
+) {
+    if state.pending_op.is_some() {
+        state.command_status = Some("another operation is already in progress".into());
+        return;
+    }
+    let Some(project) = state.projects.get(project_idx) else {
+        return;
+    };
+    let delete_worktrees = delete_worktrees || delete_main;
+    let name = project.name.clone();
+    let project_slug = project.slug.clone();
+    let repo_path = project.repo_path.clone();
+    let worktree_paths = project
+        .worktrees
+        .iter()
+        .map(|worktree| worktree.path.clone())
+        .collect();
+    state.pending_op = Some(format!("Removing project '{name}'…"));
+    cmds.push(Command::RemoveProject {
+        project_idx,
+        project_slug,
+        repo_path,
+        worktree_paths,
+        delete_worktrees,
+        delete_main,
+    });
+}
+
 pub(crate) fn cmd_edit(state: &mut AppState, _args: &[&str], _cmds: &mut Commands) {
     let Some(project_idx) = selected_project_idx(state) else {
         state.command_status = Some("select a project in the sidebar first".into());
@@ -485,6 +569,7 @@ fn cmd_gh_enable(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
     };
     state.projects[pi].github_enabled = true;
     state.command_status = Some("GitHub PR status enabled".into());
+    let project_slug = state.projects[pi].slug.clone();
     let repo_path = state.projects[pi].repo_path.clone();
     let worktrees = state.projects[pi]
         .worktrees
@@ -495,6 +580,7 @@ fn cmd_gh_enable(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
     cmds.push(Command::SaveProjectConfig(pi));
     cmds.push(Command::FetchPrStatuses {
         project_idx: pi,
+        project_slug,
         repo_path,
         worktrees,
     });
@@ -538,6 +624,7 @@ fn cmd_gh_refresh(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
         return;
     }
     let repo_path = state.projects[pi].repo_path.clone();
+    let project_slug = state.projects[pi].slug.clone();
     let worktrees: Vec<_> = state.projects[pi]
         .worktrees
         .iter()
@@ -548,6 +635,7 @@ fn cmd_gh_refresh(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
     state.pr_refresh_in_flight = true;
     cmds.push(Command::FetchPrStatuses {
         project_idx: pi,
+        project_slug,
         repo_path,
         worktrees,
     });

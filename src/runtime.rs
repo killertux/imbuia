@@ -63,8 +63,8 @@ pub async fn run() -> Result<()> {
             Project::from_config(cfg, sup)
         })
         .collect();
-    if !state.projects.is_empty() {
-        state.sidebar_selection = Some((0, None));
+    if let Some(first) = state.sorted_project_indices().first().copied() {
+        state.sidebar_selection = Some((first, None));
     }
 
     // Re-bind sessions every connected supervisor has from a previous run
@@ -564,6 +564,26 @@ fn execute(
                     action_tx.try_send(Action::OperationFailed(format!("remove worktree: {e}")));
             }
         }
+        Command::RemoveProject {
+            project_idx,
+            project_slug,
+            repo_path,
+            worktree_paths,
+            delete_worktrees,
+            delete_main,
+        } => {
+            if let Some(client) = project_client(state, supervisors, project_idx, action_tx)
+                && let Err(e) = client.request_remove_project(
+                    project_slug,
+                    repo_path,
+                    worktree_paths,
+                    delete_worktrees,
+                    delete_main,
+                )
+            {
+                let _ = action_tx.try_send(Action::OperationFailed(format!("remove project: {e}")));
+            }
+        }
         Command::SaveGlobalConfig => {
             let disk = config::load_global(&state.config_dir).ok();
             let global = config::GlobalConfig {
@@ -597,15 +617,21 @@ fn execute(
                 }
             }
         }
+        Command::DeleteProjectConfig(slug) => {
+            if let Err(e) = config::delete_project(&state.config_dir, &slug) {
+                tracing::warn!(%slug, "delete_project failed: {e}");
+            }
+        }
         Command::FetchPrStatuses {
             project_idx,
+            project_slug,
             repo_path,
             worktrees,
         } => {
             // The supervisor's gh worker serialises and coalesces; the reader
             // posts PrStatusesFetched / PrFetchFailed back.
             if let Some(client) = project_client(state, supervisors, project_idx, action_tx)
-                && let Err(e) = client.request_fetch_pr(project_idx, repo_path, worktrees)
+                && let Err(e) = client.request_fetch_pr(project_slug, repo_path, worktrees)
             {
                 tracing::warn!("gh fetch request failed: {e}");
             }
@@ -704,7 +730,11 @@ fn spawn_update_install(tag: String, action_tx: &mpsc::Sender<Action>) {
 }
 
 fn state_slugs(state: &AppState) -> Vec<String> {
-    state.projects.iter().map(|p| p.slug.clone()).collect()
+    state
+        .sorted_project_indices()
+        .into_iter()
+        .map(|idx| state.projects[idx].slug.clone())
+        .collect()
 }
 
 fn spawn_input_thread(tx: mpsc::Sender<Action>) {

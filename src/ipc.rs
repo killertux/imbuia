@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 /// Version 3 adds chunked clipboard-file uploads. The handshake refuses
 /// version mismatches.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 const MAX_FRAME: u32 = 8 * 1024 * 1024;
 pub const MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -138,6 +138,14 @@ pub enum OpRequest {
         dest_path: PathBuf,
         branch: Option<String>,
     },
+    /// Close all project PTYs, then optionally delete linked worktrees and the
+    /// main project folder. `delete_main` implies `delete_worktrees`.
+    ProjectRemove {
+        repo_path: PathBuf,
+        worktree_paths: Vec<PathBuf>,
+        delete_worktrees: bool,
+        delete_main: bool,
+    },
     /// Per-worktree live HEAD resolution + `gh pr list`. `worktrees` is
     /// `(worktree_idx, worktree_cwd)`; the supervisor resolves each branch
     /// live so a `git switch` inside a worktree is picked up.
@@ -186,6 +194,7 @@ pub enum OpOk {
     Worktrees(Vec<WorktreeEntry>),
     WorktreeAdded(WorktreeEntry),
     WorktreeRemoved,
+    ProjectRemoved,
     /// `(worktree_idx, classification)` — `None` means "no PR / detached".
     PrStatuses(Vec<(usize, Option<PrStatus>)>),
     /// Directory contents for the open-project browser. `dir` is the
@@ -577,17 +586,29 @@ mod tests {
             },
             ClientMsg::Op {
                 request_id: 15,
+                req: OpRequest::ProjectRemove {
+                    repo_path: PathBuf::from("/repo"),
+                    worktree_paths: vec![
+                        PathBuf::from("/repo"),
+                        PathBuf::from("/repo-worktrees/feat"),
+                    ],
+                    delete_worktrees: true,
+                    delete_main: false,
+                },
+            },
+            ClientMsg::Op {
+                request_id: 16,
                 req: OpRequest::FetchPr {
                     repo_path: PathBuf::from("/repo"),
                     worktrees: vec![(0, PathBuf::from("/repo")), (1, PathBuf::from("/wt"))],
                 },
             },
             ClientMsg::Op {
-                request_id: 16,
+                request_id: 17,
                 req: OpRequest::ListDir { path: None },
             },
             ClientMsg::Op {
-                request_id: 17,
+                request_id: 18,
                 req: OpRequest::ListDir {
                     path: Some(PathBuf::from("~/code")),
                 },
@@ -685,14 +706,18 @@ mod tests {
             },
             SupervisorMsg::OpResult {
                 request_id: 5,
-                result: Ok(OpOk::PrStatuses(vec![(0, Some(PrStatus::Open)), (1, None)])),
+                result: Ok(OpOk::ProjectRemoved),
             },
             SupervisorMsg::OpResult {
                 request_id: 6,
-                result: Err("boom".into()),
+                result: Ok(OpOk::PrStatuses(vec![(0, Some(PrStatus::Open)), (1, None)])),
             },
             SupervisorMsg::OpResult {
                 request_id: 7,
+                result: Err("boom".into()),
+            },
+            SupervisorMsg::OpResult {
+                request_id: 8,
                 result: Ok(OpOk::DirListing {
                     dir: PathBuf::from("/home/me/code"),
                     parent: Some(PathBuf::from("/home/me")),

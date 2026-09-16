@@ -98,6 +98,7 @@ available follow-up keys. The current bindings:
 | Chord          | What it does                                  |
 |----------------|-----------------------------------------------|
 | `<Space> o`    | Open project popup (path + setup script).     |
+| `<Space> P`    | Remove project popup (optional file deletion).|
 | `<Space> w`    | New worktree popup.                           |
 | `<Space> W`    | Remove the selected worktree.                 |
 | `<Space> l`    | Launcher picker.                              |
@@ -115,6 +116,7 @@ available follow-up keys. The current bindings:
 | `:open [path]`                | Add a project. With no arg, opens a popup for path + setup-script. |
 | `:worktree <branch>` / `:wt`  | `git worktree add` for `<branch>`, opens a terminal, runs setup. |
 | `:worktree-remove` / `:wr`    | Removes the selected worktree (files + local branch).         |
+| `:project-remove [--worktrees] [--main]` | Removes the selected project; flags also delete local files (`--main` implies `--worktrees`). |
 | `:edit` / `:e`                | Multi-line popup to edit the selected project's setup script. |
 | `:launch [name]` / `:l`       | Launch a named command in a new tab; no arg → picker popup.   |
 | `:tabnew` / `:tabclose`       | New terminal / close current terminal.                        |

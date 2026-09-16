@@ -235,6 +235,16 @@ pub fn save_project(dir: &Path, cfg: &ProjectConfig) -> Result<()> {
     write_toml_atomic(&path, cfg)
 }
 
+pub fn delete_project(dir: &Path, slug: &str) -> Result<()> {
+    anyhow::ensure!(is_valid_slug(slug), "invalid slug {slug:?}");
+    let path = project_path(dir, slug);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("deleting {}", path.display())),
+    }
+}
+
 fn write_toml_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -460,6 +470,23 @@ mod tests {
 
         assert!(error.to_string().contains("parsing"));
         assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn delete_project_removes_only_requested_config() {
+        let dir = std::env::temp_dir().join(format!("imbuia-cfg-delete-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("projects")).unwrap();
+        fs::write(project_path(&dir, "one"), "name = 'one'").unwrap();
+        fs::write(project_path(&dir, "two"), "name = 'two'").unwrap();
+
+        delete_project(&dir, "one").unwrap();
+
+        assert!(!project_path(&dir, "one").exists());
+        assert!(project_path(&dir, "two").exists());
+        // Idempotent so retries after a crash are harmless.
+        delete_project(&dir, "one").unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 

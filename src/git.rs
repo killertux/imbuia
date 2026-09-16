@@ -221,3 +221,44 @@ pub fn worktree_remove(repo: &Path, dest: &Path, branch: Option<&str>) -> Result
     }
     Ok(())
 }
+
+/// Remove a project from disk according to the user's explicit choices.
+/// Linked worktrees are unregistered through git but their branches are kept;
+/// deleting the main folder then removes the repository and those refs anyway.
+pub fn project_remove(repo: &Path, delete_worktrees: bool, delete_main: bool) -> Result<()> {
+    if !delete_worktrees && !delete_main {
+        return Ok(());
+    }
+
+    let canonical_repo = std::fs::canonicalize(repo)
+        .map_err(|e| anyhow!("canonicalizing project folder {}: {e}", repo.display()))?;
+    validate_repo(&canonical_repo)?;
+
+    if delete_worktrees || delete_main {
+        // Ask git rather than trusting the client's imported subset: deleting
+        // the main folder must not leave unimported linked worktrees behind.
+        for entry in list_worktrees(&canonical_repo)? {
+            let is_project_root = entry.path == repo
+                || std::fs::canonicalize(&entry.path)
+                    .is_ok_and(|canonical| canonical == canonical_repo);
+            if is_project_root {
+                continue;
+            }
+            worktree_remove(&canonical_repo, &entry.path, None)?;
+        }
+    }
+
+    if delete_main {
+        anyhow::ensure!(
+            canonical_repo.parent().is_some(),
+            "refusing to delete filesystem root"
+        );
+        std::fs::remove_dir_all(&canonical_repo).map_err(|e| {
+            anyhow!(
+                "deleting main project folder {}: {e}",
+                canonical_repo.display()
+            )
+        })?;
+    }
+    Ok(())
+}

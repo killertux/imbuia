@@ -198,6 +198,19 @@ pub enum PendingConfirm {
     },
 }
 
+/// Modal confirmation for removing a project. The two filesystem choices are
+/// independent in the UI except that deleting the main folder necessarily
+/// implies deleting its linked worktrees first.
+#[derive(Clone, Debug)]
+pub struct RemoveProjectPopup {
+    pub project_idx: usize,
+    pub project_name: String,
+    pub delete_worktrees: bool,
+    pub delete_main: bool,
+    /// Selected checkbox: 0 = linked worktrees, 1 = main project folder.
+    pub cursor: u8,
+}
+
 /// Multi-line edit popup driven by `ratatui-textarea`. Currently used by
 /// `:edit` to edit the selected project's `setup_script`.
 pub struct EditPopup {
@@ -403,6 +416,8 @@ pub struct AppState {
     pub usage_popup: Option<UsagePopup>,
     /// Active command palette (`<C-p>` / `:palette`), if any.
     pub palette_popup: Option<PalettePopup>,
+    /// Active project-removal confirmation (`<Space>P`), if any.
+    pub remove_project_popup: Option<RemoveProjectPopup>,
     /// `~/.config/imbuia` (or XDG equivalent). Resolved once at startup.
     pub config_dir: PathBuf,
     /// Description of the currently running async operation (open project,
@@ -468,6 +483,7 @@ impl AppState {
             launch_popup: None,
             usage_popup: None,
             palette_popup: None,
+            remove_project_popup: None,
             config_dir: PathBuf::new(),
             pending_op: None,
             pending_confirm: None,
@@ -488,6 +504,25 @@ impl AppState {
         let wt = self.projects.get(p)?.worktrees.get(w)?;
         let idx = wt.active_tab?;
         wt.sessions.get(idx).copied()
+    }
+
+    /// Stable project indices in sidebar order: supervisor name, then project
+    /// name (both case-insensitive), with slug as a deterministic tie-breaker.
+    /// The backing vector stays untouched so in-flight async operations keep
+    /// their positional indices.
+    pub fn sorted_project_indices(&self) -> Vec<usize> {
+        let mut indices: Vec<usize> = (0..self.projects.len()).collect();
+        indices.sort_by_cached_key(|idx| {
+            let project = &self.projects[*idx];
+            (
+                self.supervisors
+                    .name_of(project.supervisor)
+                    .to_ascii_lowercase(),
+                project.name.to_ascii_lowercase(),
+                project.slug.clone(),
+            )
+        });
+        indices
     }
 }
 
@@ -649,6 +684,11 @@ pub enum Action {
         project_idx: usize,
         worktree_idx: usize,
     },
+    /// Supervisor finished closing every project session and performing the
+    /// requested filesystem deletion. Remove its client-side config/state.
+    ProjectRemoved {
+        project_slug: String,
+    },
     /// Runtime → reducer: `git worktree list` returned these entries; the
     /// reducer adds whichever ones aren't already in the project.
     WorktreesImported {
@@ -697,13 +737,13 @@ pub enum Action {
     /// worktree-index in the order they were polled. `None` clears the
     /// existing entry (no PR / per-worktree failure).
     PrStatusesFetched {
-        project_idx: usize,
+        project_slug: String,
         statuses: Vec<(usize, Option<PrStatus>)>,
     },
     /// Background fetcher failure. Surfaced to `command_status` only when a
     /// foreground `:gh-refresh` was in flight; silent otherwise.
     PrFetchFailed {
-        project_idx: usize,
+        project_slug: String,
         message: String,
     },
     Quit,
@@ -765,6 +805,10 @@ impl std::fmt::Debug for Action {
                 .field("project_idx", project_idx)
                 .field("worktree_idx", worktree_idx)
                 .finish(),
+            Action::ProjectRemoved { project_slug } => f
+                .debug_struct("ProjectRemoved")
+                .field("project_slug", project_slug)
+                .finish(),
             Action::WorktreesImported {
                 project_idx,
                 entries,
@@ -796,19 +840,19 @@ impl std::fmt::Debug for Action {
             Action::PeriodicUpdateCheck => write!(f, "PeriodicUpdateCheck"),
             Action::PeriodicPrCheck => write!(f, "PeriodicPrCheck"),
             Action::PrStatusesFetched {
-                project_idx,
+                project_slug,
                 statuses,
             } => f
                 .debug_struct("PrStatusesFetched")
-                .field("project_idx", project_idx)
+                .field("project_slug", project_slug)
                 .field("count", &statuses.len())
                 .finish(),
             Action::PrFetchFailed {
-                project_idx,
+                project_slug,
                 message,
             } => f
                 .debug_struct("PrFetchFailed")
-                .field("project_idx", project_idx)
+                .field("project_slug", project_slug)
                 .field("message", message)
                 .finish(),
             Action::Quit => write!(f, "Quit"),
@@ -916,10 +960,23 @@ pub enum Command {
         dest_path: PathBuf,
         branch: Option<String>,
     },
+    /// Close every session in a project, optionally delete its linked
+    /// worktrees/main folder on the owning supervisor, then remove it from the
+    /// client configuration after the supervisor confirms success.
+    RemoveProject {
+        project_idx: usize,
+        project_slug: String,
+        repo_path: PathBuf,
+        worktree_paths: Vec<PathBuf>,
+        delete_worktrees: bool,
+        delete_main: bool,
+    },
     /// Persist global config (sidebar width + project list).
     SaveGlobalConfig,
     /// Persist a project's config.
     SaveProjectConfig(usize),
+    /// Delete one `projects/<slug>.toml` file from client-side config.
+    DeleteProjectConfig(String),
     /// Ask the updater to hit GitHub and report back via
     /// [`Action::UpdateChecked`]. Spawned as a thread by the runtime.
     CheckForUpdate,
@@ -934,6 +991,9 @@ pub enum Command {
     /// thread.
     FetchPrStatuses {
         project_idx: usize,
+        /// Stable identity used to discard/re-route replies if project indices
+        /// shift while the fetch is in flight.
+        project_slug: String,
         /// CWD for the `gh` invocations (project's main repo dir).
         repo_path: PathBuf,
         /// `(worktree_idx, worktree_cwd)` — branch resolved live in the
