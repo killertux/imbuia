@@ -151,7 +151,12 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
         } => {
             state.pending_op = None;
             state.command_status = None;
-            let term = chrome(state.term_size.as_rect(), state.sidebar_width).terminal;
+            let term = chrome(
+                state.term_size.as_rect(),
+                state.sidebar_width,
+                state.sidebar_hidden,
+            )
+            .terminal;
             if let Some(p) = state.projects.get_mut(project_idx) {
                 let cwd = worktree.path.clone();
                 let script = p.setup_script.clone();
@@ -852,7 +857,12 @@ pub(crate) fn launch_in_worktree(
     initial_command: Option<String>,
     cmds: &mut Commands,
 ) {
-    let term = chrome(state.term_size.as_rect(), state.sidebar_width).terminal;
+    let term = chrome(
+        state.term_size.as_rect(),
+        state.sidebar_width,
+        state.sidebar_hidden,
+    )
+    .terminal;
     let (cwd, slug, wt_name, supervisor) = match state
         .projects
         .get(pi)
@@ -877,7 +887,12 @@ pub(crate) fn open_new_tab_in_active(state: &mut AppState, cmds: &mut Commands) 
     let Some((pi, wi)) = state.active_worktree else {
         return;
     };
-    let term = chrome(state.term_size.as_rect(), state.sidebar_width).terminal;
+    let term = chrome(
+        state.term_size.as_rect(),
+        state.sidebar_width,
+        state.sidebar_hidden,
+    )
+    .terminal;
     let (cwd, slug, wt_name, supervisor) = match state
         .projects
         .get(pi)
@@ -1033,7 +1048,11 @@ fn move_sidebar_selection(state: &mut AppState, delta: i32) {
 /// Keep `row_idx` (an index into `sidebar_visible_rows`) within the visible
 /// window by scrolling the sidebar up or down as needed.
 fn ensure_selection_visible(state: &mut AppState, row_idx: u16) {
-    let regions = chrome(state.term_size.as_rect(), state.sidebar_width);
+    let regions = chrome(
+        state.term_size.as_rect(),
+        state.sidebar_width,
+        state.sidebar_hidden,
+    );
     let inner = sidebar_inner_rows(&regions);
     if inner == 0 {
         return;
@@ -1062,7 +1081,11 @@ fn activate_sidebar_selection(state: &mut AppState, cmds: &mut Commands) {
 }
 
 fn clamp_sidebar_scroll(state: &mut AppState) {
-    let regions = chrome(state.term_size.as_rect(), state.sidebar_width);
+    let regions = chrome(
+        state.term_size.as_rect(),
+        state.sidebar_width,
+        state.sidebar_hidden,
+    );
     let inner = sidebar_inner_rows(&regions);
     let total = sidebar_visible_rows(state).len() as u16;
     let max_scroll = total.saturating_sub(inner);
@@ -1141,7 +1164,11 @@ fn handle_terminal_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {
 /// behaviour lives in those helpers — this is just the name layer.
 fn dispatch_action(state: &mut AppState, action: BindableAction, cmds: &mut Commands) {
     match action {
-        BindableAction::FocusSidebar => state.ui_focus = UiFocus::Sidebar,
+        BindableAction::FocusSidebar => {
+            // Focusing the left pane implies showing it again.
+            set_sidebar_hidden(state, false, cmds);
+            state.ui_focus = UiFocus::Sidebar;
+        }
         BindableAction::FocusTerminal => state.ui_focus = UiFocus::Terminal,
         BindableAction::SidebarUp => {
             if state.ui_focus == UiFocus::Sidebar {
@@ -1174,6 +1201,7 @@ fn dispatch_action(state: &mut AppState, action: BindableAction, cmds: &mut Comm
         BindableAction::SidebarGrow => apply_sidebar_resize(state, 2, cmds),
         BindableAction::SidebarShrink => apply_sidebar_resize(state, -2, cmds),
         BindableAction::SidebarReset => set_sidebar_width(state, DEFAULT_SIDEBAR_WIDTH, cmds),
+        BindableAction::ToggleSidebar => toggle_sidebar(state, cmds),
         BindableAction::OpenProjectPopup => crate::commands::cmd_open(state, &[], cmds),
         BindableAction::RemoveProject => crate::commands::open_project_remove_popup(state),
         BindableAction::NewWorktree => crate::commands::cmd_worktree(state, &[], cmds),
@@ -1513,7 +1541,11 @@ fn handle_mouse(state: &mut AppState, m: MouseEvent, cmds: &mut Commands) {
         }
         return;
     }
-    let regions = chrome(state.term_size.as_rect(), state.sidebar_width);
+    let regions = chrome(
+        state.term_size.as_rect(),
+        state.sidebar_width,
+        state.sidebar_hidden,
+    );
     if rect_contains(regions.sidebar, m.column, m.row) {
         handle_sidebar_mouse(state, m, &regions, cmds);
     } else if rect_contains(regions.tab_bar, m.column, m.row) {
@@ -1636,10 +1668,34 @@ pub(crate) fn set_sidebar_width(state: &mut AppState, width: u16, cmds: &mut Com
 }
 
 fn broadcast_resize(state: &AppState, cmds: &mut Commands) {
-    let term = chrome(state.term_size.as_rect(), state.sidebar_width).terminal;
+    let term = chrome(
+        state.term_size.as_rect(),
+        state.sidebar_width,
+        state.sidebar_hidden,
+    )
+    .terminal;
     for id in state.sessions.keys().copied() {
         cmds.push(Command::ResizePty(id, term.height, term.width));
     }
+}
+
+/// `<Space>s` — collapse/expand the sidebar. The terminal (and every PTY)
+/// gets the reclaimed columns immediately; the choice is autosaved.
+fn toggle_sidebar(state: &mut AppState, cmds: &mut Commands) {
+    set_sidebar_hidden(state, !state.sidebar_hidden, cmds);
+}
+
+fn set_sidebar_hidden(state: &mut AppState, hidden: bool, cmds: &mut Commands) {
+    if state.sidebar_hidden == hidden {
+        return;
+    }
+    state.sidebar_hidden = hidden;
+    // Don't leave keyboard focus parked on an invisible panel.
+    if hidden && state.ui_focus == UiFocus::Sidebar {
+        state.ui_focus = UiFocus::Terminal;
+    }
+    broadcast_resize(state, cmds);
+    cmds.push(Command::SaveGlobalConfig);
 }
 
 fn handle_launch_popup_key(state: &mut AppState, k: KeyEvent, cmds: &mut Commands) {

@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 pub fn render(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
-    let regions = chrome(area, state.sidebar_width);
+    let regions = chrome(area, state.sidebar_width, state.sidebar_hidden);
     let theme = &state.theme;
 
     // Paint the whole screen with the theme background so empty regions
@@ -20,7 +20,9 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         area,
     );
 
-    render_sidebar(frame, regions.sidebar, state);
+    if !state.sidebar_hidden {
+        render_sidebar(frame, regions.sidebar, state);
+    }
     render_tab_bar(frame, regions.tab_bar, state);
     render_terminal(frame, regions.terminal, state);
     render_action_bar(frame, regions.action_bar, state, &regions);
@@ -926,10 +928,11 @@ fn help_lines(theme: &Theme, state: &AppState) -> Vec<Line<'static>> {
     lines.push(kr(A::PrevTab));
     lines.push(Line::from(""));
 
-    lines.push(header("SIDEBAR WIDTH".into()));
+    lines.push(header("SIDEBAR".into()));
     lines.push(kr(A::SidebarGrow));
     lines.push(kr(A::SidebarShrink));
     lines.push(kr(A::SidebarReset));
+    lines.push(kr(A::ToggleSidebar));
     lines.push(Line::from(""));
 
     lines.push(header("LEADER".into()));

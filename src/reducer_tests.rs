@@ -1276,6 +1276,67 @@ fn space_leader_l_opens_launch_popup() {
 }
 
 #[test]
+fn space_leader_s_toggles_sidebar() {
+    let mut s = AppState::new();
+    s.term_size = TermSize::new(40, 200);
+    assert!(!s.sidebar_hidden);
+    let _ = reduce(&mut s, Action::Key(plain(' ')));
+    let cmds = reduce(&mut s, Action::Key(plain('s')));
+    assert!(s.sidebar_hidden);
+    assert!(s.pending_chord.is_empty());
+    assert!(matches!(cmds.as_slice(), [Command::SaveGlobalConfig]));
+
+    let _ = reduce(&mut s, Action::Key(plain(' ')));
+    let _ = reduce(&mut s, Action::Key(plain('s')));
+    assert!(!s.sidebar_hidden);
+}
+
+#[test]
+fn toggling_sidebar_hidden_gives_columns_back_to_the_pty() {
+    let mut s = AppState::new();
+    s.term_size = TermSize::new(40, 200);
+    s.projects = mock_projects();
+    let fake = FakeSession::new(7);
+    let _ = reduce(
+        &mut s,
+        Action::SessionSpawned {
+            session: fake,
+            dest: (0, 0),
+        },
+    );
+    let _ = reduce(&mut s, Action::Key(plain(' ')));
+    let cmds = reduce(&mut s, Action::Key(plain('s')));
+    // Terminal rows are 40 - 1 (action bar) - 2 (tab bar); with the sidebar
+    // hidden it spans the full 200 columns.
+    assert!(matches!(
+        cmds.as_slice(),
+        [Command::ResizePty(7, 37, 200), Command::SaveGlobalConfig]
+    ));
+}
+
+#[test]
+fn hiding_sidebar_moves_focus_to_terminal() {
+    let mut s = AppState::new();
+    s.term_size = TermSize::new(40, 200);
+    s.ui_focus = UiFocus::Sidebar;
+    let _ = reduce(&mut s, Action::Key(plain(' ')));
+    let _ = reduce(&mut s, Action::Key(plain('s')));
+    assert_eq!(s.ui_focus, UiFocus::Terminal);
+}
+
+#[test]
+fn focusing_sidebar_reveals_it_again() {
+    let mut s = AppState::new();
+    s.term_size = TermSize::new(40, 200);
+    let _ = reduce(&mut s, Action::Key(plain(' ')));
+    let _ = reduce(&mut s, Action::Key(plain('s')));
+    assert!(s.sidebar_hidden);
+    let _ = reduce(&mut s, Action::Key(plain('h')));
+    assert!(!s.sidebar_hidden);
+    assert_eq!(s.ui_focus, UiFocus::Sidebar);
+}
+
+#[test]
 fn space_leader_q_quits() {
     let mut s = AppState::new();
     let _ = reduce(&mut s, Action::Key(plain(' ')));
@@ -2426,7 +2487,7 @@ fn ctrl_p_opens_palette_in_normal_mode() {
     assert!(cmds.is_empty());
     let popup = s.palette_popup.as_ref().expect("palette open");
     assert_eq!(popup.filtered.len(), popup.entries.len());
-    assert_eq!(popup.entries.len(), 32);
+    assert_eq!(popup.entries.len(), 33);
 }
 
 #[test]

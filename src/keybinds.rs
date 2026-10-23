@@ -41,6 +41,7 @@ pub enum BindableAction {
     SidebarGrow,
     SidebarShrink,
     SidebarReset,
+    ToggleSidebar,
     OpenProjectPopup,
     RemoveProject,
     NewWorktree,
@@ -75,6 +76,7 @@ impl BindableAction {
             Self::SidebarGrow => "sidebar_grow",
             Self::SidebarShrink => "sidebar_shrink",
             Self::SidebarReset => "sidebar_reset",
+            Self::ToggleSidebar => "toggle_sidebar",
             Self::OpenProjectPopup => "open_project_popup",
             Self::RemoveProject => "remove_project",
             Self::NewWorktree => "new_worktree",
@@ -110,6 +112,7 @@ impl BindableAction {
             Self::SidebarGrow => "grow the sidebar",
             Self::SidebarShrink => "shrink the sidebar",
             Self::SidebarReset => "reset sidebar width",
+            Self::ToggleSidebar => "show/hide the sidebar",
             Self::OpenProjectPopup => "open project popup",
             Self::RemoveProject => "remove project",
             Self::NewWorktree => "new worktree",
@@ -148,6 +151,7 @@ pub const ALL: &[BindableAction] = &[
     BindableAction::SidebarGrow,
     BindableAction::SidebarShrink,
     BindableAction::SidebarReset,
+    BindableAction::ToggleSidebar,
     BindableAction::OpenProjectPopup,
     BindableAction::RemoveProject,
     BindableAction::NewWorktree,
@@ -292,6 +296,7 @@ pub fn defaults() -> KeyMap {
     add_n(&mut normal, "<C-w><", BindableAction::SidebarShrink);
     add_n(&mut normal, "<C-w>=", BindableAction::SidebarReset);
     add_n(&mut normal, "<Space>o", BindableAction::OpenProjectPopup);
+    add_n(&mut normal, "<Space>s", BindableAction::ToggleSidebar);
     add_n(&mut normal, "<Space>P", BindableAction::RemoveProject);
     add_n(&mut normal, "<Space>w", BindableAction::NewWorktree);
     add_n(&mut normal, "<Space>W", BindableAction::RemoveWorktree);

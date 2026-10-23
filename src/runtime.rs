@@ -43,6 +43,7 @@ pub async fn run() -> Result<()> {
     state.config_dir = config_dir.clone();
     state.supervisors = supervisors.directory();
     state.sidebar_width = global.sidebar_width;
+    state.sidebar_hidden = global.sidebar_hidden;
     state.theme = Theme::for_kind(global.theme);
     state.global_launchers = global
         .launchers
@@ -588,6 +589,7 @@ fn execute(
             let disk = config::load_global(&state.config_dir).ok();
             let global = config::GlobalConfig {
                 sidebar_width: state.sidebar_width,
+                sidebar_hidden: state.sidebar_hidden,
                 theme: state.theme.kind,
                 projects: state_slugs(state),
                 launchers: state

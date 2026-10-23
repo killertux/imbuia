@@ -83,6 +83,7 @@ cargo build --release
 | `gt` / `gT`               | Next / previous tab.                                            |
 | `<Space>`                 | Open the leader menu (which-key style overlay; see below).      |
 | `Ctrl-W >` / `<` / `=`    | Grow / shrink / reset sidebar width.                            |
+| `<Space> s`               | Show / hide the sidebar.                                        |
 | `i`                       | Enter Terminal mode (keys forwarded to the PTY).                |
 | `Ctrl-\ Ctrl-N`           | Leave Terminal mode (Neovim-style).                             |
 | `:`                       | Enter Command mode.                                             |
@@ -98,6 +99,7 @@ available follow-up keys. The current bindings:
 | Chord          | What it does                                  |
 |----------------|-----------------------------------------------|
 | `<Space> o`    | Open project popup (path + setup script).     |
+| `<Space> s`    | Show / hide the sidebar panel.                |
 | `<Space> P`    | Remove project popup (optional file deletion).|
 | `<Space> w`    | New worktree popup.                           |
 | `<Space> W`    | Remove the selected worktree.                 |
@@ -184,7 +186,7 @@ Everything is persisted under `$XDG_CONFIG_HOME/imbuia/` (default
 
 ```
 ~/.config/imbuia/
-├── config.toml           # global: sidebar_width, theme, project list
+├── config.toml           # global: sidebar_width, sidebar_hidden, theme, project list
 └── projects/
     ├── myrepo.toml       # per-project: name, path, expanded,
     │                     #              setup_script, worktrees, launchers

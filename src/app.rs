@@ -364,6 +364,9 @@ pub struct AppState {
     /// Currently active worktree whose tabs are shown in the tab bar.
     pub active_worktree: Option<(usize, usize)>,
     pub sidebar_width: u16,
+    /// Whether the sidebar is collapsed (`<Space>s`). Persisted in the global
+    /// config alongside `sidebar_width`.
+    pub sidebar_hidden: bool,
     /// First visible row of the sidebar tree (scroll offset).
     pub sidebar_scroll: u16,
     /// Chord accumulator for the keymap matcher. Empty when no multi-key
@@ -463,6 +466,7 @@ impl AppState {
             sidebar_selection: None,
             active_worktree: None,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            sidebar_hidden: false,
             sidebar_scroll: 0,
             pending_chord: SmallVec::new(),
             pending_terminal_keys: SmallVec::new(),
