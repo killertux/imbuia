@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 pub struct GlobalConfig {
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: u16,
+    /// Whether the sidebar starts collapsed. Toggled with `<Space>s`; absent
+    /// (the default) means visible.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sidebar_hidden: bool,
     #[serde(default)]
     pub theme: ThemeKind,
     #[serde(default)]
@@ -66,6 +70,7 @@ impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            sidebar_hidden: false,
             theme: ThemeKind::default(),
             projects: Vec::new(),
             launchers: Vec::new(),
@@ -79,6 +84,10 @@ impl Default for GlobalConfig {
 
 fn default_sidebar_width() -> u16 {
     DEFAULT_SIDEBAR_WIDTH
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,6 +425,7 @@ mod tests {
         fs::create_dir_all(dir.join("projects")).unwrap();
         let global = GlobalConfig {
             sidebar_width: 30,
+            sidebar_hidden: false,
             theme: ThemeKind::default(),
             projects: vec!["../etc".into(), "ok".into()],
             launchers: Vec::new(),
@@ -498,6 +508,7 @@ mod tests {
 
         let global = GlobalConfig {
             sidebar_width: 30,
+            sidebar_hidden: true,
             theme: ThemeKind::Light,
             projects: vec!["foo".into()],
             launchers: Vec::new(),
@@ -509,6 +520,7 @@ mod tests {
         save_global(&dir, &global).unwrap();
         let loaded = load_global(&dir).unwrap();
         assert_eq!(loaded.sidebar_width, 30);
+        assert!(loaded.sidebar_hidden);
         assert_eq!(loaded.theme, ThemeKind::Light);
         assert_eq!(loaded.projects, vec!["foo"]);
 
