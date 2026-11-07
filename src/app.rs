@@ -54,6 +54,10 @@ pub struct SupervisorDirectory {
     /// `SupervisorClient` is attached, so the sidebar can gray out projects
     /// whose host is currently unreachable.
     pub connected: std::collections::HashSet<SupervisorId>,
+    /// Remotes whose link dropped and which the runtime is currently re-dialing
+    /// with backoff. They are not connected (commands fail while retrying) but
+    /// aren't grayed out yet — the sidebar shows `⟳` instead of `✗`.
+    pub reconnecting: std::collections::HashSet<SupervisorId>,
 }
 
 impl SupervisorDirectory {
@@ -61,6 +65,7 @@ impl SupervisorDirectory {
         Self {
             entries: vec![(LOCAL, "local".to_string())],
             connected: std::iter::once(LOCAL).collect(),
+            reconnecting: std::collections::HashSet::new(),
         }
     }
 
@@ -68,6 +73,11 @@ impl SupervisorDirectory {
     /// (it's auto-spawned and required for the app to run at all).
     pub fn is_connected(&self, id: SupervisorId) -> bool {
         id == LOCAL || self.connected.contains(&id)
+    }
+
+    /// Whether a background reconnect is in flight for `id`.
+    pub fn is_reconnecting(&self, id: SupervisorId) -> bool {
+        self.reconnecting.contains(&id)
     }
 
     pub fn name_of(&self, id: SupervisorId) -> &str {
@@ -701,11 +711,17 @@ pub enum Action {
     },
     /// Runtime → reducer: an async operation failed; show the message.
     OperationFailed(String),
-    /// A supervisor connection ended (steal-on-attach, socket EOF, read error).
-    /// Losing the **local** supervisor wipes the session map and exits; losing a
-    /// **remote** just drops that supervisor's sessions and shows a message —
-    /// the rest of the app keeps running.
+    /// A supervisor connection ended (steal-on-attach, socket EOF, read/write
+    /// error, or heartbeat timeout). Losing the **local** supervisor wipes the
+    /// session map and exits; losing a **remote** drops that supervisor's
+    /// sessions and starts a background reconnect with backoff — it is only
+    /// marked disconnected if every attempt fails.
     SupervisorLost(SupervisorId, String),
+    /// The supervisor sent `Detached` because another client attached (the
+    /// supervisor serves one client at a time). Treated like a loss for the UI,
+    /// but **without** auto-reconnect: re-dialing would steal the slot back and
+    /// bounce both clients forever. The user can run `:reconnect` explicitly.
+    SupervisorDetached(SupervisorId, String),
     /// Runtime → runtime: a (re)connection to a remote supervisor succeeded.
     /// Handled entirely in `runtime` (it mutates the live `client::Supervisors`
     /// registry, which the pure reducer can't touch) — installs the client,
@@ -713,6 +729,22 @@ pub enum Action {
     SupervisorConnected {
         id: SupervisorId,
         client: Arc<crate::client::SupervisorClient>,
+    },
+    /// Runtime → reducer: a background reconnect attempt is starting after a
+    /// remote link loss. Keeps the status row informed while the runtime dials
+    /// with backoff; the sidebar's `⟳` marker comes from
+    /// [`SupervisorDirectory::reconnecting`].
+    SupervisorReconnecting {
+        id: SupervisorId,
+        attempt: u32,
+        max_attempts: u32,
+    },
+    /// Runtime → reducer: every reconnect attempt failed, so the remote is now
+    /// fully disconnected (its sessions were already dropped when the link was
+    /// first declared lost).
+    SupervisorReconnectFailed {
+        id: SupervisorId,
+        reason: String,
     },
     /// Supervisor → reducer: a fresh resource-usage snapshot from one
     /// supervisor (tagged so the popup can segregate per-supervisor).
@@ -825,9 +857,29 @@ impl std::fmt::Debug for Action {
             Action::SupervisorLost(sup, s) => {
                 f.debug_tuple("SupervisorLost").field(sup).field(s).finish()
             }
+            Action::SupervisorDetached(sup, s) => f
+                .debug_tuple("SupervisorDetached")
+                .field(sup)
+                .field(s)
+                .finish(),
             Action::SupervisorConnected { id, .. } => f
                 .debug_struct("SupervisorConnected")
                 .field("id", id)
+                .finish(),
+            Action::SupervisorReconnecting {
+                id,
+                attempt,
+                max_attempts,
+            } => f
+                .debug_struct("SupervisorReconnecting")
+                .field("id", id)
+                .field("attempt", attempt)
+                .field("max_attempts", max_attempts)
+                .finish(),
+            Action::SupervisorReconnectFailed { id, reason } => f
+                .debug_struct("SupervisorReconnectFailed")
+                .field("id", id)
+                .field("reason", reason)
                 .finish(),
             Action::UsageReceived(sup, _) => f
                 .debug_struct("UsageReceived")

@@ -16,13 +16,14 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{Notify, mpsc};
 use tokio_rustls::TlsConnector;
+use tokio_util::sync::CancellationToken;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 /// Boxed read/write halves of whatever transport the client attached over (a
@@ -30,6 +31,86 @@ use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 /// `AsyncWrite`, so the framing + handshake code is transport-agnostic.
 type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
 type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
+
+/// Liveness bookkeeping shared by one connection's reader, writer and heartbeat
+/// tasks. `last_rx` is bumped on every inbound frame (output, pong, usage — any
+/// traffic proves the link is alive); `lost` makes sure only the first task to
+/// notice a failure reports it.
+struct LinkHealth {
+    lost: AtomicBool,
+    last_rx: Mutex<Instant>,
+}
+
+/// The socket reader, plus the state needed to start it. Kept on the client
+/// until the runtime has processed `Action::SupervisorConnected`, so a `Lost`
+/// from a brand-new link can never be processed before its matching
+/// `Connected` (which would leave a dead client installed).
+struct PendingReader {
+    rd: BoxRead,
+    health: Arc<LinkHealth>,
+    cancel: CancellationToken,
+}
+
+/// Report a link as dead, exactly once, and tear down the connection's tasks.
+/// Called from the reader, writer or heartbeat — whichever notices first wins;
+/// the cancellation token stops the others.
+fn mark_lost(
+    health: &Arc<LinkHealth>,
+    cancel: &CancellationToken,
+    action_tx: &mpsc::Sender<Action>,
+    sup_id: crate::app::SupervisorId,
+    reason: String,
+) {
+    cancel.cancel();
+    if health.lost.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tracing::warn!(?sup_id, %reason, "supervisor link lost");
+    // The caller may be a task that must not block (the writer). Posting from a
+    // spawned task keeps a full action channel from wedging the connection.
+    let tx = action_tx.clone();
+    tokio::spawn(async move {
+        let _ = tx.send(Action::SupervisorLost(sup_id, reason)).await;
+    });
+}
+
+/// Same teardown as [`mark_lost`], but for a clean `Detached` notice (another
+/// client stole the supervisor's single-client slot). Deliberately a distinct
+/// action: auto-reconnecting here would fight the new owner in a steal loop.
+fn mark_detached(
+    health: &Arc<LinkHealth>,
+    cancel: &CancellationToken,
+    action_tx: &mpsc::Sender<Action>,
+    sup_id: crate::app::SupervisorId,
+    reason: String,
+) {
+    cancel.cancel();
+    if health.lost.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tracing::warn!(?sup_id, %reason, "detached from supervisor");
+    let tx = action_tx.clone();
+    tokio::spawn(async move {
+        let _ = tx.send(Action::SupervisorDetached(sup_id, reason)).await;
+    });
+}
+
+/// Write one frame, aborting when the connection is cancelled. A write to a
+/// black-holed peer can otherwise park the writer for the kernel's entire TCP
+/// retransmit budget, long after the heartbeat declared the link dead.
+/// `None` means cancelled before/while writing.
+async fn write_or_cancel(
+    wr: &mut BoxWrite,
+    msg: &ClientMsg,
+    compress: bool,
+    cancel: &CancellationToken,
+) -> Option<Result<()>> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        res = ipc::write_frame_async(wr, msg, compress) => Some(res),
+    }
+}
 
 /// Per-session local state held client-side. The vt100 parser is fed by
 /// frames arriving from the supervisor (Dump on attach, Delta as live PTY
@@ -425,9 +506,47 @@ pub struct SupervisorClient {
     /// Resumed sessions reported by the supervisor at handshake. Empty after
     /// `drain_initial_sessions` is called.
     initial_sessions: Mutex<Vec<SessionMeta>>,
+    /// Cancels the writer + heartbeat + reader tasks for this connection.
+    cancel: CancellationToken,
+    /// Reader halves awaiting `start_reader` (see [`PendingReader`]).
+    reader_pending: Mutex<Option<PendingReader>>,
+}
+
+impl Drop for SupervisorClient {
+    fn drop(&mut self) {
+        // Cancelling stops the writer/heartbeat tasks even when the reader was
+        // never started (e.g. a duplicate dial dropped as a spare), so an
+        // abandoned connection can't linger with a half-open socket.
+        self.cancel.cancel();
+        if let Ok(mut slot) = self.reader_pending.lock()
+            && let Some(pending) = slot.take()
+        {
+            pending.cancel.cancel();
+        }
+    }
 }
 
 impl SupervisorClient {
+    /// Spawn the inbound-frame reader. Called by the runtime exactly once, from
+    /// `SupervisorConnected` / attach handling, *after* this client has been
+    /// installed in the registry and its resumed sessions re-bound. Starting it
+    /// here (rather than inside `handshake`) guarantees any `SupervisorLost`
+    /// this reader posts is ordered after the `SupervisorConnected` that
+    /// installed it.
+    pub fn start_reader(self: &Arc<Self>, action_tx: mpsc::Sender<Action>) {
+        let pending = self.reader_pending.lock().unwrap().take();
+        let Some(pending) = pending else {
+            return;
+        };
+        spawn_reader(
+            Arc::clone(self),
+            pending.rd,
+            action_tx,
+            pending.health,
+            pending.cancel,
+        );
+    }
+
     /// Take the list of pre-existing sessions reported during the handshake,
     /// leaving the slot empty.
     pub fn drain_initial_sessions(&self) -> Vec<SessionMeta> {
@@ -641,6 +760,9 @@ struct SupervisorEntry {
     /// Remote URL (`host:port`) to (re)dial; `None` for the local supervisor.
     url: Option<String>,
     client: Option<Arc<SupervisorClient>>,
+    /// A background dial is in progress after a link loss. The sidebar shows a
+    /// `⟳` marker instead of graying the project out until it gives up.
+    reconnecting: bool,
 }
 
 impl Supervisors {
@@ -664,6 +786,14 @@ impl Supervisors {
         self.get(id).is_some()
     }
 
+    /// Whether a background reconnect is in flight for `id`.
+    pub fn is_reconnecting(&self, id: crate::app::SupervisorId) -> bool {
+        self.entries
+            .iter()
+            .find(|e| e.id == id)
+            .is_some_and(|e| e.reconnecting)
+    }
+
     /// The configured URL for a remote `id`, if any (`None` for local/unknown).
     pub fn url_of(&self, id: crate::app::SupervisorId) -> Option<String> {
         self.entries
@@ -681,13 +811,26 @@ impl Supervisors {
     pub fn set_client(&mut self, id: crate::app::SupervisorId, client: Arc<SupervisorClient>) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
             e.client = Some(client);
+            e.reconnecting = false;
         }
     }
 
-    /// Drop a supervisor's connection (it died / detached); reconnect re-dials.
+    /// Mark a remote as *retrying* after its link dropped: the connection is
+    /// gone (so commands can't be routed), but the UI keeps the `⟳` marker up
+    /// and the runtime keeps dialing in the background until it gives up.
+    pub fn mark_reconnecting(&mut self, id: crate::app::SupervisorId) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+            e.client = None;
+            e.reconnecting = true;
+        }
+    }
+
+    /// Drop a supervisor's connection (it died / detached / retries exhausted);
+    /// reconnect re-dials.
     pub fn mark_disconnected(&mut self, id: crate::app::SupervisorId) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
             e.client = None;
+            e.reconnecting = false;
         }
     }
 
@@ -720,6 +863,12 @@ impl Supervisors {
                 .filter(|e| e.client.is_some())
                 .map(|e| e.id)
                 .collect(),
+            reconnecting: self
+                .entries
+                .iter()
+                .filter(|e| e.reconnecting)
+                .map(|e| e.id)
+                .collect(),
         }
     }
 }
@@ -750,11 +899,16 @@ pub async fn connect_all(
         false, // local UDS: no compression
     )
     .await?;
+    // START the local reader before returning (the runtime re-binds resumed
+    // sessions right after `connect_all`). No Connected action race here: the
+    // local connection is synchronous and its loss is terminal.
+    local.start_reader(action_tx.clone());
     let mut entries = vec![SupervisorEntry {
         id: LOCAL,
         name: "local".into(),
         url: None,
         client: Some(local),
+        reconnecting: false,
     }];
 
     // Remotes: seed disconnected entries (numbered in config order). The
@@ -765,6 +919,7 @@ pub async fn connect_all(
             name,
             url: Some(cfg.url),
             client: None,
+            reconnecting: false,
         });
     }
 
@@ -836,8 +991,8 @@ async fn connect_remote(config_dir: &Path, url: &str) -> Result<(BoxRead, BoxWri
 }
 
 async fn handshake(
-    mut rd: BoxRead,
-    mut wr: BoxWrite,
+    rd: BoxRead,
+    wr: BoxWrite,
     sup_id: crate::app::SupervisorId,
     global_ids: Arc<AtomicU64>,
     notify: Arc<Notify>,
@@ -845,6 +1000,34 @@ async fn handshake(
     // Compress large outbound frames — `true` for remote (TCP) connections,
     // `false` for the local UDS (pointless there).
     compress: bool,
+) -> Result<Arc<SupervisorClient>> {
+    handshake_with_timings(
+        rd,
+        wr,
+        sup_id,
+        global_ids,
+        notify,
+        action_tx,
+        compress,
+        ipc::HEARTBEAT_INTERVAL,
+        ipc::HEARTBEAT_TIMEOUT,
+    )
+    .await
+}
+
+/// [`handshake`] with injectable heartbeat timings (the liveness tests drive
+/// them down to milliseconds).
+#[allow(clippy::too_many_arguments)]
+async fn handshake_with_timings(
+    mut rd: BoxRead,
+    mut wr: BoxWrite,
+    sup_id: crate::app::SupervisorId,
+    global_ids: Arc<AtomicU64>,
+    notify: Arc<Notify>,
+    action_tx: mpsc::Sender<Action>,
+    compress: bool,
+    heartbeat_interval: Duration,
+    heartbeat_timeout: Duration,
 ) -> Result<Arc<SupervisorClient>> {
     // Bounded handshake: a half-dead supervisor that accepts but never replies
     // must not hang the TUI.
@@ -874,68 +1057,191 @@ async fn handshake(
         }
     };
 
+    // Liveness: any inbound frame bumps `last_rx`; the heartbeat declares the
+    // link dead if none arrives for `HEARTBEAT_TIMEOUT`. This is what turns a
+    // silently black-holed remote link (sleep/Wi-Fi handoff/NAT timeout) from
+    // "typing does nothing for minutes" into a disconnect within ~15s.
+    let health = Arc::new(LinkHealth {
+        lost: AtomicBool::new(false),
+        last_rx: Mutex::new(Instant::now()),
+    });
+    let cancel = CancellationToken::new();
+
     // Writer task: drains an unbounded queue and writes frames. Runtime code
     // only ever does `tx.send(msg)` (O(1), non-blocking), so paste floods and a
     // back-pressured supervisor can't freeze the TUI.
     let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
     let (upload_tx, mut upload_rx) = mpsc::channel::<UploadJob>(2);
-    tokio::spawn(async move {
-        'writer: loop {
-            tokio::select! {
-                biased;
-                Some(msg) = rx.recv() => {
-                    if let Err(e) = ipc::write_frame_async(&mut wr, &msg, compress).await {
-                        tracing::warn!("supervisor write loop exiting: {e}");
-                        break;
-                    }
-                }
-                Some(job) = upload_rx.recv() => {
-                    let size = job.bytes.len() as u64;
-                    let start = ClientMsg::UploadStart {
-                        request_id: job.request_id,
-                        id: job.id,
-                        file_name: job.file_name,
-                        size,
-                    };
-                    if ipc::write_frame_async(&mut wr, &start, compress).await.is_err() {
-                        break;
-                    }
-                    let mut hasher = Sha256::new();
-                    const CHUNK: usize = 64 * 1024;
-                    for (index, chunk) in job.bytes.chunks(CHUNK).enumerate() {
-                        // Preserve terminal latency: drain control traffic
-                        // between file chunks rather than queueing a whole file
-                        // in front of keystrokes and resizes.
-                        while let Ok(msg) = rx.try_recv() {
-                            if ipc::write_frame_async(&mut wr, &msg, compress).await.is_err() {
+    {
+        let health = Arc::clone(&health);
+        let cancel = cancel.clone();
+        let action_tx = action_tx.clone();
+        tokio::spawn(async move {
+            'writer: loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break 'writer,
+                    Some(msg) = rx.recv() => {
+                        match write_or_cancel(&mut wr, &msg, compress, &cancel).await {
+                            None => break 'writer,
+                            Some(Err(e)) => {
+                                mark_lost(
+                                    &health,
+                                    &cancel,
+                                    &action_tx,
+                                    sup_id,
+                                    format!("write failed: {e}"),
+                                );
                                 break 'writer;
                             }
+                            Some(Ok(())) => {}
                         }
-                        hasher.update(chunk);
-                        let msg = ClientMsg::UploadChunk {
-                            request_id: job.request_id,
-                            offset: (index * CHUNK) as u64,
-                            bytes: chunk.to_vec(),
-                        };
-                        if ipc::write_frame_async(&mut wr, &msg, compress).await.is_err() {
-                            break 'writer;
-                        }
-                        tokio::task::yield_now().await;
                     }
-                    let msg = ClientMsg::UploadFinish {
-                        request_id: job.request_id,
-                        sha256: hasher.finalize().into(),
-                    };
-                    if ipc::write_frame_async(&mut wr, &msg, compress).await.is_err() {
-                        break;
+                    Some(job) = upload_rx.recv() => {
+                        let size = job.bytes.len() as u64;
+                        let start = ClientMsg::UploadStart {
+                            request_id: job.request_id,
+                            id: job.id,
+                            file_name: job.file_name,
+                            size,
+                        };
+                        match write_or_cancel(&mut wr, &start, compress, &cancel).await {
+                            None => break 'writer,
+                            Some(Err(e)) => {
+                                mark_lost(
+                                    &health,
+                                    &cancel,
+                                    &action_tx,
+                                    sup_id,
+                                    format!("upload write failed: {e}"),
+                                );
+                                break 'writer;
+                            }
+                            Some(Ok(())) => {}
+                        }
+                        let mut hasher = Sha256::new();
+                        const CHUNK: usize = 64 * 1024;
+                        for (index, chunk) in job.bytes.chunks(CHUNK).enumerate() {
+                            // Preserve terminal latency: drain control traffic
+                            // between file chunks rather than queueing a whole file
+                            // in front of keystrokes and resizes.
+                            while let Ok(msg) = rx.try_recv() {
+                                match write_or_cancel(&mut wr, &msg, compress, &cancel).await {
+                                    None => break 'writer,
+                                    Some(Err(e)) => {
+                                        mark_lost(
+                                            &health,
+                                            &cancel,
+                                            &action_tx,
+                                            sup_id,
+                                            format!("write failed: {e}"),
+                                        );
+                                        break 'writer;
+                                    }
+                                    Some(Ok(())) => {}
+                                }
+                            }
+                            hasher.update(chunk);
+                            let msg = ClientMsg::UploadChunk {
+                                request_id: job.request_id,
+                                offset: (index * CHUNK) as u64,
+                                bytes: chunk.to_vec(),
+                            };
+                            match write_or_cancel(&mut wr, &msg, compress, &cancel).await {
+                                None => break 'writer,
+                                Some(Err(e)) => {
+                                    mark_lost(
+                                        &health,
+                                        &cancel,
+                                        &action_tx,
+                                        sup_id,
+                                        format!("upload write failed: {e}"),
+                                    );
+                                    break 'writer;
+                                }
+                                Some(Ok(())) => {}
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                        let msg = ClientMsg::UploadFinish {
+                            request_id: job.request_id,
+                            sha256: hasher.finalize().into(),
+                        };
+                        match write_or_cancel(&mut wr, &msg, compress, &cancel).await {
+                            None => break 'writer,
+                            Some(Err(e)) => {
+                                mark_lost(
+                                    &health,
+                                    &cancel,
+                                    &action_tx,
+                                    sup_id,
+                                    format!("upload write failed: {e}"),
+                                );
+                                break 'writer;
+                            }
+                            Some(Ok(())) => {}
+                        }
+                    }
+                    else => break 'writer,
+                }
+            }
+        });
+    }
+
+    // Heartbeat task: probe the supervisor on a fixed cadence and bail out when
+    // nothing has come back for `HEARTBEAT_TIMEOUT`. Runs for every connection
+    // (local UDS too) — a hung supervisor is just as silent as a dead network.
+    {
+        let tx = tx.clone();
+        let health = Arc::clone(&health);
+        let cancel = cancel.clone();
+        let action_tx = action_tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(heartbeat_interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut nonce = 0u64;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = tick.tick() => {
+                        let idle = health
+                            .last_rx
+                            .lock()
+                            .map(|t| t.elapsed())
+                            .unwrap_or_default();
+                        if idle >= heartbeat_timeout {
+                            mark_lost(
+                                &health,
+                                &cancel,
+                                &action_tx,
+                                sup_id,
+                                format!(
+                                    "no response from supervisor for {}s",
+                                    idle.as_secs()
+                                ),
+                            );
+                            break;
+                        }
+                        nonce = nonce.wrapping_add(1);
+                        if tx.send(ClientMsg::Ping { nonce }).is_err() {
+                            mark_lost(
+                                &health,
+                                &cancel,
+                                &action_tx,
+                                sup_id,
+                                "supervisor writer task is gone".into(),
+                            );
+                            break;
+                        }
                     }
                 }
-                else => break,
             }
-        }
-    });
+        });
+    }
 
     let next_request = Arc::new(AtomicU64::new(1));
+    let reader_token = cancel.clone();
     let client = Arc::new(SupervisorClient {
         sup_id,
         tx,
@@ -948,26 +1254,53 @@ async fn handshake(
         notify,
         next_request,
         initial_sessions: Mutex::new(sessions),
+        cancel,
+        reader_pending: Mutex::new(Some(PendingReader {
+            rd,
+            health,
+            cancel: reader_token,
+        })),
     });
 
-    spawn_reader(Arc::clone(&client), rd, action_tx);
+    // The reader is started by `start_reader` once the runtime has processed
+    // `Action::SupervisorConnected` (see its doc comment). Starting it inside
+    // the handshake would let a `SupervisorLost` from this connection race
+    // ahead of the `Connected` that installs it.
     Ok(client)
 }
 
-fn spawn_reader(client: Arc<SupervisorClient>, mut rd: BoxRead, action_tx: mpsc::Sender<Action>) {
+fn spawn_reader(
+    client: Arc<SupervisorClient>,
+    mut rd: BoxRead,
+    action_tx: mpsc::Sender<Action>,
+    health: Arc<LinkHealth>,
+    cancel: CancellationToken,
+) {
     tokio::spawn(async move {
         loop {
-            let msg: SupervisorMsg = match ipc::read_frame_async(&mut rd).await {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!("supervisor read ended: {e}");
-                    let _ = action_tx
-                        .send(Action::SupervisorLost(client.sup_id, format!("{e}")))
-                        .await;
-                    return;
-                }
+            let msg: SupervisorMsg = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                r = ipc::read_frame_async(&mut rd) => match r {
+                    Ok(m) => m,
+                    Err(e) => {
+                        mark_lost(
+                            &health,
+                            &cancel,
+                            &action_tx,
+                            client.sup_id,
+                            format!("read failed: {e}"),
+                        );
+                        return;
+                    }
+                },
             };
+            // Any frame — output, pong, usage — proves the link is alive.
+            if let Ok(mut last) = health.last_rx.lock() {
+                *last = Instant::now();
+            }
             match msg {
+                SupervisorMsg::Pong { .. } => {}
                 SupervisorMsg::Spawned { request_id, id } => {
                     // Bind in a statement so the MutexGuard drops before the
                     // later `.await` (a held std guard isn't Send).
@@ -1060,9 +1393,7 @@ fn spawn_reader(client: Arc<SupervisorClient>, mut rd: BoxRead, action_tx: mpsc:
                     }
                 }
                 SupervisorMsg::Detached { reason } => {
-                    let _ = action_tx
-                        .send(Action::SupervisorLost(client.sup_id, reason))
-                        .await;
+                    mark_detached(&health, &cancel, &action_tx, client.sup_id, reason);
                     return;
                 }
                 SupervisorMsg::Usage(report) => {
@@ -1265,6 +1596,119 @@ fn encode_mouse(ev: MouseEvent, mode: MouseProtocolMode, enc: MouseProtocolEncod
             let cy_byte = (row + 32).min(255) as u8;
             vec![0x1b, b'[', b'M', cb_byte, cx_byte, cy_byte]
         }
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    use crate::ipc::{HandshakeReq, HandshakeResp, PROTOCOL_VERSION};
+
+    const INTERVAL: Duration = Duration::from_millis(20);
+
+    /// Fake supervisor: complete the handshake, then answer `Ping`s (or stay
+    /// silent) on the peer half of a duplex stream.
+    async fn fake_supervisor(peer: tokio::io::DuplexStream, answer_pings: bool) {
+        let (mut prd, mut pwr) = tokio::io::split(peer);
+        let req: HandshakeReq = ipc::read_frame_async(&mut prd).await.unwrap();
+        assert_eq!(req.protocol, PROTOCOL_VERSION);
+        let resp = HandshakeResp::Ok {
+            supervisor_pid: 1,
+            sessions: vec![],
+        };
+        ipc::write_frame_async(&mut pwr, &resp, false)
+            .await
+            .unwrap();
+        loop {
+            match ipc::read_frame_async::<_, ClientMsg>(&mut prd).await {
+                Ok(ClientMsg::Ping { nonce }) if answer_pings => {
+                    if ipc::write_frame_async(&mut pwr, &SupervisorMsg::Pong { nonce }, false)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                // Silent variant: drain the probe and never answer.
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    }
+
+    async fn connect_silent_with(
+        action_tx: &mpsc::Sender<Action>,
+        timeout: Duration,
+    ) -> Arc<SupervisorClient> {
+        let (client_stream, peer) = tokio::io::duplex(64 * 1024);
+        let (rd, wr) = tokio::io::split(client_stream);
+        let _fake = tokio::spawn(fake_supervisor(peer, false));
+        let client = handshake_with_timings(
+            Box::new(rd),
+            Box::new(wr),
+            crate::app::LOCAL,
+            Arc::new(AtomicU64::new(1)),
+            Arc::new(Notify::new()),
+            action_tx.clone(),
+            false,
+            INTERVAL,
+            timeout,
+        )
+        .await
+        .expect("handshake against fake supervisor");
+        client.start_reader(action_tx.clone());
+        client
+    }
+
+    #[tokio::test]
+    async fn silent_supervisor_is_declared_lost() {
+        let (action_tx, mut action_rx) = mpsc::channel(8);
+        let _client = connect_silent_with(&action_tx, Duration::from_millis(200)).await;
+
+        let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+            .await
+            .expect("heartbeat should notice the silent supervisor")
+            .expect("action channel open");
+        match action {
+            Action::SupervisorLost(crate::app::LOCAL, reason) => {
+                assert!(
+                    reason.contains("no response"),
+                    "unexpected loss reason: {reason}"
+                );
+            }
+            other => panic!("expected SupervisorLost, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pongs_keep_the_link_alive() {
+        let (action_tx, mut action_rx) = mpsc::channel(8);
+        let (client_stream, peer) = tokio::io::duplex(64 * 1024);
+        let (rd, wr) = tokio::io::split(client_stream);
+        let fake = tokio::spawn(fake_supervisor(peer, true));
+        let client = handshake_with_timings(
+            Box::new(rd),
+            Box::new(wr),
+            crate::app::LOCAL,
+            Arc::new(AtomicU64::new(1)),
+            Arc::new(Notify::new()),
+            action_tx.clone(),
+            false,
+            INTERVAL,
+            Duration::from_millis(200),
+        )
+        .await
+        .expect("handshake against fake supervisor");
+        client.start_reader(action_tx.clone());
+
+        // Several heartbeat cycles, well past the timeout: an answering link
+        // must never be declared lost.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            action_rx.try_recv().is_err(),
+            "responsive supervisor must not be marked lost"
+        );
+        fake.abort();
     }
 }
 

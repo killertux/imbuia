@@ -250,6 +250,72 @@ fn spawn_remote_connect(
     });
 }
 
+/// How a dropped remote is re-dialed. First attempt is immediate (the link may
+/// have died on a transient blip), then each failure waits longer: 0.5s, 1s,
+/// 2s, 4s, 8s, 15s, 15s — roughly 45s of total retrying before giving up.
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(500);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(15);
+const RECONNECT_MAX_ATTEMPTS: u32 = 8;
+
+/// Re-dial a remote whose link dropped, with exponential backoff. Each attempt
+/// updates the status row via `SupervisorReconnecting`; success installs the
+/// client through the normal `SupervisorConnected` path (rebinding its resumed
+/// sessions), and exhausting every attempt posts `SupervisorReconnectFailed`
+/// so the runtime marks it disconnected and the sidebar grays it out.
+fn spawn_remote_reconnect(
+    id: crate::app::SupervisorId,
+    url: String,
+    config_dir: std::path::PathBuf,
+    global_ids: Arc<std::sync::atomic::AtomicU64>,
+    notify: Arc<Notify>,
+    action_tx: mpsc::Sender<Action>,
+) {
+    tokio::spawn(async move {
+        let mut delay = RECONNECT_INITIAL_DELAY;
+        let mut last_error = String::new();
+        for attempt in 1..=RECONNECT_MAX_ATTEMPTS {
+            let _ = action_tx
+                .send(Action::SupervisorReconnecting {
+                    id,
+                    attempt,
+                    max_attempts: RECONNECT_MAX_ATTEMPTS,
+                })
+                .await;
+            match client::connect_remote_handshake(
+                &config_dir,
+                &url,
+                id,
+                Arc::clone(&global_ids),
+                Arc::clone(&notify),
+                action_tx.clone(),
+            )
+            .await
+            {
+                Ok(client) => {
+                    let _ = action_tx
+                        .send(Action::SupervisorConnected { id, client })
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(%url, attempt, "remote reconnect failed: {e:#}");
+                    last_error = format!("{e:#}");
+                    if attempt < RECONNECT_MAX_ATTEMPTS {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(RECONNECT_MAX_DELAY);
+                    }
+                }
+            }
+        }
+        let _ = action_tx
+            .send(Action::SupervisorReconnectFailed {
+                id,
+                reason: last_error,
+            })
+            .await;
+    });
+}
+
 fn locate(state: &AppState, slug: &str, wt_name: &str) -> Option<(usize, usize)> {
     let pi = state.projects.iter().position(|p| p.slug == slug)?;
     let wi = state.projects[pi]
@@ -276,15 +342,54 @@ fn handle_action(
             return;
         }
         // A remote dropping: let the reducer drop its sessions + show a message,
-        // then flip the registry entry to disconnected so the sidebar grays it
-        // and `:reconnect` can re-dial.
+        // mark it as retrying (grayed into `⟳`), then re-dial with backoff.
+        // Only when the retries are exhausted does it become fully disconnected.
         Action::SupervisorLost(sup, reason) if sup != LOCAL => {
+            let url = supervisors.url_of(sup);
             let cmds = reduce(state, Action::SupervisorLost(sup, reason));
+            for cmd in cmds {
+                execute(cmd, state, action_tx, notify, supervisors);
+            }
+            supervisors.mark_reconnecting(sup);
+            state.supervisors = supervisors.directory();
+            if let Some(url) = url {
+                spawn_remote_reconnect(
+                    sup,
+                    url,
+                    state.config_dir.clone(),
+                    supervisors.global_ids(),
+                    Arc::clone(notify),
+                    action_tx.clone(),
+                );
+            }
+            return;
+        }
+        // Detached = another client took the supervisor's single slot. Drop the
+        // link for good (no retry: stealing it back would ping-pong forever);
+        // the user can `:reconnect` if they want it back.
+        Action::SupervisorDetached(sup, reason) if sup != LOCAL => {
+            let cmds = reduce(state, Action::SupervisorDetached(sup, reason));
             for cmd in cmds {
                 execute(cmd, state, action_tx, notify, supervisors);
             }
             supervisors.mark_disconnected(sup);
             state.supervisors = supervisors.directory();
+            return;
+        }
+        // Backoff exhausted: clear the retrying marker and tell the user.
+        Action::SupervisorReconnectFailed { id, reason } => {
+            tracing::warn!(
+                ?id,
+                name = supervisors.name_of(id),
+                %reason,
+                "remote reconnect gave up; supervisor is disconnected"
+            );
+            supervisors.mark_disconnected(id);
+            state.supervisors = supervisors.directory();
+            let cmds = reduce(state, Action::SupervisorReconnectFailed { id, reason });
+            for cmd in cmds {
+                execute(cmd, state, action_tx, notify, supervisors);
+            }
             return;
         }
         _ => {}
@@ -316,12 +421,17 @@ fn on_supervisor_connected(
     }
     supervisors.set_client(id, Arc::clone(&client));
     rebind_one(state, &client);
+    // Start the frame reader only after the client is installed and its
+    // resumed sessions are bound: any `SupervisorLost` it posts must be
+    // ordered after the `SupervisorConnected` we're handling right now.
+    client.start_reader(action_tx.clone());
     state.supervisors = supervisors.directory();
     // If the usage popup is open, start streaming this supervisor's usage too.
     if state.usage_popup.is_some() {
         client.subscribe_usage();
     }
     let name = supervisors.name_of(id).to_string();
+    tracing::info!(?id, %name, "supervisor connected");
     state.command_status = Some(format!("supervisor '{name}' connected"));
     // Resync PTY dimensions for the just-rebound sessions.
     let cmds = reduce(state, Action::Resize(state.term_size));
@@ -343,12 +453,23 @@ fn project_client<'a>(
     match supervisors.get(sup) {
         Some(c) => Some(c),
         None => {
-            let _ = action_tx.try_send(Action::OperationFailed(format!(
-                "supervisor '{}' is not connected",
-                supervisors.name_of(sup)
+            let _ = action_tx.try_send(Action::OperationFailed(unreachable_message(
+                supervisors,
+                sup,
             )));
             None
         }
+    }
+}
+
+/// User-facing reason a supervisor-targeted command failed: distinguishes the
+/// transient reconnect window from a fully disconnected host.
+fn unreachable_message(supervisors: &Supervisors, sup: crate::app::SupervisorId) -> String {
+    let name = supervisors.name_of(sup);
+    if supervisors.is_reconnecting(sup) {
+        format!("supervisor '{name}' is reconnecting")
+    } else {
+        format!("supervisor '{name}' is not connected")
     }
 }
 
@@ -365,9 +486,9 @@ fn execute(
         match supervisors.get(sup) {
             Some(c) => Some(c),
             None => {
-                let _ = action_tx.try_send(Action::OperationFailed(format!(
-                    "supervisor '{}' is not connected",
-                    supervisors.name_of(sup)
+                let _ = action_tx.try_send(Action::OperationFailed(unreachable_message(
+                    supervisors,
+                    sup,
                 )));
                 None
             }

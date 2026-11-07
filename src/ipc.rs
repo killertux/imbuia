@@ -12,12 +12,33 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-/// Version 3 adds chunked clipboard-file uploads. The handshake refuses
+/// Version 5 adds app-level heartbeats (`Ping`/`Pong`) so a silently dead link
+/// (laptop sleep, Wi-Fi handoff, NAT timeout) is detected in seconds instead of
+/// waiting for the kernel's TCP retransmit timeout. The handshake refuses
 /// version mismatches.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 const MAX_FRAME: u32 = 8 * 1024 * 1024;
 pub const MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
+
+/// How often the client probes the supervisor. A link with an idle session
+/// otherwise looks exactly like a dead one; this keeps a known cadence.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Declare the link dead when *nothing* (not even a `Pong`) arrives for this
+/// long. Any inbound frame counts as proof of life, so busy output and quiet
+/// links are handled the same way. Kept comfortably above
+/// [`HEARTBEAT_INTERVAL`] so a slow-but-alive link (or a ping queued behind a
+/// large paste) isn't mistaken for a dead one.
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Supervisor-side: drop a client that hasn't sent anything for this long.
+/// Pings arrive every [`HEARTBEAT_INTERVAL`], so this only fires for a dead or
+/// frozen client (and frees the single-client slot promptly). Deliberately
+/// larger than [`HEARTBEAT_TIMEOUT`] so a brief client-side stall doesn't tear
+/// down a healthy (just slow) connection before the client itself decides.
+pub const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Per-frame codec tag (the byte after the length prefix).
 const CODEC_RAW: u8 = 0;
@@ -119,6 +140,11 @@ pub enum ClientMsg {
     Op {
         request_id: u64,
         req: OpRequest,
+    },
+    /// Heartbeat probe. The supervisor answers with [`SupervisorMsg::Pong`].
+    /// Sent every [`HEARTBEAT_INTERVAL`].
+    Ping {
+        nonce: u64,
     },
 }
 
@@ -259,6 +285,11 @@ pub enum SupervisorMsg {
     UploadResult {
         request_id: u64,
         result: UploadResult,
+    },
+    /// Response to [`ClientMsg::Ping`]. Any inbound frame resets the client's
+    /// liveness clock, so this is only used for logging/RTT.
+    Pong {
+        nonce: u64,
     },
 }
 
@@ -557,6 +588,7 @@ mod tests {
             ClientMsg::Shutdown,
             ClientMsg::SubscribeUsage,
             ClientMsg::UnsubscribeUsage,
+            ClientMsg::Ping { nonce: 99 },
             ClientMsg::Op {
                 request_id: 11,
                 req: OpRequest::Validate {
@@ -648,6 +680,7 @@ mod tests {
             SupervisorMsg::Detached {
                 reason: "stolen".into(),
             },
+            SupervisorMsg::Pong { nonce: 1 },
             SupervisorMsg::Usage(UsageReport {
                 sessions: vec![SessionUsage {
                     session_id: 1,
