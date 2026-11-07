@@ -329,46 +329,36 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
             state.command_status = Some(msg);
         }
         Action::SupervisorLost(sup, reason) => {
-            if sup == crate::app::LOCAL {
-                // The local supervisor's PTYs are gone — nothing to attach to;
-                // wipe everything and exit, as before.
-                state.sessions.clear();
-                for p in &mut state.projects {
-                    for w in &mut p.worktrees {
-                        w.sessions.clear();
-                        w.active_tab = None;
-                    }
-                }
-                state.pending_op = None;
-                state.mode = Mode::Normal;
-                state.command_status = Some(format!("supervisor lost: {reason}"));
-                state.running = false;
-            } else {
-                // A remote dropped — drop only its sessions, keep running.
-                let name = state.supervisors.name_of(sup).to_string();
-                for p in &mut state.projects {
-                    if p.supervisor != sup {
-                        continue;
-                    }
-                    for w in &mut p.worktrees {
-                        for id in w.sessions.drain(..) {
-                            state.sessions.remove(&id);
-                        }
-                        w.active_tab = None;
-                    }
-                }
-                if let Some((pi, _)) = state.active_worktree
-                    && state.projects.get(pi).map(|p| p.supervisor) == Some(sup)
-                {
-                    state.active_worktree = None;
-                }
-                state.command_status = Some(format!("remote supervisor '{name}' disconnected"));
-            }
+            supervisor_gone(state, sup, reason, true);
+        }
+        Action::SupervisorDetached(sup, reason) => {
+            supervisor_gone(state, sup, reason, false);
         }
         Action::SupervisorConnected { .. } => {
             // Handled entirely in `runtime::handle_action` (it mutates the live
             // connection registry, which this pure reducer can't reach). Never
             // reaches here, but the match must stay exhaustive.
+        }
+        Action::SupervisorReconnecting {
+            id,
+            attempt,
+            max_attempts,
+        } => {
+            // Ignore stale attempt notices once the link is back (the runtime
+            // clears `reconnecting` when it installs a new client).
+            if state.supervisors.is_reconnecting(id) {
+                let name = state.supervisors.name_of(id).to_string();
+                state.command_status = Some(format!(
+                    "reconnecting to '{name}' (attempt {attempt}/{max_attempts})…"
+                ));
+            }
+        }
+        Action::SupervisorReconnectFailed { id, reason } => {
+            let name = state.supervisors.name_of(id).to_string();
+            state.pending_op = None;
+            state.command_status = Some(format!(
+                "supervisor '{name}' unreachable — disconnected ({reason})"
+            ));
         }
         Action::UsageReceived(sup, report) => {
             if let Some(popup) = state.usage_popup.as_mut() {
@@ -524,6 +514,61 @@ pub fn reduce(state: &mut AppState, action: Action) -> Commands {
         }
     }
     cmds
+}
+
+/// Shared handling for a supervisor that went away: `SupervisorLost` (transport
+/// failure — remote loss will be retried by the runtime) and
+/// `SupervisorDetached` (another client took over — no retry).
+///
+/// Local loss is terminal (its PTYs are gone). Remote loss drops only that
+/// supervisor's session references and keeps the app running.
+fn supervisor_gone(
+    state: &mut AppState,
+    sup: crate::app::SupervisorId,
+    reason: String,
+    will_retry: bool,
+) {
+    if sup == crate::app::LOCAL {
+        // nothing to attach to; wipe everything and exit.
+        state.sessions.clear();
+        for p in &mut state.projects {
+            for w in &mut p.worktrees {
+                w.sessions.clear();
+                w.active_tab = None;
+            }
+        }
+        state.pending_op = None;
+        state.mode = Mode::Normal;
+        state.command_status = Some(format!("supervisor lost: {reason}"));
+        state.running = false;
+        return;
+    }
+
+    let name = state.supervisors.name_of(sup).to_string();
+    for p in &mut state.projects {
+        if p.supervisor != sup {
+            continue;
+        }
+        for w in &mut p.worktrees {
+            for id in w.sessions.drain(..) {
+                state.sessions.remove(&id);
+            }
+            w.active_tab = None;
+        }
+    }
+    if let Some((pi, _)) = state.active_worktree
+        && state.projects.get(pi).map(|p| p.supervisor) == Some(sup)
+    {
+        state.active_worktree = None;
+    }
+    state.pending_op = None;
+    state.command_status = Some(if will_retry {
+        // The runtime re-dials with backoff; only a failure posts
+        // `SupervisorReconnectFailed`, which replaces this message.
+        format!("remote supervisor '{name}' lost — reconnecting…")
+    } else {
+        format!("remote supervisor '{name}' detached — disconnected ({reason})")
+    });
 }
 
 /// Push a `FetchPrStatuses` for a single worktree on this project, provided

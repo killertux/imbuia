@@ -189,6 +189,10 @@ fn cmd_reconnect(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
         return;
     }
     let name = state.supervisors.name_of(sup).to_string();
+    if state.supervisors.is_reconnecting(sup) {
+        state.command_status = Some(format!("supervisor '{name}' is already reconnecting"));
+        return;
+    }
     if state.supervisors.is_connected(sup) {
         state.command_status = Some(format!("supervisor '{name}' already connected"));
         return;

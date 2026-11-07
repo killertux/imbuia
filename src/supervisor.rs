@@ -432,7 +432,19 @@ where
         let msg: ClientMsg = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(()),
-            r = ipc::read_frame_async(rd) => r?,
+            r = tokio::time::timeout(ipc::CLIENT_IDLE_TIMEOUT, ipc::read_frame_async(rd)) => match r {
+                Err(_) => {
+                    // The client pings every few seconds, so silence this long
+                    // means it's dead or frozen (e.g. a suspended laptop whose
+                    // TCP connection never got a FIN). Free the slot.
+                    tracing::info!(
+                        timeout_secs = ipc::CLIENT_IDLE_TIMEOUT.as_secs(),
+                        "client went silent; closing connection"
+                    );
+                    return Ok(());
+                }
+                Ok(frame) => frame?,
+            },
         };
         match msg {
             ClientMsg::Spawn {
@@ -656,6 +668,11 @@ where
                 let _ = std::fs::remove_file(&sock);
                 let _ = std::fs::remove_dir_all(upload_dir());
                 std::process::exit(0);
+            }
+            ClientMsg::Ping { nonce } => {
+                // Heartbeat probe: reply on the normal writer queue. Also lets
+                // the client measure liveness through a quiet link.
+                let _ = tx.send(SupervisorMsg::Pong { nonce }).await;
             }
         }
     }

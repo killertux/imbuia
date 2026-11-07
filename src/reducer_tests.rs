@@ -2377,6 +2377,7 @@ fn state_with_disconnected_remote() -> AppState {
             (SupervisorId(1), "remote".into()),
         ],
         connected: std::iter::once(crate::app::LOCAL).collect(),
+        reconnecting: std::collections::HashSet::new(),
     };
     s.projects = vec![Project {
         slug: "p".into(),
@@ -2402,6 +2403,7 @@ fn directory_is_connected_treats_local_as_always_up() {
             (SupervisorId(1), "remote".into()),
         ],
         connected: std::iter::once(crate::app::LOCAL).collect(),
+        reconnecting: std::collections::HashSet::new(),
     };
     assert!(dir.is_connected(crate::app::LOCAL));
     assert!(!dir.is_connected(SupervisorId(1)));
@@ -2476,6 +2478,122 @@ fn losing_remote_drops_only_its_sessions() {
     assert!(s.sessions.is_empty());
     assert!(s.projects[0].worktrees[0].sessions.is_empty());
     assert!(s.running, "losing a remote must not stop the app");
+}
+
+#[test]
+fn losing_remote_says_reconnecting_until_retries_give_up() {
+    let mut s = state_with_disconnected_remote();
+    s.supervisors.connected.insert(SupervisorId(1));
+
+    let _ = reduce(
+        &mut s,
+        Action::SupervisorLost(SupervisorId(1), "heartbeat".into()),
+    );
+    assert!(
+        s.command_status
+            .as_deref()
+            .unwrap()
+            .contains("reconnecting"),
+        "status should tell the user a reconnect is starting: {:?}",
+        s.command_status
+    );
+
+    // The runtime marks the directory as retrying before the first attempt.
+    s.supervisors.reconnecting.insert(SupervisorId(1));
+    let _ = reduce(
+        &mut s,
+        Action::SupervisorReconnecting {
+            id: SupervisorId(1),
+            attempt: 3,
+            max_attempts: 8,
+        },
+    );
+    assert_eq!(
+        s.command_status.as_deref(),
+        Some("reconnecting to 'remote' (attempt 3/8)…")
+    );
+
+    let _ = reduce(
+        &mut s,
+        Action::SupervisorReconnectFailed {
+            id: SupervisorId(1),
+            reason: "connection refused".into(),
+        },
+    );
+    assert!(
+        s.command_status
+            .as_deref()
+            .unwrap()
+            .contains("unreachable — disconnected")
+    );
+}
+
+#[test]
+fn stale_reconnecting_notice_does_not_clobber_status() {
+    // If the link already came back (runtime cleared `reconnecting`), a queued
+    // attempt notice must not overwrite the "connected" status.
+    let mut s = state_with_disconnected_remote();
+    s.command_status = Some("supervisor 'remote' connected".into());
+    let _ = reduce(
+        &mut s,
+        Action::SupervisorReconnecting {
+            id: SupervisorId(1),
+            attempt: 2,
+            max_attempts: 8,
+        },
+    );
+    assert_eq!(
+        s.command_status.as_deref(),
+        Some("supervisor 'remote' connected")
+    );
+}
+
+#[test]
+fn remote_detach_drops_sessions_without_retry_wording() {
+    let mut s = state_with_disconnected_remote();
+    s.supervisors.connected.insert(SupervisorId(1));
+    s.projects[0].worktrees = vec![Worktree {
+        name: "w".into(),
+        path: PathBuf::from("."),
+        branch: None,
+        sessions: vec![1],
+        active_tab: Some(0),
+    }];
+    s.sessions.insert(1, FakeSession::new(1));
+
+    let _ = reduce(
+        &mut s,
+        Action::SupervisorDetached(SupervisorId(1), "new client attached".into()),
+    );
+    assert!(s.sessions.is_empty());
+    assert!(s.projects[0].worktrees[0].sessions.is_empty());
+    assert!(s.running);
+    let status = s.command_status.as_deref().unwrap();
+    assert!(status.contains("detached"), "unexpected status: {status}");
+    assert!(
+        !status.contains("reconnecting"),
+        "a detach must not advertise a retry: {status}"
+    );
+}
+
+#[test]
+fn local_detach_exits_the_app() {
+    let mut s = AppState::new();
+    let _ = reduce(
+        &mut s,
+        Action::SupervisorDetached(crate::app::LOCAL, "new client attached".into()),
+    );
+    assert!(!s.running);
+}
+
+#[test]
+fn directory_reports_reconnecting_remotes() {
+    let mut dir = SupervisorDirectory::local_only();
+    dir.entries.push((SupervisorId(1), "remote".into()));
+    dir.reconnecting.insert(SupervisorId(1));
+    assert!(dir.is_reconnecting(SupervisorId(1)));
+    assert!(!dir.is_connected(SupervisorId(1)));
+    assert!(!dir.is_reconnecting(crate::app::LOCAL));
 }
 
 // ── command palette ─────────────────────────────────────────────────────────

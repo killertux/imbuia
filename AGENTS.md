@@ -48,9 +48,9 @@ codebase. Humans should read `README.md` first.
 | `git.rs`          | `std::process::Command` wrappers (`validate_repo`, `head_branch`, `worktree_add`, `worktree_remove`). **Run inside the supervisor**, not the client (see Disk ops below). |
 | `github.rs`       | `gh` CLI wrapper for PR status. Also **run inside the supervisor**. |
 | `session.rs`      | `Session` trait + `FakeSession` for tests. The real impl is in `client.rs`. |
-| `client.rs`       | `Supervisors` registry (local + N remotes, each with `url`/`connected` state + `set_client`/`mark_disconnected`); one `SupervisorClient` per connection; `connect_all` (local sync + remotes seeded disconnected, dialed later in the background); `ProxySession` (client-side `Session` impl) with local↔global session-id remap; double-fork helpers, reader + writer tasks. |
+| `client.rs`       | `Supervisors` registry (local + N remotes, each with `url`/`connected`/`reconnecting` state + `set_client`/`mark_reconnecting`/`mark_disconnected`); one `SupervisorClient` per connection with reader + writer + heartbeat tasks (cancel-on-loss); `connect_all` (local sync + remotes seeded disconnected, dialed later in the background); `ProxySession` (client-side `Session` impl) with local↔global session-id remap; double-fork helpers. |
 | `supervisor.rs`   | `imbuia --supervisor` entry: owns a tokio runtime; PTY spawn/own (portable-pty + vt100) on blocking threads; UDS accept loop (always) + optional TCP+TLS acceptor (`--listen`); per-client async `handle_conn`. |
-| `ipc.rs`          | Shared wire types (`ClientMsg`, `SupervisorMsg`, `Handshake*`, ops and chunked uploads), framed read/write (`[u32 len][u8 codec][payload]`; codec 0=raw, 1=zstd — `write_frame_async(.., compress)` gates compression on size + remote-only, reader auto-detects; sync twins are test-only), socket path resolution. `PROTOCOL_VERSION = 4`. |
+| `ipc.rs`          | Shared wire types (`ClientMsg`, `SupervisorMsg`, `Handshake*`, ops and chunked uploads), framed read/write (`[u32 len][u8 codec][payload]`; codec 0=raw, 1=zstd — `write_frame_async(.., compress)` gates compression on size + remote-only, reader auto-detects; sync twins are test-only), heartbeat cadence/timeouts, socket path resolution. `PROTOCOL_VERSION = 5`. |
 | `transport.rs`    | Optional remote transport: Ed25519 identity load/gen, SPKI fingerprints, rustls (ring) client/server configs with pinned-key verifiers. Both sides TOFU: client pins the supervisor in `known_hosts`; supervisor pins the first client into `authorized_keys` when empty. |
 | `input.rs`        | crossterm `Event` → `Action`; `encode_key` with DECCKM handling + kitty/modifyOtherKeys passthrough; `KbdTracker` infers the inner app's keyboard protocol from its output. |
 | `clipboard.rs`    | Client-side desktop clipboard ingestion. Reads files/images/text off the runtime task; images become PNG and uploads are capped at 32 MiB. |
@@ -166,9 +166,10 @@ crossterm Event ─► input::map ─► Action ─┐
   stalls or crashes the TUI. On success the task posts
   `Action::SupervisorConnected { id, client }`; on failure it's a quiet log
   (startup) or an `OperationFailed` (a user-initiated `:reconnect`, which
-  passes `verbose = true`). **`SupervisorConnected` and remote `SupervisorLost`
-  are intercepted in `runtime::handle_action` before the reducer** — they
-  mutate the live `client::Supervisors` registry (`set_client` /
+  passes `verbose = true`). **`SupervisorConnected`, remote `SupervisorLost`,
+  `SupervisorReconnecting` and `SupervisorReconnectFailed` are handled in
+  `runtime::handle_action` around the reducer** — they mutate the live
+  `client::Supervisors` registry (`set_client` / `mark_reconnecting` /
   `mark_disconnected`), which the pure reducer can't reach, then re-snapshot
   `state.supervisors = supervisors.directory()`. `on_supervisor_connected` also
   re-binds that supervisor's resumed sessions (`rebind_one`) and pushes a
@@ -177,12 +178,34 @@ crossterm Event ─► input::map ─► Action ─┐
   rendering for offline remote projects. `:reconnect` (`:rc`) re-dials the
   selected project's supervisor (`Command::ReconnectSupervisor`); the command
   handler short-circuits LOCAL / already-connected cases client-side.
+- **Liveness + reconnect.** Every connection runs an app-level heartbeat
+  (`ClientMsg::Ping` → `SupervisorMsg::Pong`, 3 s cadence). The reader bumps a
+  shared `last_rx` clock on *any* inbound frame, the writer reports write
+  failures immediately, and whichever task notices first calls `mark_lost`
+  (posts `SupervisorLost` once, then cancels the connection's
+  `CancellationToken`). No inbound frame for 15 s declares the link dead — a
+  black-holed remote (laptop sleep, Wi-Fi handoff, NAT timeout) can't fake
+  "typing does nothing for minutes" anymore. The supervisor applies a 60 s
+  idle timeout so a dead client doesn't hold the single-client slot.
+  **The reader is started by `SupervisorClient::start_reader`, called *after*
+  `SupervisorConnected` is processed — never inside `handshake`** — so a
+  `Lost` from a fresh connection can't race ahead of its `Connected`.
+- **Remote reconnect backoff.** On `SupervisorLost` for a remote the runtime
+  keeps the entry in `state.supervisors.reconnecting` (sidebar `⟳`, commands
+  still fail) and re-dials via `runtime::spawn_remote_reconnect`: immediate
+  first attempt, then 0.5 s / 1 s / 2 s / 4 s / 8 s / 15 s backoff (8
+  attempts, ~45 s). Success flows through `SupervisorConnected` as usual and
+  rebinds resumed sessions; exhausting the attempts posts
+  `SupervisorReconnectFailed`, which clears the marker and grays the project
+  (`✗`). Local supervisor loss is still terminal (exit): its PTYs are gone.
 - **Single client at a time.** The supervisor's accept loop hands the new
   client an exclusive slot. The old client (if any) gets
   `SupervisorMsg::Detached`, then its `CancellationToken` is fired to tear
   down its reader + writer tasks (dropping both stream halves closes the
-  socket). The TUI handles `Detached` by posting `OperationFailed` and
-  exiting.
+  socket). `Detached` posts `Action::SupervisorDetached`, not
+  `SupervisorLost`: local exits, and a remote is marked disconnected
+  **without** auto-retry — re-dialing would steal the slot back and bounce
+  both clients forever (use `:reconnect` deliberately).
 - **State sync = "dump on attach + raw byte forward".** On attach the
   supervisor sends `OutputDump { bytes: parser.screen().contents_formatted() }`
   per session — escape sequences that restore the visible screen and
