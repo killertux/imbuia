@@ -50,7 +50,7 @@ codebase. Humans should read `README.md` first.
 | `session.rs`      | `Session` trait + `FakeSession` for tests. The real impl is in `client.rs`. |
 | `client.rs`       | `Supervisors` registry (local + N remotes, each with `url`/`connected`/`reconnecting` state + `set_client`/`mark_reconnecting`/`mark_disconnected`); one `SupervisorClient` per connection with reader + writer + heartbeat tasks (cancel-on-loss); `connect_all` (local sync + remotes seeded disconnected, dialed later in the background); `ProxySession` (client-side `Session` impl) with local↔global session-id remap; double-fork helpers. |
 | `supervisor.rs`   | `imbuia --supervisor` entry: owns a tokio runtime; PTY spawn/own (portable-pty + vt100) on blocking threads; UDS accept loop (always) + optional TCP+TLS acceptor (`--listen`); per-client async `handle_conn`. |
-| `ipc.rs`          | Shared wire types (`ClientMsg`, `SupervisorMsg`, `Handshake*`, ops and chunked uploads), framed read/write (`[u32 len][u8 codec][payload]`; codec 0=raw, 1=zstd — `write_frame_async(.., compress)` gates compression on size + remote-only, reader auto-detects; sync twins are test-only), heartbeat cadence/timeouts, socket path resolution. `PROTOCOL_VERSION = 5`. |
+| `ipc.rs`          | Shared wire types (`ClientMsg`, `SupervisorMsg`, `Handshake*`, ops and chunked uploads), framed read/write (`[u32 len][u8 codec][payload]`; codec 0=raw, 1=zstd — `write_frame_async(.., compress)` gates compression on size + remote-only, reader auto-detects; sync twins are test-only), heartbeat cadence/timeouts, socket path resolution. `PROTOCOL_VERSION = 6`. |
 | `transport.rs`    | Optional remote transport: Ed25519 identity load/gen, SPKI fingerprints, rustls (ring) client/server configs with pinned-key verifiers. Both sides TOFU: client pins the supervisor in `known_hosts`; supervisor pins the first client into `authorized_keys` when empty. |
 | `input.rs`        | crossterm `Event` → `Action`; `encode_key` with DECCKM handling + kitty/modifyOtherKeys passthrough; `KbdTracker` infers the inner app's keyboard protocol from its output. |
 | `clipboard.rs`    | Client-side desktop clipboard ingestion. Reads files/images/text off the runtime task; images become PNG and uploads are capped at 32 MiB. |
@@ -226,11 +226,17 @@ crossterm Event ─► input::map ─► Action ─┐
   responds with `Spawned { request_id, id }`, the client builds the local
   vt100 parser with the correct dimensions. Don't hardcode 24×80 here —
   there was a bug.
-- **`:restart-supervisor` (`:rs`) kills everything.** The handler sends
-  `ClientMsg::Shutdown`, the supervisor kills all children + unlinks the
-  socket, and the client exits. Re-launch to get a fresh supervisor. No
-  in-place reconnect today; the reader task terminates when the socket
-  closes.
+- **`:restart-supervisor` (`:rs`) targets the selected project's supervisor.**
+  Local keeps the historical behaviour: `ClientMsg::Shutdown` → the supervisor
+  kills all children + unlinks the socket → the client exits (re-launch
+  auto-spawns). A remote instead gets `ClientMsg::Restart`: the supervisor kills
+  its PTYs, unlinks the socket, and **re-execs itself with its original argv**
+  (`reexec_supervisor` in `supervisor.rs`). Same PID, so systemd/launchd stay
+  happy, and it works regardless of how the daemon was launched. The client
+  stays up; the EOF enters the normal remote reconnect backoff and resumes with
+  an empty session list. The command handler clears only the target
+  supervisor's session references. After a protocol bump, a still-running old
+  remote supervisor can't decode `Restart` — restart it once by hand.
 
 ## vt100 + scrollback (don't tweak without reading this)
 
@@ -385,7 +391,9 @@ async ops; the files are the only debug channel.
 - No multi-client attach on the supervisor (a second `imbuia` steals the
   slot; concurrent rendering would need viewport negotiation).
 - No automatic supervisor restart on protocol-version mismatch — the
-  client tells the user to run `:rs` and relaunch.
+  handshake is refused before the TUI starts, and `:rs` can't reach a
+  supervisor it can't talk to, so the old daemon must be restarted by hand
+  (one time per protocol bump, local or remote).
 - Sessions don't survive host reboot (would need a launchd / systemd
   unit). Scrollback older than the screen at attach time isn't replayed.
 - Keyboard-protocol state (kitty / modifyOtherKeys) is tracked

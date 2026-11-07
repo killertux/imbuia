@@ -963,10 +963,11 @@ pub enum Command {
     /// otherwise `execute` couldn't look it up and the supervisor's child would
     /// leak (reappearing on reattach). See `runtime::execute`.
     KillSession(Arc<dyn Session>),
-    /// Send `Shutdown` to the supervisor and wire down the local session map.
-    /// The client process keeps running and will auto-spawn a fresh
-    /// supervisor on its next attach attempt (today: at next start).
-    RestartSupervisor,
+    /// Restart the supervisor hosting the selected project (`:rs`). `LOCAL`
+    /// sends `Shutdown` and exits the client (a relaunch auto-spawns a fresh
+    /// daemon); a remote sends `Restart`, which re-execs the remote daemon in
+    /// place while the client stays up and reconnects via the backoff path.
+    RestartSupervisor(SupervisorId),
     /// (Re)dial a remote supervisor in the background. On success the runtime
     /// posts `Action::SupervisorConnected`; on failure `Action::OperationFailed`.
     /// The command handler guarantees `id` is a currently-disconnected remote.

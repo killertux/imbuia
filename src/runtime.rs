@@ -593,10 +593,17 @@ fn execute(
             // `state.sessions`), so the kill still reaches the supervisor.
             sess.kill();
         }
-        Command::RestartSupervisor => {
-            // `:rs` targets the local supervisor (the auto-spawned one).
-            if let Some(client) = supervisors.get(LOCAL) {
-                client.shutdown_supervisor();
+        Command::RestartSupervisor(sup) => {
+            // `:rs` targets the selected project's supervisor. Local uses the
+            // clean Shutdown path (the client exits and a relaunch auto-spawns);
+            // a remote re-execs itself in place and the link-loss path drives
+            // the reconnect backoff.
+            if let Some(client) = targeted(sup) {
+                if sup == LOCAL {
+                    client.shutdown_supervisor();
+                } else {
+                    client.restart_supervisor();
+                }
             }
         }
         Command::ReconnectSupervisor(id) => {
