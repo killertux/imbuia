@@ -14,11 +14,12 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Version 5 adds app-level heartbeats (`Ping`/`Pong`) so a silently dead link
-/// (laptop sleep, Wi-Fi handoff, NAT timeout) is detected in seconds instead of
-/// waiting for the kernel's TCP retransmit timeout. The handshake refuses
-/// version mismatches.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// Version 6 adds `ClientMsg::Restart` (supervisor self re-exec). Version 5
+/// added app-level heartbeats (`Ping`/`Pong`) so a silently dead link (laptop
+/// sleep, Wi-Fi handoff, NAT timeout) is detected in seconds instead of waiting
+/// for the kernel's TCP retransmit timeout. The handshake refuses version
+/// mismatches.
+pub const PROTOCOL_VERSION: u32 = 6;
 const MAX_FRAME: u32 = 8 * 1024 * 1024;
 pub const MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -146,6 +147,12 @@ pub enum ClientMsg {
     Ping {
         nonce: u64,
     },
+    /// Restart the supervisor **in place**: kill every PTY, unlink the listener,
+    /// then re-exec the same binary with its original argv. The client sees a
+    /// disconnect and reconnects through the normal backoff path once the fresh
+    /// process is up. This makes `:rs` work for remotes regardless of how the
+    /// daemon was launched (systemd, nohup, tmux, an ssh session).
+    Restart,
 }
 
 /// A repo-touching operation. Every variant carries the `repo_path` (the
@@ -586,6 +593,7 @@ mod tests {
             ClientMsg::Kill { id: 9 },
             ClientMsg::Attach { id: 9 },
             ClientMsg::Shutdown,
+            ClientMsg::Restart,
             ClientMsg::SubscribeUsage,
             ClientMsg::UnsubscribeUsage,
             ClientMsg::Ping { nonce: 99 },

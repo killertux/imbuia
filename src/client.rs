@@ -624,6 +624,13 @@ impl SupervisorClient {
         let _ = self.tx.send(ClientMsg::Shutdown);
     }
 
+    /// Ask the supervisor to re-exec in place (kills every PTY). The link will
+    /// drop; a remote reconnects through the normal backoff path, a local one
+    /// exits the app (`:rs` keeps its historical local semantics).
+    pub fn restart_supervisor(&self) {
+        let _ = self.tx.send(ClientMsg::Restart);
+    }
+
     pub fn subscribe_usage(&self) {
         let _ = self.tx.send(ClientMsg::SubscribeUsage);
     }

@@ -2587,6 +2587,95 @@ fn local_detach_exits_the_app() {
 }
 
 #[test]
+fn restart_remote_targets_that_supervisor_and_keeps_app_running() {
+    let mut s = state_with_disconnected_remote();
+    s.supervisors.connected.insert(SupervisorId(1));
+    s.projects[0].worktrees = vec![Worktree {
+        name: "w".into(),
+        path: PathBuf::from("."),
+        branch: None,
+        sessions: vec![1],
+        active_tab: Some(0),
+    }];
+    s.sessions.insert(1, FakeSession::new(1));
+    // A local project whose session must survive the remote restart.
+    s.projects.push(Project {
+        slug: "local".into(),
+        name: "local".into(),
+        repo_path: PathBuf::from("."),
+        supervisor: crate::app::LOCAL,
+        worktrees: vec![Worktree {
+            name: "main".into(),
+            path: PathBuf::from("."),
+            branch: None,
+            sessions: vec![2],
+            active_tab: Some(0),
+        }],
+        expanded: true,
+        setup_script: None,
+        launchers: Vec::new(),
+        github_enabled: false,
+        gh_poll_interval_secs: None,
+    });
+    s.sessions.insert(2, FakeSession::new(2));
+
+    let mut cmds = Commands::new();
+    crate::commands::execute_command(&mut s, "rs", &mut cmds);
+
+    assert!(matches!(
+        cmds.as_slice(),
+        [Command::RestartSupervisor(SupervisorId(1))]
+    ));
+    assert!(s.running, "a remote restart must not quit the app");
+    assert!(!s.sessions.contains_key(&1), "remote session refs dropped");
+    assert!(
+        s.sessions.contains_key(&2),
+        "sessions on other supervisors must survive"
+    );
+    assert!(
+        s.command_status
+            .as_deref()
+            .unwrap()
+            .contains("restarting remote supervisor 'remote'")
+    );
+}
+
+#[test]
+fn restart_local_exits_and_targets_local_supervisor() {
+    let mut s = AppState::new();
+    let mut cmds = Commands::new();
+    crate::commands::execute_command(&mut s, "rs", &mut cmds);
+
+    assert!(matches!(
+        cmds.as_slice(),
+        [Command::RestartSupervisor(crate::app::LOCAL)]
+    ));
+    assert!(!s.running);
+    assert!(
+        s.command_status
+            .as_deref()
+            .unwrap()
+            .contains("restarting supervisor")
+    );
+}
+
+#[test]
+fn restart_disconnected_remote_is_refused() {
+    let mut s = state_with_disconnected_remote();
+    let mut cmds = Commands::new();
+    crate::commands::execute_command(&mut s, "rs", &mut cmds);
+
+    assert!(cmds.is_empty());
+    assert!(s.running);
+    assert!(
+        s.command_status
+            .as_deref()
+            .unwrap()
+            .contains("not connected")
+    );
+}
+
+#[test]
 fn directory_reports_reconnecting_remotes() {
     let mut dir = SupervisorDirectory::local_only();
     dir.entries.push((SupervisorId(1), "remote".into()));
