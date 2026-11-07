@@ -669,6 +669,22 @@ where
                 let _ = std::fs::remove_dir_all(upload_dir());
                 std::process::exit(0);
             }
+            ClientMsg::Restart => {
+                tracing::info!("restart requested by client; killing sessions and re-exec'ing");
+                shutdown_all(shared);
+                // The fresh process binds its listeners from scratch. Unlink
+                // ours first so a probe never attaches to a stale socket, and
+                // drop uploaded temp files (they belong to the dead sessions).
+                let sock = ipc::resolve_socket_path();
+                let _ = std::fs::remove_file(&sock);
+                let _ = std::fs::remove_dir_all(upload_dir());
+                // Normally never returns. If it does, the binary is gone or not
+                // executable — exit so a service manager can still recover (and
+                // the client's reconnect backoff reports the failure).
+                let err = reexec_supervisor();
+                tracing::error!("supervisor re-exec failed: {err}");
+                std::process::exit(1);
+            }
             ClientMsg::Ping { nonce } => {
                 // Heartbeat probe: reply on the normal writer queue. Also lets
                 // the client measure liveness through a quiet link.
@@ -1400,6 +1416,20 @@ fn shutdown_all(shared: &Arc<Shared>) {
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Replace this process with a fresh supervisor built from the same binary and
+/// argv (`--supervisor`, optional `--listen host:port`). Environment, cwd and
+/// stdio are inherited, so a daemon launched by systemd, nohup, tmux or an ssh
+/// session comes back exactly the same way — without needing the client to know
+/// how to start it. Only returns on failure.
+fn reexec_supervisor() -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("imbuia"));
+    std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .exec()
 }
 
 /// Replay every PTY byte we've buffered so the client's local vt100 parser

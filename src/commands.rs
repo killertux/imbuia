@@ -202,21 +202,57 @@ fn cmd_reconnect(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
 }
 
 fn cmd_restart_supervisor(state: &mut AppState, _args: &[&str], cmds: &mut Commands) {
-    state.command_status = Some("restarting supervisor — all sessions killed".into());
-    // Drop every local session reference; the supervisor side terminates
-    // the children when it processes Shutdown.
-    state.sessions.clear();
+    use crate::app::LOCAL;
+
+    // Target the project under the sidebar cursor (project header or worktree).
+    // With no selection, keep the historical local-supervisor behaviour.
+    let sup = state
+        .sidebar_selection
+        .and_then(|(pi, _)| state.projects.get(pi).map(|p| p.supervisor))
+        .unwrap_or(LOCAL);
+    let name = state.supervisors.name_of(sup).to_string();
+
+    if sup != LOCAL && !state.supervisors.is_connected(sup) {
+        state.command_status = Some(format!(
+            "supervisor '{name}' is not connected — use :reconnect first"
+        ));
+        return;
+    }
+
+    // Drop only *this* supervisor's session references; the supervisor kills
+    // the children when it processes the restart. Sessions on other hosts are
+    // untouched and keep running.
     for p in &mut state.projects {
+        if p.supervisor != sup {
+            continue;
+        }
         for w in &mut p.worktrees {
-            w.sessions.clear();
+            for id in w.sessions.drain(..) {
+                state.sessions.remove(&id);
+            }
             w.active_tab = None;
         }
     }
-    cmds.push(Command::RestartSupervisor);
-    // Exit; on next launch the client will see no socket and spawn a fresh
-    // supervisor. (Restarting in-place would require teaching the client
-    // reader thread to reconnect — a future iteration.)
-    state.running = false;
+    if let Some((pi, _)) = state.active_worktree
+        && state.projects.get(pi).map(|p| p.supervisor) == Some(sup)
+    {
+        state.active_worktree = None;
+    }
+    state.pending_op = None;
+
+    if sup == LOCAL {
+        state.command_status = Some("restarting supervisor — all sessions killed".into());
+        cmds.push(Command::RestartSupervisor(sup));
+        // Exit; on next launch the client will see no socket and spawn a fresh
+        // supervisor. (In-place local restart would race the auto-spawn path,
+        // which would start a second supervisor while the first re-execs.)
+        state.running = false;
+    } else {
+        state.command_status = Some(format!(
+            "restarting remote supervisor '{name}' — its sessions will be killed; reconnecting…"
+        ));
+        cmds.push(Command::RestartSupervisor(sup));
+    }
 }
 
 fn cmd_quit(state: &mut AppState, _args: &[&str], _cmds: &mut Commands) {
