@@ -26,7 +26,7 @@ jobs:
             cross_linker: aarch64-linux-gnu-gcc
             apt_packages: gcc-aarch64-linux-gnu
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
